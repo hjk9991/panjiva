@@ -1,0 +1,13 @@
+# credentials — never commit
+.env
+*.env
+
+# data files — stay on server A, never in git
+*.parquet
+*.csv
+*.dta
+
+# logs and caches
+*.log
+__pycache__/
+.ipynb_checkpoints/

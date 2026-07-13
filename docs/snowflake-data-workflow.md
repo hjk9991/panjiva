@@ -28,12 +28,20 @@ Snowflake 클라우드                         A 서버
 
 ---
 
-## 1. 사전 준비 (관리자에게 받을 것)
+## 1. 사전 준비
 
-- [ ] 본인 Snowflake 계정 (사용자명/비밀번호 또는 SSO)
-- [ ] 계정 식별자(account identifier): `<기관계정식별자>` ← **(관리자: 실제 값으로 채워넣을 것, 예: `xy12345.ap-northeast-2.aws`)**
-- [ ] 사용할 웨어하우스 이름: `<웨어하우스명>` ← **(관리자: 채워넣을 것)**
-- [ ] 공유 데이터베이스 이름: Panjiva `<PANJIVA_DB명>`, CapIQ `<CIQ_DB명>` ← **(관리자: 채워넣을 것)**
+- [ ] 본인 Snowflake 계정 사용자명/비밀번호 (관리자에게 요청)
+
+접속 정보 (팀 공통, S&P Xpressfeed 제공):
+
+| 항목 | 값 |
+|---|---|
+| 계정 식별자 (account) | `vlc67107.us-east-1` |
+| 웨어하우스 (warehouse) | `XF_READER_KoreaDevelopment_WH` |
+| 데이터베이스 (database) | `MI_XPRESSCLOUD` |
+| 스키마 (schema) | `XPRESSFEED` |
+
+> Panjiva와 CapIQ 테이블이 **모두 `MI_XPRESSCLOUD.XPRESSFEED` 안에** 있습니다 (별도 DB 아님).
 
 ## 2. 접속 정보 설정 (A에서, 계정당 1회)
 
@@ -43,10 +51,12 @@ A의 VS Code 터미널(SSH: A)에서:
 
 ```powershell
 @"
-SNOWFLAKE_ACCOUNT=<기관계정식별자>
+SNOWFLAKE_ACCOUNT=vlc67107.us-east-1
 SNOWFLAKE_USER=<본인 Snowflake 사용자명>
 SNOWFLAKE_PASSWORD=<본인 비밀번호>
-SNOWFLAKE_WAREHOUSE=<웨어하우스명>
+SNOWFLAKE_WAREHOUSE=XF_READER_KoreaDevelopment_WH
+SNOWFLAKE_DATABASE=MI_XPRESSCLOUD
+SNOWFLAKE_SCHEMA=XPRESSFEED
 "@ | Out-File -Encoding utf8 $env:USERPROFILE\.snowflake.env
 ```
 
@@ -91,17 +101,30 @@ print(cur.fetchone())
 ## 4. 데이터 탐색 — 뭐가 있는지 먼저 보기
 
 ```python
-# 접근 가능한 데이터베이스 목록
-cur.execute("SHOW DATABASES")
+# Panjiva 테이블 목록 (Xpressfeed에는 테이블이 수천 개라 반드시 LIKE로 좁힐 것)
+cur.execute("SHOW TABLES LIKE 'panjiva%' IN SCHEMA MI_XPRESSCLOUD.XPRESSFEED")
 for row in cur.fetchall():
     print(row[1])
 
-# 특정 DB의 테이블 목록 (예: Panjiva)
-cur.execute("SHOW TABLES IN DATABASE <PANJIVA_DB명>")
+# CapIQ 테이블 목록
+cur.execute("SHOW TABLES LIKE 'ciq%' IN SCHEMA MI_XPRESSCLOUD.XPRESSFEED")
 
 # 테이블 구조 확인
-cur.execute("DESCRIBE TABLE <PANJIVA_DB명>.<스키마>.<테이블명>")
+cur.execute("DESCRIBE TABLE MI_XPRESSCLOUD.XPRESSFEED.panjivaUSImport")
 ```
+
+### 주요 테이블 (팀에서 쓰는 것 위주)
+
+| 테이블 | 내용 |
+|---|---|
+| `panjivaUSImport` | 미국 수입 선적 건별 데이터 (arrivalDate, conPanjivaId/conName=수입자, shpPanjivaId/shpName=수출자, shpCountry, 항구, weightKg, valueOfGoodsUSD, volumeTEU 등) |
+| `panjivaUSImpHSCode` | 선적 건별 HS코드 (panjivaRecordId로 조인) |
+| `panjivaCompanyCrossRef` | **Panjiva 기업 ID ↔ CapIQ companyId 매핑** — 무역 데이터와 재무 데이터를 잇는 다리 |
+| CIQ 기업 기본정보 테이블군 | 기업 개요·산업분류·소재지 등 (`base_files_company_foundation` 스키마 문서 참고) |
+| CIQ 재무 테이블군 | 최신 재무제표 항목 (`intraday_latest_financials` 스키마 문서 참고) |
+
+> 전체 컬럼 정의는 팀 공유 스키마 문서(PDF 4종: Panjiva US 스키마, 크로스레퍼런스, CIQ 기업기본, CIQ 재무)를 참고하세요.
+> Panjiva↔CapIQ 연계 분석의 조인 경로: `panjivaUSImport.conPanjivaId(또는 shpPanjivaId)` → `panjivaCompanyCrossRef.identifierValue` → `companyId` → CIQ 테이블.
 
 **새 테이블을 다룰 때의 순서** (크레딧 절약 + 실수 방지):
 
@@ -123,10 +146,23 @@ SELECT * FROM <테이블> LIMIT 100;
 
 ```
 C:\panjiva\projects\extraction\
+    pull_panjiva.py                            ← 팀 표준 추출 스크립트 (아래 참고)
     ex_20260713_us_imports_kr_2020_2025.py    ← ex_날짜_내용요약.py
 ```
 
 스크립트 안에 **SQL 전문, 추출 사유, 저장 경로**가 들어가야 합니다. 이게 있어야 나중에 "이 parquet이 뭐였지?"가 없습니다.
+
+repo의 `extraction/pull_panjiva.py`가 팀 표준 스크립트입니다 — 미국 수입 데이터를 국가·연도·HS코드로 잘라 받는 전 과정이 구현되어 있으니, 새 추출 스크립트는 이걸 복사해서 시작하세요. 사용 예:
+
+```powershell
+# 연결 테스트 (1,000행만)
+python extraction\pull_panjiva.py --smoke
+
+# 실제 추출: 한국발 전기기기(HS 85), 2020~2024
+python extraction\pull_panjiva.py --year-start 2020 --year-end 2024 `
+    --shp-country "South Korea" --hs-prefix 85 `
+    --out C:\panjiva\data\staging\korea_electronics_2020_2024.parquet
+```
 
 ### 5-2. 소량 추출 (수백만 행 이하) — 기본 패턴
 
@@ -134,10 +170,11 @@ C:\panjiva\projects\extraction\
 import pandas as pd
 
 SQL = """
-SELECT shipment_date, consignee_name, shipper_country, value_usd
-FROM <PANJIVA_DB명>.<스키마>.us_imports
-WHERE shipper_country = 'South Korea'
-  AND shipment_date BETWEEN '2020-01-01' AND '2025-12-31'
+SELECT imp.panjivaRecordId, imp.arrivalDate, imp.conName, imp.shpName,
+       imp.shpCountry, imp.valueOfGoodsUSD, imp.weightKg
+FROM MI_XPRESSCLOUD.XPRESSFEED.panjivaUSImport imp
+WHERE imp.shpCountry = 'South Korea'
+  AND imp.arrivalDate BETWEEN '2020-01-01' AND '2025-12-31'
 """
 
 cur.execute(SQL)
@@ -202,7 +239,7 @@ Snowflake는 **웨어하우스 가동 시간만큼 과금**됩니다 (쿼리가 
 
 | 증상 | 원인/해결 |
 |---|---|
-| `250001: Could not connect` | 계정 식별자 오타. `<기관계정식별자>` 형식 확인 (조직-계정 또는 로케이터.리전.클라우드) |
+| `250001: Could not connect` | 계정 식별자 오타. `vlc67107.us-east-1` 그대로인지 확인 |
 | `Object does not exist or not authorized` | DB/테이블 이름 오타 또는 권한 없음. `SHOW DATABASES`로 보이는지 먼저 확인, 안 보이면 관리자에게 역할(role) 확인 요청 |
 | `No active warehouse` | 접속 시 warehouse 미지정. `.env`의 `SNOWFLAKE_WAREHOUSE` 확인 또는 `cur.execute("USE WAREHOUSE <이름>")` |
 | `fetch_pandas_all` 메모리 부족 | 5-3의 배치 패턴으로 전환, 또는 쿼리에서 기간을 쪼개 여러 번 추출 |
@@ -213,8 +250,8 @@ Snowflake는 **웨어하우스 가동 시간만큼 과금**됩니다 (쿼리가 
 
 ## (부록) 관리자 체크리스트
 
-- [ ] 이 문서의 `<기관계정식별자>`, `<웨어하우스명>`, `<PANJIVA_DB명>`, `<CIQ_DB명>` 플레이스홀더를 실제 값으로 치환
 - [ ] 팀원별 Snowflake 계정 발급 (개인별 계정 — 공용 계정 금지, 사용량 추적을 위해)
+- [ ] 스키마 문서 PDF 4종(Panjiva US, 크로스레퍼런스, CIQ 기업기본, CIQ 재무)을 팀 공유 위치(mPower/OneDrive)에 배포
 - [ ] staging 폴더 생성 + 권한 (A의 관리자 PowerShell, 1회):
 
 ```powershell
