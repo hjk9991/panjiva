@@ -8,10 +8,10 @@ USAGE (VS Code terminal on server A, with the team venv active):
     #    (see docs/snowflake-data-workflow.md section 2 — never commit this file)
 
     # 2. smoke test (pulls 1000 rows of Korea-origin imports)
-    python extraction\pull_panjiva.py --smoke
+    python scripts\extraction\pull_panjiva.py --smoke
 
     # 3. real pull
-    python extraction\pull_panjiva.py --year-start 2020 --year-end 2024 `
+    python scripts\extraction\pull_panjiva.py --year-start 2020 --year-end 2024 `
         --shp-country "South Korea" --hs-prefix 85 `
         --out C:\panjiva\data\staging\korea_electronics_2020_2024.parquet
 """

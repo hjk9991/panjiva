@@ -145,21 +145,21 @@ SELECT * FROM <테이블> LIMIT 100;
 모든 추출은 **스크립트 파일로** 작성해서 git에 남깁니다. 위치와 이름:
 
 ```
-C:\panjiva\projects\extraction\
+<본인 clone: C:\panjiva\projects\사번>\scripts\extraction\
     pull_panjiva.py                            ← 팀 표준 추출 스크립트 (아래 참고)
     ex_20260713_us_imports_kr_2020_2025.py    ← ex_날짜_내용요약.py
 ```
 
 스크립트 안에 **SQL 전문, 추출 사유, 저장 경로**가 들어가야 합니다. 이게 있어야 나중에 "이 parquet이 뭐였지?"가 없습니다.
 
-repo의 `extraction/pull_panjiva.py`가 팀 표준 스크립트입니다 — 미국 수입 데이터를 국가·연도·HS코드로 잘라 받는 전 과정이 구현되어 있으니, 새 추출 스크립트는 이걸 복사해서 시작하세요. 사용 예:
+repo의 `scripts/extraction/pull_panjiva.py`가 팀 표준 스크립트입니다 — 미국 수입 데이터를 국가·연도·HS코드로 잘라 받는 전 과정이 구현되어 있으니, 새 추출 스크립트는 이걸 복사해서 시작하세요. 사용 예 (본인 clone 폴더에서):
 
 ```powershell
 # 연결 테스트 (1,000행만)
-python extraction\pull_panjiva.py --smoke
+python scripts\extraction\pull_panjiva.py --smoke
 
 # 실제 추출: 한국발 전기기기(HS 85), 2020~2024
-python extraction\pull_panjiva.py --year-start 2020 --year-end 2024 `
+python scripts\extraction\pull_panjiva.py --year-start 2020 --year-end 2024 `
     --shp-country "South Korea" --hs-prefix 85 `
     --out C:\panjiva\data\staging\korea_electronics_2020_2024.parquet
 ```

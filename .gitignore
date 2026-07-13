@@ -6,6 +6,8 @@
 *.parquet
 *.csv
 *.dta
+# exception: small result tables in output/ are versioned
+!output/tables/*.csv
 
 # logs and caches
 *.log
