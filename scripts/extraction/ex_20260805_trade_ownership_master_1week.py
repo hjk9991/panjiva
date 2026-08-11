@@ -223,11 +223,21 @@ xr as (
     where activeFlag = 1 and identifierValue is not null
     qualify row_number() over (partition by identifierValue order by companyId) = 1
 ),
-ids as (
+ids0 as (
     select distinct companyId from (
         select xc.companyId from base b join xr xc on xc.identifierValue = b.conPanjivaId
         union all
         select xs.companyId from base b join xr xs on xs.identifierValue = b.shpPanjivaId
+    ) where companyId is not null
+),
+ids as (
+    -- 무역 당사자 + 그들의 최종 모회사. 해외 모회사는 미국에 직접 수입하지 않으므로
+    -- 당사자만 모으면 목록에서 빠지고, 그러면 그 그룹 전체가 재무 없는 것처럼 보인다.
+    select distinct companyId from (
+        select companyId from ids0
+        union all
+        select up.ultimateParentCompanyId
+        from ciqCompanyUltimateParent up join ids0 on ids0.companyId = up.companyId
     ) where companyId is not null
 ),
 fam as (
@@ -281,11 +291,23 @@ xr as (
     where activeFlag = 1 and identifierValue is not null
     qualify row_number() over (partition by identifierValue order by companyId) = 1
 ),
-ids as (
+ids0 as (
     select distinct companyId from (
         select xc.companyId from base b join xr xc on xc.identifierValue = b.conPanjivaId
         union all
         select xs.companyId from base b join xr xs on xs.identifierValue = b.shpPanjivaId
+    ) where companyId is not null
+),
+ids as (
+    -- ⚠️ 무역 당사자 + 그들의 최종 모회사를 함께 조회한다.
+    -- 미국 판매법인은 재무를 공시하지 않고 본사가 공시하는데, 본사는 미국에 직접
+    -- 수입하지 않아 당사자 목록에 안 잡힌다. 이 한 줄이 빠지면 삼성·Mazda 같은
+    -- 그룹이 통째로 재무 없는 것으로 나온다(실측: 수입액 커버리지 6.0% → 43.3%).
+    select distinct companyId from (
+        select companyId from ids0
+        union all
+        select up.ultimateParentCompanyId
+        from ciqCompanyUltimateParent up join ids0 on ids0.companyId = up.companyId
     ) where companyId is not null
 ),
 per as (
@@ -293,7 +315,7 @@ per as (
     -- ⚠️ 거래일보다 **먼저 끝난** 회계연도만 쓴다. calendarYear <= 거래연도로 걸면
     --    3월 선적에 그해 12월 결산 재무가 붙어 미래정보가 새어 든다.
     select fp.financialPeriodId, fp.companyId, fp.calendarYear, fp.periodEndDate,
-           fp.currencyId, fp.filingDate
+           fp.currencyId, fp.filingDate, fp.restatementTypeId
     from ciqLatestInstanceFinPeriod fp
     join ids on ids.companyId = fp.companyId
     where fp.periodTypeId = 1                                   -- 1 = 연간
@@ -304,21 +326,32 @@ per as (
 ),
 wide as (
     select p.companyId, p.calendarYear, p.periodEndDate, p.filingDate, p.currencyId,
+           p.restatementTypeId,
            {pivot}
     from per p
     left join ciqFinancialData d on d.financialPeriodId = p.financialPeriodId
                                 and d.dataItemId in ({item_ids})
-    group by 1, 2, 3, 4, 5
+    group by 1, 2, 3, 4, 5, 6
 )
+-- ⚠️ fin_filing_date 는 '최초 공시일'이 아니다. ciqLatestInstanceFinPeriod 의 filingDate 는
+--    그 기간의 **최신 인스턴스**가 실린 서류의 제출일이다. 회계기간은 이후 연차보고서에
+--    비교 열로 계속 다시 실리므로 날짜가 몇 년 뒤로 갱신된다(실측: 결산일 대비 중위 453일,
+--    연간 기간의 73.8%가 400~800일). 이 컬럼으로 point-in-time 필터를 걸면 실제로는
+--    이미 공시돼 있던 재무가 대량으로 사라진다(파일럿 기준 80.9% 소실).
+--    시점 통제가 필요하면 ciqFinInstance 를 조인해 financialPeriodId 별 min(filingDate) 를 쓸 것.
 select w.companyId     as companyid,
        w.calendarYear  as fin_year,
        w.periodEndDate as fin_period_end,
-       w.filingDate    as fin_filing_date,
+       w.filingDate    as fin_filing_date,   -- 최신 인스턴스 제출일 (위 주석 참조)
        datediff(day, w.periodEndDate, to_date('{date_start}')) as fin_age_days,
        cu.ISOCode      as fin_currency,
+       rt.restatementTypeName as fin_restatement_type,
+       -- 이 기간의 '최신' 인스턴스가 보도자료뿐이라는 뜻(감사 전 잠정치). 제외하지 말고 표시만 한다
+       iff(w.restatementTypeId = 1, 1, 0) as fin_is_press_release,
        {cols}
 from wide w
 left join ciqCurrency cu on cu.currencyId = w.currencyId
+left join ciqRestatementType rt on rt.restatementTypeId = w.restatementTypeId
 -- 거래일 이전에 끝난 회계연도 중 가장 최근 1개만 남긴다
 qualify row_number() over (partition by w.companyId order by w.periodEndDate desc) = 1
 """
@@ -553,6 +586,55 @@ def build_firm(ship: pd.DataFrame, co: pd.DataFrame, fin: pd.DataFrame) -> pd.Da
     return firm
 
 
+def build_group(ship: pd.DataFrame, co: pd.DataFrame, fin: pd.DataFrame) -> pd.DataFrame:
+    """한 행 = 기업집단(최종 모회사). 무역은 소속 법인 합산, 재무는 **모회사 것 하나**.
+
+    ⚠️ 재무를 소속 법인끼리 더하면 안 된다 — 모회사의 연결 재무에 자회사 실적이 이미
+       들어 있어 이중계상이 된다. entity 패널(03_firm)과 이 파일을 UNION 하는 것도 금지.
+    """
+    blocks = []
+    for prefix, key, other in (("imp", "con_up", "shp_up"), ("exp", "shp_up", "con_up")):
+        sub = ship[ship[key].notna()].copy()
+        member = "con_companyid" if key == "con_up" else "shp_companyid"
+        g = sub.groupby(key)
+        b = g.agg(**{
+            f"{prefix}_n_ship": ("panjivarecordid", "nunique"),
+            f"{prefix}_value_usd": ("valueofgoodsusd", "sum"),
+            f"{prefix}_weight_kg": ("weightkg", "sum"),
+            f"{prefix}_teu": ("volumeteu", "sum"),
+            f"{prefix}_n_members": (member, "nunique"),       # 이 표본에 등장한 소속 법인 수
+            f"{prefix}_n_partner_groups": (other, "nunique"),
+        })
+        # 그룹 내부거래 = 상대의 최종 모회사가 나와 같은 거래. 집단 단위로 보면 자기거래다.
+        internal = (sub[sub[key] == sub[other]].groupby(key)["valueofgoodsusd"].sum()
+                    .rename(f"{prefix}_value_internal"))
+        b = b.join(internal, how="left")
+        b[f"{prefix}_value_internal"] = b[f"{prefix}_value_internal"].fillna(0)
+        b[f"{prefix}_value_external"] = b[f"{prefix}_value_usd"] - b[f"{prefix}_value_internal"]
+        b[f"{prefix}_internal_share"] = (
+            b[f"{prefix}_value_internal"] / b[f"{prefix}_value_usd"]
+        ).where(b[f"{prefix}_value_usd"] > 0)
+        for col, out in (("hs2", f"{prefix}_top_hs2"),
+                         ("shpmtorigin", f"{prefix}_top_partner_country")):
+            b = b.join(_top_by_value(sub, [key], col, out).set_index(key), how="left")
+        b.index.name = "ultimate_parent_companyid"
+        blocks.append(b)
+
+    grp = blocks[0].join(blocks[1], how="outer").reset_index()
+
+    # 모회사 자신의 기준정보·재무를 붙인다(합산 아님).
+    # ⚠️ co 에도 ultimate_parent_companyid 컬럼이 있으므로 rename 전에 필요한 것만 골라낸다.
+    keep = ["companyid", "companyname", "country_iso2", "country",
+            "industry", "company_type", "company_status", "family_size"]
+    co_up = (co[[c for c in keep if c in co.columns]]
+             .rename(columns={"companyid": "ultimate_parent_companyid"}))
+    grp = grp.merge(co_up, on="ultimate_parent_companyid", how="left")
+    fin_up = fin.rename(columns={"companyid": "ultimate_parent_companyid"})
+    grp = grp.merge(fin_up, on="ultimate_parent_companyid", how="left")
+    grp["has_financials"] = grp["fin_year"].notna().astype("int8")
+    return grp
+
+
 def _top_by_value(df: pd.DataFrame, keys: list, col: str, out: str) -> pd.DataFrame:
     """그룹별로 금액이 가장 큰 값 1개(대표값). 결측은 제외하고 고른다.
     반환은 DataFrame[keys + [out]] — 인덱스 정렬 사고를 피하려고 merge/join 용으로 준다."""
@@ -628,10 +710,12 @@ def main() -> None:
 
     pair = build_pair(ship, co, fin)
     firm = build_firm(ship, co, fin)
+    group = build_group(ship, co, fin)
 
     print("\n[3/4] 저장")
     paths = {}
-    for name, df in (("01_shipment", ship), ("02_pair", pair), ("03_firm", firm)):
+    for name, df in (("01_shipment", ship), ("02_pair", pair),
+                     ("03_firm", firm), ("04_group", group)):
         p = out_dir / f"{name}.parquet"
         df.columns = [str(c).lower() for c in df.columns]
         df.to_parquet(p, index=False, compression="snappy")
@@ -639,7 +723,7 @@ def main() -> None:
         print(f"  {p.name:<20} {len(df):>9,}행  {p.stat().st_size/1e6:>7.1f} MB")
 
     print("\n[4/4] 진단 리포트")
-    write_checks(out_dir / "90_checks.md", ship, pair, firm, co, fin, chk, ds, de)
+    write_checks(out_dir / "90_checks.md", ship, pair, firm, group, co, fin, chk, ds, de)
     print(f"  {out_dir / '90_checks.md'}")
 
     print("\n" + "=" * 78)
@@ -649,15 +733,17 @@ def main() -> None:
     desc = {
         "01_shipment": "미국 수입 선적 + 양측 CIQ 매칭·모기업(PIT)·관계분류·대표HS",
         "02_pair": "수출자–수입자 쌍 집계 + 양측 재무 (양측 매칭 건만)",
-        "03_firm": "기업 단위 집계(수입/수출 분리) + 자기 재무",
+        "03_firm": "법인 단위 집계(수입/수출 분리) + 자기 재무",
+        "04_group": "기업집단(최종 모회사) 단위 집계 + 모회사 재무",
     }
     days = (pd.Timestamp(de) - pd.Timestamp(ds)).days
-    for name, df in (("01_shipment", ship), ("02_pair", pair), ("03_firm", firm)):
+    for name, df in (("01_shipment", ship), ("02_pair", pair),
+                     ("03_firm", firm), ("04_group", group)):
         print(f"| `{folder}/{name}.parquet` | {desc[name]} | {ds}~{de} ({days}일) | "
               f"{len(df):,} | `{Path(__file__).name}` | 2026-08-05 | 김영수 |")
 
 
-def write_checks(path, ship, pair, firm, co, fin, chk, ds, de) -> None:
+def write_checks(path, ship, pair, firm, group, co, fin, chk, ds, de) -> None:
     """진단 8종 + 검증. 숫자만 적지 않고 '그래서 뭘 뜻하는지'를 같이 적는다."""
     n = len(ship)
     both = ship["con_companyid"].notna() & ship["shp_companyid"].notna()
@@ -786,12 +872,49 @@ def write_checks(path, ship, pair, firm, co, fin, chk, ds, de) -> None:
     A("\n**뜻 (1) 커버리지**: 재무가 없는 회사가 많은 건 데이터 오류가 아니라 "
       "**비상장사는 재무를 공시하지 않기 때문**입니다. 재무를 요구하는 분석은 표본이 "
       "상장사 쪽으로 크게 치우칩니다 — 이건 데이터를 더 받아서 해결되는 문제가 아닙니다.")
+
+    # 법인 단위 vs 집단 단위 — 재무가 덮는 무역액이 얼마나 달라지는가
+    imp = firm[firm["imp_value_usd"].notna()]
+    gimp = group[group["imp_value_usd"].notna()]
+    if len(imp) and len(gimp):
+        e_tot, g_tot = imp["imp_value_usd"].sum(), gimp["imp_value_usd"].sum()
+        e_cov = imp.loc[imp["has_financials"] == 1, "imp_value_usd"].sum() / e_tot
+        g_cov = gimp.loc[gimp["has_financials"] == 1, "imp_value_usd"].sum() / g_tot
+        A("\n**법인 단위(03) vs 집단 단위(04) — 재무가 덮는 수입액**\n")
+        A(md_table(pd.DataFrame([
+            {"패널": "03_firm (법인, 자기 재무)", "행 수": len(imp),
+             "재무 보유 비율(%)": round(100 * (imp["has_financials"] == 1).mean(), 1),
+             "덮는 수입액(%)": round(100 * e_cov, 1)},
+            {"패널": "04_group (집단, 모회사 재무)", "행 수": len(gimp),
+             "재무 보유 비율(%)": round(100 * (gimp["has_financials"] == 1).mean(), 1),
+             "덮는 수입액(%)": round(100 * g_cov, 1)},
+        ])))
+        A("\n미국 판매법인은 재무를 따로 내지 않고 본사가 냅니다. 그래서 **재무를 쓰는 분석은 "
+          "집단 단위(04)가 사실상 유일한 선택**입니다. "
+          "⚠️ 두 파일을 UNION 하면 같은 무역이 두 번 세어집니다.\n")
+
     A("\n**뜻 (2) 통화**: 표시 통화가 제각각이라 `revenue` 를 그대로 비교하면 안 됩니다. "
       "USD 환산이 필요하고, 환율은 `ciqExchangeRate` 에 있습니다. (초안 6절 미결 #3)")
-    A("\n**뜻 (3) 시점**: 거래일보다 **먼저 끝난** 회계연도만 붙였습니다. "
+    A("\n**뜻 (3) 시점**: 거래일보다 **먼저 끝난** 회계연도만 붙였습니다(`periodEndDate < 거래일`). "
       "`calendarYear <= 거래연도` 로 거르면 3월 선적에 그해 12월 결산 재무가 붙어 "
-      "미래 정보가 새어 듭니다. 다만 결산일이 지났어도 **공시는 몇 달 뒤**라, "
-      "엄격한 시점 통제가 필요하면 `fin_filing_date` 로 한 번 더 거르세요.\n")
+      "미래 정보가 새어 듭니다.")
+    A("\n> **`fin_filing_date` 로 시점 필터를 걸지 마세요.** 이 컬럼은 최초 공시일이 아니라 "
+      "그 기간의 **최신 인스턴스**가 실린 서류의 제출일입니다. 회계기간은 이후 연차보고서에 "
+      "비교 열로 계속 다시 실려 날짜가 갱신됩니다(결산일 대비 중위 **453일**, 연간의 73.8%가 400~800일). "
+      "이 표본에 걸면 재무 보유 기업의 **80.9%가 사라집니다** — 실제로는 이미 공시돼 있던 수치인데도요.\n"
+      ">\n"
+      "> **애초에 걸 필요가 없습니다.** 재무는 여기서 *기업 규모의 척도*로 쓰이지 "
+      "*그 시점의 정보집합*이 아닙니다. 거래 당사자는 자기 회사 규모를 알고 있었고, "
+      "우리가 사후에 관측하는 것이 편의를 만들지 않습니다. 무역·산업조직 문헌의 표준 관행도 "
+      "회계연도 기준 결합입니다.\n"
+      ">\n"
+      "> 최초 공시일이 정말 필요해지면(주가 반응·공시 전후 비교 등) `ciqFinInstance`(5,761만 행)에서 "
+      "`restatementTypeId = 2`(Original) 또는 `= 1`(Press Release) 인스턴스를 **유형으로 골라** 씁니다. "
+      "`min(filingDate)` 로 뭉뚱그리면 이 둘이 섞이고, 후행 재게재만 남은 기간에서 조용히 틀립니다. "
+      "실측: 가장 이른 인스턴스가 Original 65.7% · Press Release 33.5%, 결산일 대비 중위 90일.\n")
+    A("\n**뜻 (4) 정정본**: `ciqLatestInstanceFinPeriod` 는 각 기간의 **최신 정정본**을 줍니다. "
+      "기술통계에는 이게 더 정확합니다. `fin_is_press_release=1` 인 행은 그 기간에 대해 "
+      "보도자료(감사 전 잠정치)밖에 없다는 뜻이니 제외하지 말고 플래그로만 다루세요.\n")
 
     A("\n## 6. 자식 테이블을 조인하면 합계가 얼마나 틀어지나\n")
     cj = chk["childjoin"].copy()
@@ -841,25 +964,58 @@ def write_checks(path, ship, pair, firm, co, fin, chk, ds, de) -> None:
     else:
         A("\n- 표본이 작아 판정 불가. 기간을 넓혀 다시 확인하세요.\n")
 
-    A("\n## 9. 파일 검증\n")
+    A("\n## 9. 매칭 품질 — 눈으로 확인할 대상\n")
+    A("`panjivaCompanyCrossRef` 가 무역 업체를 엉뚱한 CIQ 회사에 연결하는 경우가 있습니다. "
+      "실제 사례: Panjiva 의 `Chevron Products Co.`(원유 수입)가 CIQ 의 `Chevron Inc`에 붙었는데, "
+      "그 회사는 **Miller Industries 산하 견인차 업체**였습니다(1주일치에서만 2억 달러 오귀속).\n")
+    A("자동으로 다 걸러낼 수는 없지만, **업종과 품목이 안 맞는 건**은 신호가 됩니다. "
+      "아래는 광물·석유(HS 26·27)를 대량 수입했는데 CIQ 업종이 에너지 계열이 아닌 건들입니다:\n")
+    ENERGY = "Oil|Gas|Energy|Chemical|Utilit|Metal|Mining|Petro"
+    susp = ship[(ship["hs2"].isin(["26", "27"])) & ship["con_companyid"].notna()
+                & ship["con_ciq_industry"].notna()
+                & ~ship["con_ciq_industry"].str.contains(ENERGY, case=False, na=False)]
+    if len(susp):
+        t = (susp.groupby(["conname", "con_ciq_companyname", "con_ciq_industry"], dropna=False)
+                 .agg(건수=("panjivarecordid", "size"),
+                      금액백만=("valueofgoodsusd", lambda x: round(x.sum() / 1e6, 1)))
+                 .reset_index().sort_values("금액백만", ascending=False).head(12))
+        A(md_table(t))
+        A(f"\n총 {len(susp):,}건 · {susp['valueofgoodsusd'].sum()/1e6:,.0f} 백만$ 가 이 규칙에 걸립니다.")
+    else:
+        A("(해당 없음)")
+    A("\n**이 표는 '틀렸다'는 판정이 아니라 spot-check 대상 목록입니다.** "
+      "정유사가 소매업으로 분류돼 있을 수도 있고, 실제로 상사(商社)가 원유를 수입할 수도 있습니다. "
+      "지시서 02 의 보고항목인 *'알려진 기업집단 표본으로 분류 정확성 spot-check'* 가 이 작업입니다.\n")
+
+    A("\n## 10. 파일 검증\n")
     h = chk["hsfix"].iloc[0]
     A(f"- **HS 재결합 수정 확인** (`rid=287952173`, 조각 {int(h['chunks'])}개): "
       f"잘못된 방식(구분자 `|` + 문자열 정렬)으로는 코드 {int(h['codes_wrong_order']):,}개, "
       f"고친 방식(구분자 없음 + hsCodeId 정렬)으로는 **{int(h['codes_right_order']):,}개** 인식")
     A(f"- 선적 중복: **{n - ship['panjivarecordid'].nunique():,}건** (0이어야 정상 — "
       "0이 아니면 소유구조 구간 조인이 행을 늘린 것)")
+    for label, df, key in (("03_firm", firm, "companyid"),
+                           ("04_group", group, "ultimate_parent_companyid")):
+        A(f"- {label} 키 중복: **{len(df) - df[key].nunique():,}건** (0이어야 정상)")
+    orphan = firm["companyname"].isna().sum()
+    A(f"- `panjivaCompanyCrossRef` 가 가리키는데 `ciqCompany` 에 행이 없는 companyId: "
+      f"**{int(orphan):,}개** — 이름·산업이 빈칸으로 남습니다(크로스레퍼런스 품질 지표)")
 
     tot = val.sum()
     exp_pair, exp_imp = val[both].sum(), val[ship["con_companyid"].notna()].sum()
-    A("\n세 파일의 금액 합계가 서로 맞물리는지 (단위: 백만$):\n")
+    exp_grp = val[ship["con_up"].notna()].sum()
+    A("\n네 파일의 금액 합계가 서로 맞물리는지 (단위: 백만$):\n")
     A(md_table(pd.DataFrame([
         {"파일": "01_shipment", "금액": tot / 1e6, "기대값": tot / 1e6, "설명": "전체"},
         {"파일": "02_pair", "금액": pair["value_usd"].sum() / 1e6, "기대값": exp_pair / 1e6,
          "설명": "양측 매칭 건의 합과 같아야 함"},
         {"파일": "03_firm(수입)", "금액": firm["imp_value_usd"].sum() / 1e6,
          "기대값": exp_imp / 1e6, "설명": "수입자 매칭 건의 합과 같아야 함"},
+        {"파일": "04_group(수입)", "금액": group["imp_value_usd"].sum() / 1e6,
+         "기대값": exp_grp / 1e6, "설명": "03과 같아야 함 (묶는 단위만 다름)"},
     ])))
-    A("\n금액과 기대값이 같으면 집계 과정에서 행이 새거나 중복되지 않았다는 뜻입니다.\n")
+    A("\n금액과 기대값이 같으면 집계 과정에서 행이 새거나 중복되지 않았다는 뜻입니다. "
+      "**03과 04의 합계가 같은 것이 정상입니다** — 같은 무역을 법인별로 보느냐 집단별로 보느냐의 차이뿐입니다.\n")
 
     A(f"\n- HS6 결측 {ship['hs6'].isna().mean()*100:.1f}% · "
       f"HS 코드가 여러 개인 선적 {ship['hs_is_multi'].mean()*100:.1f}%")
