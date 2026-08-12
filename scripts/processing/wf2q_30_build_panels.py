@@ -15,7 +15,15 @@ wf2q_30_build_panels.py — within-firm 파일럿(2024 H1) L3 분석패널 층
   * within_firm(선적) = PIT 동일 ultimate parent (self·parent_sub·sibling 통합).
     지분율 부재로 related_minority 는 산출 불가 — 스키마에 자리만 둔다.
   * within_firm(pair-월) = 금액가중 within 비중 > 0.5 (within_share 도 저장)
-  * 재무 as-of = 분기 시작일 이전 마지막 periodEndDate (미래정보 차단)
+
+2026-08-12 리뷰 반영 (버전맵·DECISIONS 참조 — 사용자 확정 3건):
+  * 재무 층을 v1 표준으로 교체 — tom_v1_2024h1\fin_annual·fin_quarterly (9계정 USD 환산,
+    소급 2년 한도) + 자기/모회사 × 연간/분기 4블록. 모회사 = 거래시점(PIT+대체) UP.
+    (기존: L0 분기재무만·법인만·소급 무제한 → 커버리지 1.3~2.5%)
+  * panel_firm_origin_hs 를 L2 균등배분값(value_alloc)으로 재구축 — L2 와 합계 일치
+    (기존: 대표HS 100% 귀속이라 두 층의 품목별 합계가 상충)
+  * kor_mnc_link 의 수출자 모회사 국적을 거래시점 UP(shipper_up, PIT+대체) 기준으로
+    (기존: 현재 스냅샷 UP 국적 — within_firm 의 PIT 기준과 시점 혼용)
 
 사용법:  python scripts\processing\wf2q_30_build_panels.py
 """
@@ -28,9 +36,13 @@ import pandas as pd
 
 STAGE = Path(r"C:\panjiva\data\staging\within_firm_pilot_2q")
 L0, L2, L3 = STAGE / "L0", STAGE / "L2", STAGE / "L3"
+V1 = Path(r"C:\panjiva\data\staging\tom_v1_2024h1")     # v1 재무 중간산출 (리뷰 반영)
 QUARTERS = {"2024Q1": ("2024-01-01", ["2024-01", "2024-02", "2024-03"]),
             "2024Q2": ("2024-04-01", ["2024-04", "2024-05", "2024-06"])}
-FIN_COLS = ["revenue", "cogs", "assets", "inventory", "capex", "ppent", "lt_debt"]
+FIN_LOOKBACK_DAYS = 730                                  # 소급 2년 (v1 결정 3-6 통일)
+FIN_MONEY = ["revenue", "cogs", "assets", "ebitda", "inventory", "capex", "ppent", "lt_debt"]
+FIN_VALUE_COLS = [f"{c}_usd" for c in FIN_MONEY] + ["employees"]
+FIN_META_COLS = ["fin_currency", "fx_per_usd", "is_press_release", "perimeter_change"]
 
 
 def top_by(df: pd.DataFrame, keys: list, col: str, weight: str, out: str) -> pd.DataFrame:
@@ -39,19 +51,21 @@ def top_by(df: pd.DataFrame, keys: list, col: str, weight: str, out: str) -> pd.
     if not len(sub):
         return pd.DataFrame(columns=keys + [out])
     return (sub.groupby(keys + [col], dropna=False, observed=True)[weight].sum()
-               .reset_index().sort_values(weight, ascending=False)
+               .reset_index()
+               .sort_values([weight, col], ascending=[False, True], kind="mergesort")
                .drop_duplicates(keys).rename(columns={col: out})[keys + [out]])
 
 
-def fin_asof(fin: pd.DataFrame, q_start: str) -> pd.DataFrame:
-    """분기 시작일 '이전에 끝난' 마지막 분기 재무 1행/기업 + lag 일수."""
-    sub = fin[fin["period_end"] < pd.Timestamp(q_start)].sort_values("period_end")
-    out = sub.drop_duplicates("companyid", keep="last").copy()
-    out["fin_lag_days"] = (pd.Timestamp(q_start) - out["period_end"]).dt.days
-    keep = ["companyid", "period_end", "filing_date", "fin_currency",
-            "fin_lag_days"] + FIN_COLS
-    return out[keep].rename(columns={"period_end": "fin_period_end",
-                                     "filing_date": "fin_filing_date"})
+def fin_asof(fin: pd.DataFrame, q_start: str, prefix: str) -> pd.DataFrame:
+    """분기 시작일 '이전에 끝난' 마지막 재무 1행/기업 + lag. 소급 2년 초과는 결측 처리."""
+    qs = pd.Timestamp(q_start)
+    sub = fin[(fin["period_end"] < qs)
+              & (fin["period_end"] >= qs - pd.Timedelta(days=FIN_LOOKBACK_DAYS))]
+    out = sub.sort_values("period_end").drop_duplicates("companyid", keep="last").copy()
+    out["fin_lag_days"] = (qs - out["period_end"]).dt.days
+    keep = ["companyid", "period_end", "fin_lag_days"] + FIN_META_COLS + FIN_VALUE_COLS
+    out = out[keep].rename(columns={"period_end": "fin_period_end"})
+    return out.rename(columns={c: f"{prefix}{c}" for c in out.columns if c != "companyid"})
 
 
 def to_stata(df: pd.DataFrame, path: Path) -> None:
@@ -76,15 +90,24 @@ def main() -> None:
 
     print("[1/6] fact 로드")
     cols = ["record_id", "arrival_date", "ym", "consignee_ciqid", "shipper_ciqid",
-            "consignee_pcid", "shipper_pcid", "origin_country", "hs6_main", "hs2_main",
+            "consignee_pcid", "shipper_pcid", "consignee_up", "shipper_up",
+            "origin_country", "hs6_main", "hs2_main",
             "n_hs6", "weight_kg", "value_usd", "teu", "within_firm", "relationship",
             "con_own_fallback", "shp_own_fallback"]
     imp = pd.read_parquet(L2 / "fact_shipment.parquet", columns=cols)
     co = pd.read_parquet(L0 / "company.parquet")
-    fin = pd.read_parquet(L0 / "fin_quarterly.parquet")
-    fin["period_end"] = pd.to_datetime(fin["period_end"])
 
-    up_country = co.set_index("companyid")["ultimate_parent_country_iso2"]
+    # 재무: v1 표준 (연간+분기, 9계정 USD, 환율·플래그 포함) — 2026-08-12 리뷰 확정
+    def _load_fin(name: str) -> pd.DataFrame:
+        f = pd.read_parquet(V1 / name)
+        f["companyid"] = pd.to_numeric(f["companyid"], errors="coerce").astype("int64")
+        f["period_end"] = pd.to_datetime(f["period_end"]).astype("datetime64[ns]")
+        return f.sort_values("period_end")
+    fin_a, fin_q = _load_fin("fin_annual.parquet"), _load_fin("fin_quarterly.parquet")
+
+    # UP 국가: 거래시점 UP(PIT+대체) id → 소재국. H1 등장 UP 전체를 덮는 신규 참조 테이블.
+    upc = pd.read_parquet(V1 / "up_countries.parquet")
+    up_country = upc.set_index("companyid")["country_iso2"]
 
     both = imp[imp["consignee_ciqid"].notna() & imp["shipper_ciqid"].notna()].copy()
     diag += [f"- 수입 선적 {len(imp):,} / 양측 매칭 {len(both):,} "
@@ -120,7 +143,11 @@ def main() -> None:
     pm = pm.merge(top_by(both, keys, "origin_country", "value_usd", "origin_main"),
                   on=keys, how="left")
 
-    pm["shp_up_country"] = pm["shipper_ciqid"].map(up_country)
+    # kor_mnc_link — 수출자 '거래시점' UP(PIT+대체)의 소재국 기준 (2026-08-12 리뷰 확정).
+    # 기존(스냅샷 UP 국적)은 within_firm 의 PIT 기준과 시점이 어긋났다.
+    pm = pm.merge(top_by(both, keys, "shipper_up", "value_usd", "shp_up_main"),
+                  on=keys, how="left")
+    pm["shp_up_country"] = pm["shp_up_main"].map(up_country)
     pm["kor_mnc_link"] = ((pm["shp_up_country"] == "KR")
                           & (pm["origin_main"] == "South Korea")
                           & (pm["within_firm"] == 1)).astype("int8")
@@ -218,7 +245,7 @@ def main() -> None:
     # 수출측: 기업 = 매칭된 미국 수출자. consignee 부재로 파트너 지표 없음.
     exp = pd.read_parquet(
         L2 / "fact_shipment_export.parquet",
-        columns=["record_id", "ym", "exporter_ciqid", "dest_country",
+        columns=["record_id", "ym", "exporter_ciqid", "exporter_up", "dest_country",
                  "hs6_main", "weight_kg", "value_usd", "teu"])
     exp["yq"] = exp["ym"].map({m: q for q, (_, ms) in QUARTERS.items() for m in ms})
     sube = exp[exp["exporter_ciqid"].notna()]
@@ -233,39 +260,84 @@ def main() -> None:
 
     fq = pd.concat(blocks, ignore_index=True)
 
-    # 재무 as-of 결합 (분기 시작 전 마지막 분기)
+    # 기업×분기의 모회사 id — 거래시점 UP(금액가중 대표). 수입=consignee_up, 수출=shipper_up.
+    up_imp = top_by(imp[imp["consignee_ciqid"].notna()], ["consignee_ciqid", "yq"],
+                    "consignee_up", "value_usd", "up_id") \
+        .rename(columns={"consignee_ciqid": "ciq_companyid"})
+    up_imp["direction"] = "import"
+    up_exp = top_by(sube.assign(yq=sube["ym"].map(
+                        {m: q for q, (_, ms) in QUARTERS.items() for m in ms})),
+                    ["exporter_ciqid", "yq"], "exporter_up", "value_usd", "up_id") \
+        .rename(columns={"exporter_ciqid": "ciq_companyid"})
+    up_exp["direction"] = "export"
+    fq = fq.merge(pd.concat([up_imp, up_exp], ignore_index=True),
+                  on=["ciq_companyid", "direction", "yq"], how="left")
+
+    # 재무 as-of 결합 — v1 표준 4블록: 자기(연간 접두어 없음 / 분기 q_) + 모회사(up_a_ / up_q_)
     parts = []
     for q, (q_start, _) in QUARTERS.items():
-        chunk = fq[fq["yq"] == q].merge(fin_asof(fin, q_start),
-                                        left_on="ciq_companyid",
-                                        right_on="companyid", how="left")
-        parts.append(chunk.drop(columns=["companyid"]))
+        chunk = fq[fq["yq"] == q]
+        for prefix, key, fin in (("", "ciq_companyid", fin_a),
+                                 ("q_", "ciq_companyid", fin_q),
+                                 ("up_a_", "up_id", fin_a),
+                                 ("up_q_", "up_id", fin_q)):
+            chunk = chunk.merge(fin_asof(fin, q_start, prefix),
+                                left_on=key, right_on="companyid", how="left") \
+                         .drop(columns=["companyid"])
+        parts.append(chunk)
     fq = pd.concat(parts, ignore_index=True)
-    fq["has_financials"] = fq["revenue"].notna().astype("int8")
+    fq["has_financials"] = fq["revenue_usd"].notna().astype("int8")       # 자기·연간 기준
+    fq["up_has_financials"] = fq["up_a_revenue_usd"].notna().astype("int8")
 
     dup = fq.duplicated(["ciq_companyid", "direction", "yq"]).sum()
     diag.append(f"- G4 firm_quarter 키 중복: **{dup}**")
     if dup:
         sys.exit(f"[게이트 실패] firm_quarter 키 중복 {dup}")
-    diag.append(f"- firm_quarter: {len(fq):,}행 / 재무 보유 "
-                f"{fq['has_financials'].mean():.1%}")
+    diag.append(f"- firm_quarter: {len(fq):,}행 / 재무 보유(자기·연간) "
+                f"{fq['has_financials'].mean():.1%} / 모회사·연간 "
+                f"{fq['up_has_financials'].mean():.1%} "
+                f"(리뷰 전 분기·법인만 기준 1.4%)")
+    ages = pd.concat([pd.to_numeric(fq[c], errors="coerce").dropna()
+                      for c in ("fin_lag_days", "q_fin_lag_days",
+                                "up_a_fin_lag_days", "up_q_fin_lag_days")])
+    diag.append(f"- 재무 lag: min {ages.min():.0f} · max {ages.max():.0f} "
+                f"(1~730 이어야 함) {'✅' if ages.min() >= 1 and ages.max() <= 730 else '❌'}")
+    diag.append(f"- kor_mnc_link=1: {int(pm['kor_mnc_link'].sum()):,} pair-월 "
+                f"(리뷰 전 스냅샷 UP 기준 477 — 거래시점 UP 로 교체 후 값)")
     fq.to_parquet(L3 / "panel_firm_quarter.parquet", index=False)
     print(f"  -> panel_firm_quarter.parquet {len(fq):,}행")
 
     # ---- 5. panel_firm_origin_hs (2024H1) + 스텁 --------------------------
-    print("[5/6] panel_firm_origin_hs")
-    sub = imp[imp["consignee_ciqid"].notna()]
-    fo = (sub.groupby(["consignee_ciqid", "origin_country", "hs6_main"], dropna=False)
-             .agg(n_shipments=("record_id", "nunique"), weight_kg=("weight_kg", "sum"),
-                  value_usd=("value_usd", "sum"), teu=("teu", "sum"))
-             .reset_index())
-    wsub = both[both["within_firm"] == 1]
-    fo_w = (wsub.groupby(["consignee_ciqid", "origin_country", "hs6_main"], dropna=False)
-                ["value_usd"].sum().rename("value_within").reset_index())
+    # 2026-08-12 리뷰 확정: 대표HS 100% 귀속 → L2 균등배분값(value_alloc)으로 재구축.
+    # 이제 이 패널의 품목별 합계가 L2 fact_shipment_hs 와 정의상 일치한다.
+    print("[5/6] panel_firm_origin_hs (균등배분 기준)")
+    hs = pd.read_parquet(L2 / "fact_shipment_hs.parquet",
+                         columns=["record_id", "hs6", "weight_alloc",
+                                  "value_alloc", "teu_alloc"])
+    hs = hs.merge(imp[["record_id", "consignee_ciqid", "origin_country", "within_firm"]],
+                  on="record_id", how="inner")
+    sub = hs[hs["consignee_ciqid"].notna()]
+    fo = (sub.groupby(["consignee_ciqid", "origin_country", "hs6"], dropna=False)
+             .agg(n_shipments=("record_id", "nunique"),
+                  weight_kg=("weight_alloc", "sum"),
+                  value_usd=("value_alloc", "sum"),
+                  teu=("teu_alloc", "sum"))
+             .reset_index().rename(columns={"hs6": "hs6_main"}))
+    fo_w = (sub[sub["within_firm"] == 1]
+            .groupby(["consignee_ciqid", "origin_country", "hs6"], dropna=False)
+            ["value_alloc"].sum().rename("value_within").reset_index()
+            .rename(columns={"hs6": "hs6_main"}))
     fo = fo.merge(fo_w, how="left",
                   on=["consignee_ciqid", "origin_country", "hs6_main"])
     fo["period"] = "2024H1"
+    fo["alloc_rule"] = "v1_equal"
     fo.to_parquet(L3 / "panel_firm_origin_hs.parquet", index=False)
+    # 대사: 배분값 합 == HS 보유 선적의 원값 합 (consignee 매칭분)
+    lhs = fo["value_usd"].sum()
+    rhs = imp.loc[imp["consignee_ciqid"].notna()
+                  & imp["record_id"].isin(hs["record_id"]), "value_usd"].sum()
+    diag.append(f"- firm_origin_hs 배분 대사: {lhs:,.0f} vs {rhs:,.0f} "
+                f"{'✅' if np.isclose(lhs, rhs, rtol=1e-9) else '❌'}")
     print(f"  -> panel_firm_origin_hs.parquet {len(fo):,}행")
 
     # §3.5 dim_group_trade_potential — 자리 예약 (본구축에서 적재)
