@@ -7,6 +7,50 @@
 
 ## 기록 (최신이 위)
 
+### 2026-08-12 — 코드 리뷰 지적사항 F1~F11 반영, 재추출
+
+**한 일**: 검토 문서(`2026-08-11_FIX_trade-ownership-pilot.md`)의 지적 11건을 반영하고
+1주치를 다시 뽑았다. 완료 체크리스트를 스크립트로 검증(`18/18 통과`).
+
+- **사용/수정 스크립트**: `scripts\extraction\ex_20260805_trade_ownership_master_1week.py`
+- **산출물**: `01` 254,873 / `02` 25,930 / `03` 49,289 / `04` 42,430행
+
+**F1 (필수) — 재무 결합이 표본 전체에 단일 컷오프였다**
+`periodEndDate < 표본시작일` 로 SQL 단계에서 회사당 1행을 잘라내고 있었다. 1주치에서는 차이가
+없지만 기간을 2020~2025로 넓히면 **2025년 선적에 2020년 기준 재무가 붙는다**.
+→ SQL 은 창(표본시작-4년 ~ 표본종료) 안의 **후보 전체**를 내려받고, 최종 선택은
+`pd.merge_asof`(행별 기준시점, backward, 4년 tolerance, `allow_exact_matches=False`)로 옮겼다.
+패널에 `period_start`/`period_end` 를 넣어 월·분기로 확장해도 같은 코드가 동작한다.
+검증: `fin_age_days` 최소 1 · 최대 1,435(≤1,461), 음수 0건, 패널 행 수 불변.
+
+**F2 — `build_pair` 가 `relationship` 을 `first` 로 뭉갬** → `n_relationship` 추가.
+이번 표본에선 갈린 쌍 0건이지만, 다년 패널에서는 인수·분할이 사라지므로 검증에 상시 노출.
+
+**F3 — `03_firm` 과 `04_group` 의 내부거래 비중 분모가 달랐다**
+(03은 분류된 거래, 04는 미매칭 포함 총액 → 04가 기계적으로 낮게 나옴). `_value_split()` 한 곳으로
+통일하고 원자료 5종(`_internal`·`_arms`·`_self`·`_unmatched`·`_classified`)을 함께 내보낸다.
+검증: `classified + self + unmatched == value_usd` 오차 0, 두 패널의 내부거래 총액 일치.
+
+**F4 — 진단 §5 커버리지가 실제 부착 규칙과 다른 창을 씀** → 동일 조건으로 맞추고,
+리포트가 스스로 대사하도록 한 줄 추가(실측 4,758개 일치 확인).
+
+**F5 — "Reclassified = 총액 동일"이 과했다.** 실측상 ~9%는 자산매각·중단사업 재분류라 손익
+총액이 바뀐다. `ciqFinInstance.isRestatementTypeId`(`latestForFinancialPeriodFlag=1`, 기간당 최대 1행 확인)를
+붙여 `fin_perimeter_change` 플래그 신설(이번 표본 1.6%). 소유구조로 거래를 분류하는 우리 설계에서는
+**재무의 기업 경계와 관계분류 경계가 어긋나는 구간**이라 표시가 필요하다.
+
+**F6~F8 (문서)** — `fin_year` → `fin_calendar_year` 개명(CIQ `calendarYear` 는 Compustat `fyear` 와
+3·4·5월 결산에서 100% 불일치, 2~5월 결산 15.5%) · `ciqFinPeriod` 설명 정정(정정 전 원본을 담고
+있지 않음, 컬럼 7종뿐) · `CLAUDE.md` 의 없는 경로(`C:\KDI\GVC\...`, `docs/` 접두어) 정리.
+
+**F9~F11** — `_top_by_value` 안정 정렬(mergesort + 타이브레이크), 생성일 하드코딩 제거
+(`date.today()`), 주석의 "3년 소급" → 4년, 미사용 인자 `trade_year` 제거,
+README 에 `self` 가 현재 `intra_group` 에서 **제외**돼 있다는 기본값 명시.
+
+**다음 할 일**: (변동 없음) PI 미결 #8~#10, 재무 통화 정규화, 분기 단위 확장.
+
+---
+
 ### 2026-08-06 — 파일럿 재생성(04_group 추가) + 팀 공용 문서 반영
 
 **한 일**: 파일럿을 검토하며 나온 결함 3건을 고쳐 통째로 재추출하고, 재사용 가능한 실측을

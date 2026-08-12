@@ -46,7 +46,7 @@ C:\panjiva\data\staging\trade_ownership_pilot_1week\
 import argparse
 import os
 import sys
-import textwrap
+from datetime import date
 from pathlib import Path
 
 import pandas as pd
@@ -275,7 +275,12 @@ left join ciqCompanyType upt on upt.companyTypeId = upc.companyTypeId
 """
 
 # ---------------------------------------------------------------------------
-# 3. 재무 — 연간, 거래연도 이하 중 가장 최근 연도 1개 (최대 3년 소급)
+# 3. 재무 — 연간. **후보 기간을 전부 내려받고, 최종 선택(as-of)은 pandas 에서 한다.**
+#
+# ⚠️ SQL 단계에서 회사당 1행으로 잘라내면 표본 전체가 하나의 컷오프를 쓰게 된다.
+#    1주치에서는 티가 안 나지만 기간을 2020~2025로 넓히면 2025년 선적에 2020년 기준
+#    재무가 붙는다(조용히 어긋남). 그래서 여기서는 창(window) 안의 후보를 다 받고,
+#    행별 기준시점으로 attach_financials() 가 고른다. 최대 소급은 4년.
 # ---------------------------------------------------------------------------
 SQL_FIN = """
 with base as (
@@ -312,26 +317,30 @@ ids as (
 ),
 per as (
     -- 회사×연도 1행으로 정리. 같은 기간에 정정본이 여러 개면 최신 신고분을 쓴다.
-    -- ⚠️ 거래일보다 **먼저 끝난** 회계연도만 쓴다. calendarYear <= 거래연도로 걸면
-    --    3월 선적에 그해 12월 결산 재무가 붙어 미래정보가 새어 든다.
+    -- 창(window)은 [표본시작 - 4년, 표본종료). 이 안의 후보를 **전부** 내려보낸다.
     select fp.financialPeriodId, fp.companyId, fp.calendarYear, fp.periodEndDate,
-           fp.currencyId, fp.filingDate, fp.restatementTypeId
+           fp.currencyId, fp.filingDate, fp.restatementTypeId,
+           -- 손익계산서 정정 유형(사업범위 변경 식별용). latestForFinancialPeriodFlag=1 은
+           -- 실측상 financialPeriodId 당 최대 1행이라 LEFT JOIN 이 행을 늘리지 않는다.
+           fi.isRestatementTypeId
     from ciqLatestInstanceFinPeriod fp
     join ids on ids.companyId = fp.companyId
+    left join ciqFinInstance fi on fi.financialPeriodId = fp.financialPeriodId
+                               and fi.latestForFinancialPeriodFlag = 1
     where fp.periodTypeId = 1                                   -- 1 = 연간
-      and fp.periodEndDate <  '{date_start}'
+      and fp.periodEndDate <  '{date_end}'
       and fp.periodEndDate >= dateadd(year, -4, to_date('{date_start}'))
     qualify row_number() over (partition by fp.companyId, fp.calendarYear
                                order by fp.periodEndDate desc, fp.filingDate desc) = 1
 ),
 wide as (
     select p.companyId, p.calendarYear, p.periodEndDate, p.filingDate, p.currencyId,
-           p.restatementTypeId,
+           p.restatementTypeId, p.isRestatementTypeId,
            {pivot}
     from per p
     left join ciqFinancialData d on d.financialPeriodId = p.financialPeriodId
                                 and d.dataItemId in ({item_ids})
-    group by 1, 2, 3, 4, 5, 6
+    group by 1, 2, 3, 4, 5, 6, 7
 )
 -- ⚠️ fin_filing_date 는 '최초 공시일'이 아니다. ciqLatestInstanceFinPeriod 의 filingDate 는
 --    그 기간의 **최신 인스턴스**가 실린 서류의 제출일이다. 회계기간은 이후 연차보고서에
@@ -340,24 +349,30 @@ wide as (
 --    이미 공시돼 있던 재무가 대량으로 사라진다(파일럿 기준 80.9% 소실).
 --    시점 통제가 필요하면 ciqFinInstance 를 조인해 financialPeriodId 별 min(filingDate) 를 쓸 것.
 select w.companyId     as companyid,
-       w.calendarYear  as fin_year,
+       -- ⚠️ CIQ calendarYear 는 Compustat fyear 가 아니다(1월 결산만 전년, 2~12월은 종료 연도.
+       --    Compustat 은 1~5월 결산을 전년으로 배정 → 3·4·5월 결산에서 100% 불일치).
+       --    Compustat 과 대조할 때는 periodEndDate 에서 직접 계산할 것.
+       w.calendarYear  as fin_calendar_year,
        w.periodEndDate as fin_period_end,
        w.filingDate    as fin_filing_date,   -- 최신 인스턴스 제출일 (위 주석 참조)
-       datediff(day, w.periodEndDate, to_date('{date_start}')) as fin_age_days,
        cu.ISOCode      as fin_currency,
        rt.restatementTypeName as fin_restatement_type,
        -- 이 기간의 '최신' 인스턴스가 보도자료뿐이라는 뜻(감사 전 잠정치). 제외하지 말고 표시만 한다
        iff(w.restatementTypeId = 1, 1, 0) as fin_is_press_release,
+       w.isRestatementTypeId as fin_is_restate_type_id,
+       -- 5 Reclassified for Disposal · 6 동 in Amendment · 12 Discontinued Operations
+       -- = 사업 범위가 바뀌어 손익 총액 자체가 달라진 기간. 관계분류(소유구조)와 재무의
+       --   기업 경계가 어긋날 수 있으므로 표시해 둔다.
+       iff(w.isRestatementTypeId in (5, 6, 12), 1, 0) as fin_perimeter_change,
        {cols}
 from wide w
 left join ciqCurrency cu on cu.currencyId = w.currencyId
 left join ciqRestatementType rt on rt.restatementTypeId = w.restatementTypeId
--- 거래일 이전에 끝난 회계연도 중 가장 최근 1개만 남긴다
-qualify row_number() over (partition by w.companyId order by w.periodEndDate desc) = 1
+-- ⚠️ 여기서 회사당 1행으로 자르지 않는다. 최종 선택은 attach_financials() 가 행별로 한다.
 """
 
 
-def build_fin_sql(date_start: str, date_end: str, trade_year: int) -> str:
+def build_fin_sql(date_start: str, date_end: str) -> str:
     pivot = ",\n           ".join(
         f"max(case when d.dataItemId = {k} then d.dataItemValue end) as {v}"
         for k, v in FIN_ITEMS.items())
@@ -426,11 +441,20 @@ xr as (
     where activeFlag = 1 and identifierValue is not null
     qualify row_number() over (partition by identifierValue order by companyId) = 1
 ),
-ids as (
+ids0 as (
     select distinct companyId from (
         select xc.companyId from base b join xr xc on xc.identifierValue = b.conPanjivaId
         union all
         select xs.companyId from base b join xr xs on xs.identifierValue = b.shpPanjivaId
+    ) where companyId is not null
+),
+ids as (
+    -- 실제 부착 대상과 같은 집합(무역 당사자 + 최종 모회사)
+    select distinct companyId from (
+        select companyId from ids0
+        union all
+        select up.ultimateParentCompanyId
+        from ciqCompanyUltimateParent up join ids0 on ids0.companyId = up.companyId
     ) where companyId is not null
 )
 select (select count(*) from ids) as matched_companies,
@@ -440,7 +464,9 @@ from ids
 left join ciqLatestInstanceFinPeriod fp
        on fp.companyId = ids.companyId
       and fp.periodTypeId in (1, 2)
-      and fp.calendarYear between {fin_year_min} and {fin_year_max}
+      -- ⚠️ 실제 부착 규칙(attach_financials)과 **같은 창**을 써야 §5 숫자가 어긋나지 않는다
+      and fp.periodEndDate <  '{date_end}'
+      and fp.periodEndDate >= dateadd(year, -4, to_date('{date_start}'))
 """
 
 SQL_CHECK_HS_REASSEMBLY = """
@@ -522,12 +548,73 @@ def tidy_ship(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+# 재무 컬럼 목록 — attach_financials 가 접두어를 붙여 옮긴다
+FIN_META = ["fin_calendar_year", "fin_period_end", "fin_filing_date", "fin_currency",
+            "fin_restatement_type", "fin_is_press_release",
+            "fin_is_restate_type_id", "fin_perimeter_change"]
+FIN_COLS = FIN_META + list(FIN_ITEMS.values())
+
+MAX_LOOKBACK = pd.Timedelta(days=365 * 4)   # SQL 창(dateadd(year,-4))과 같은 값
+
+
+def attach_financials(panel: pd.DataFrame, fin: pd.DataFrame, key: str,
+                      ref_col: str, prefix: str) -> pd.DataFrame:
+    """기준시점(`ref_col`) **이전에 끝난** 회계연도 중 가장 최근 1개를 행별로 붙인다.
+
+    ⚠️ 이 선택을 SQL 에서 한 번에 하면 표본 전체가 같은 컷오프를 쓰게 된다.
+       1주치는 티가 안 나지만 기간을 넓히면 최근 선적에 몇 년 전 재무가 붙는다.
+       `merge_asof` 는 규칙(뒤로만, 4년 이내, 결산일==기준일은 제외)이 코드에 그대로 드러난다.
+    """
+    right = (fin.dropna(subset=["companyid", "fin_period_end"])
+                .assign(_k=lambda d: d["companyid"].astype("int64"))
+                .sort_values("fin_period_end")[["_k", *FIN_COLS]])
+    left = (panel.assign(_k=lambda d: d[key].astype("int64"))
+                 .sort_values(ref_col))
+    out = pd.merge_asof(
+        left, right,
+        left_on=ref_col, right_on="fin_period_end", by="_k",
+        direction="backward",              # 기준시점보다 **과거**만
+        tolerance=MAX_LOOKBACK,            # 4년 넘게 묵은 재무는 안 붙임
+        allow_exact_matches=False,         # 결산일 == 기준일이면 아직 공시 전
+    ).drop(columns="_k")
+    out[f"{prefix}fin_age_days"] = (out[ref_col] - out["fin_period_end"]).dt.days
+    out[f"{prefix}has_financials"] = out["fin_calendar_year"].notna().astype("int8")
+    return out.rename(columns={c: f"{prefix}{c}" for c in FIN_COLS})
+
+
+def _value_split(sub: pd.DataFrame, key, prefix: str) -> pd.DataFrame:
+    """관계 유형별 금액 분해 — 03_firm 과 04_group 이 **같은 정의**를 쓰도록 한 곳에 모은다.
+
+    `_intra_share` 의 분모는 양쪽 다 **분류된 거래**(intra + arms_length)다.
+    미매칭을 분모에 넣으면 매칭률이 낮은 기업일수록 비중이 기계적으로 낮아진다.
+    `self`(양측 동일 법인)는 어느 쪽에도 넣지 않고 따로 뺀다 — v0.2 미결 #9.
+    """
+    INTRA = ("parent_sub", "sibling")
+    rel, val = sub["relationship"], sub["valueofgoodsusd"]
+    parts = sub.assign(
+        _internal=val.where(rel.isin(INTRA), 0),
+        _arms=val.where(rel.eq("arms_length"), 0),
+        _self=val.where(rel.eq("self"), 0),
+        _unmatched=val.where(rel.str.startswith("unmatched"), 0),
+    ).groupby(key)[["_internal", "_arms", "_self", "_unmatched"]].sum()
+    parts.columns = [f"{prefix}_value_internal", f"{prefix}_value_arms",
+                     f"{prefix}_value_self", f"{prefix}_value_unmatched"]
+    classified = parts[f"{prefix}_value_internal"] + parts[f"{prefix}_value_arms"]
+    parts[f"{prefix}_value_classified"] = classified
+    parts[f"{prefix}_intra_share"] = (
+        parts[f"{prefix}_value_internal"] / classified).where(classified > 0)
+    return parts
+
+
 def build_pair(ship: pd.DataFrame, co: pd.DataFrame, fin: pd.DataFrame) -> pd.DataFrame:
     """한 행 = (shipper, consignee) 쌍. 양측이 모두 매칭된 선적만 대상."""
     both = ship[ship["con_companyid"].notna() & ship["shp_companyid"].notna()].copy()
     g = both.groupby(["shp_companyid", "con_companyid"], dropna=False)
     pair = g.agg(
         relationship=("relationship", "first"),
+        # relationship 은 '선적별' 속성이다(PIT 소유구조가 바뀌면 같은 쌍이라도 값이 달라짐).
+        # first 로 뭉개면 인수·분할 시점이 조용히 사라지므로 불일치 건수를 같이 센다.
+        n_relationship=("relationship", "nunique"),
         intra_group=("intra_group", "first"),
         n_ship=("panjivarecordid", "nunique"),
         value_usd=("valueofgoodsusd", "sum"),
@@ -542,8 +629,12 @@ def build_pair(ship: pd.DataFrame, co: pd.DataFrame, fin: pd.DataFrame) -> pd.Da
     for col, out in (("hs2", "top_hs2"), ("hs6", "top_hs6")):
         pair = pair.merge(_top_by_value(both, keys, col, out), on=keys, how="left")
 
+    pair["period_start"] = pd.Timestamp(ship["arrivaldate"].min())
+    pair["period_end"] = pd.Timestamp(ship["arrivaldate"].max())
     for side, key in (("shp", "shp_companyid"), ("con", "con_companyid")):
-        pair = _attach(pair, co, fin, key, f"{side}_")
+        c = co.add_prefix(f"{side}_").rename(columns={f"{side}_companyid": key})
+        pair = pair.merge(c, on=key, how="left")
+        pair = attach_financials(pair, fin, key, "period_start", f"{side}_")
     return pair
 
 
@@ -561,18 +652,7 @@ def build_firm(ship: pd.DataFrame, co: pd.DataFrame, fin: pd.DataFrame) -> pd.Da
             f"{prefix}_teu": ("volumeteu", "sum"),
             f"{prefix}_n_partners": (other, "nunique"),
         })
-        # 관계 유형별 금액 분해
-        piv = (sub.pivot_table(index=key, columns="relationship",
-                               values="valueofgoodsusd", aggfunc="sum")
-                  .rename(columns=lambda c: f"{prefix}_val_{c}"))
-        b = b.join(piv, how="left")
-        zero = pd.Series(0.0, index=b.index)
-        intra = sum((b[c] if c in b else zero).fillna(0)
-                    for c in (f"{prefix}_val_parent_sub", f"{prefix}_val_sibling"))
-        arms = (b[f"{prefix}_val_arms_length"]
-                if f"{prefix}_val_arms_length" in b else zero).fillna(0)
-        denom = intra + arms
-        b[f"{prefix}_intra_share"] = (intra / denom).where(denom > 0)
+        b = b.join(_value_split(sub, key, prefix), how="left")
         for col, out in (("hs2", f"{prefix}_top_hs2"),
                          ("shpmtorigin", f"{prefix}_top_partner_country")):
             b = b.join(_top_by_value(sub, [key], col, out).set_index(key), how="left")
@@ -581,9 +661,9 @@ def build_firm(ship: pd.DataFrame, co: pd.DataFrame, fin: pd.DataFrame) -> pd.Da
 
     firm = blocks[0].join(blocks[1], how="outer").reset_index()
     firm = firm.merge(co, on="companyid", how="left")
-    firm = firm.merge(fin, on="companyid", how="left")
-    firm["has_financials"] = firm["fin_year"].notna().astype("int8")
-    return firm
+    firm["period_start"] = pd.Timestamp(ship["arrivaldate"].min())
+    firm["period_end"] = pd.Timestamp(ship["arrivaldate"].max())
+    return attach_financials(firm, fin, "companyid", "period_start", "")
 
 
 def build_group(ship: pd.DataFrame, co: pd.DataFrame, fin: pd.DataFrame) -> pd.DataFrame:
@@ -605,15 +685,10 @@ def build_group(ship: pd.DataFrame, co: pd.DataFrame, fin: pd.DataFrame) -> pd.D
             f"{prefix}_n_members": (member, "nunique"),       # 이 표본에 등장한 소속 법인 수
             f"{prefix}_n_partner_groups": (other, "nunique"),
         })
-        # 그룹 내부거래 = 상대의 최종 모회사가 나와 같은 거래. 집단 단위로 보면 자기거래다.
-        internal = (sub[sub[key] == sub[other]].groupby(key)["valueofgoodsusd"].sum()
-                    .rename(f"{prefix}_value_internal"))
-        b = b.join(internal, how="left")
-        b[f"{prefix}_value_internal"] = b[f"{prefix}_value_internal"].fillna(0)
-        b[f"{prefix}_value_external"] = b[f"{prefix}_value_usd"] - b[f"{prefix}_value_internal"]
-        b[f"{prefix}_internal_share"] = (
-            b[f"{prefix}_value_internal"] / b[f"{prefix}_value_usd"]
-        ).where(b[f"{prefix}_value_usd"] > 0)
+        # 03_firm 과 **같은 정의**로 분해한다(분모 = 분류된 거래, self 는 별도).
+        # 집단 단위에서 '내부거래'는 상대의 최종 모회사가 나와 같은 거래인데,
+        # 그것이 곧 parent_sub + sibling 이므로 _value_split 과 결과가 일치한다.
+        b = b.join(_value_split(sub, key, prefix), how="left")
         for col, out in (("hs2", f"{prefix}_top_hs2"),
                          ("shpmtorigin", f"{prefix}_top_partner_country")):
             b = b.join(_top_by_value(sub, [key], col, out).set_index(key), how="left")
@@ -629,10 +704,9 @@ def build_group(ship: pd.DataFrame, co: pd.DataFrame, fin: pd.DataFrame) -> pd.D
     co_up = (co[[c for c in keep if c in co.columns]]
              .rename(columns={"companyid": "ultimate_parent_companyid"}))
     grp = grp.merge(co_up, on="ultimate_parent_companyid", how="left")
-    fin_up = fin.rename(columns={"companyid": "ultimate_parent_companyid"})
-    grp = grp.merge(fin_up, on="ultimate_parent_companyid", how="left")
-    grp["has_financials"] = grp["fin_year"].notna().astype("int8")
-    return grp
+    grp["period_start"] = pd.Timestamp(ship["arrivaldate"].min())
+    grp["period_end"] = pd.Timestamp(ship["arrivaldate"].max())
+    return attach_financials(grp, fin, "ultimate_parent_companyid", "period_start", "")
 
 
 def _top_by_value(df: pd.DataFrame, keys: list, col: str, out: str) -> pd.DataFrame:
@@ -643,17 +717,11 @@ def _top_by_value(df: pd.DataFrame, keys: list, col: str, out: str) -> pd.DataFr
         return pd.DataFrame(columns=keys + [out])
     return (sub.groupby(keys + [col], dropna=False)["valueofgoodsusd"].sum()
                .reset_index()
-               .sort_values("valueofgoodsusd", ascending=False)
+               # 금액 동률일 때 실행마다 값이 달라지지 않도록 안정 정렬 + 결정적 타이브레이크
+               .sort_values(["valueofgoodsusd", col], ascending=[False, True],
+                            kind="mergesort")
                .drop_duplicates(keys)
                .rename(columns={col: out})[keys + [out]])
-
-
-def _attach(pair, co, fin, key, prefix):
-    c = co.add_prefix(prefix).rename(columns={f"{prefix}companyid": key})
-    f = fin.add_prefix(prefix).rename(columns={f"{prefix}companyid": key})
-    out = pair.merge(c, on=key, how="left").merge(f, on=key, how="left")
-    out[f"{prefix}has_financials"] = out[f"{prefix}fin_year"].notna().astype("int8")
-    return out
 
 
 def main() -> None:
@@ -665,7 +733,7 @@ def main() -> None:
     args = ap.parse_args()
 
     ds, de = args.week_start, args.week_end
-    trade_year = int(ds[:4])
+    run_date = date.today().isoformat()          # 카탈로그·리포트에 하드코딩하지 않는다
     sql_ship = SQL_SHIPMENT.format(date_start=ds, date_end=de)
 
     if args.print_sql:
@@ -681,15 +749,14 @@ def main() -> None:
         with conn.cursor() as cur:
             ship = fetch(cur, sql_ship, "선적 층")
             co = fetch(cur, SQL_COMPANY.format(date_start=ds, date_end=de), "기업 기준정보")
-            fin = fetch(cur, build_fin_sql(ds, de, trade_year), "재무(연간)")
+            fin = fetch(cur, build_fin_sql(ds, de), "재무(연간, 후보 전체)")
             chk = {
                 "pit": fetch(cur, SQL_CHECK_PIT, "진단 PIT 프로파일"),
                 "pit_iv": fetch(cur, SQL_CHECK_PIT_INTERVALS, "진단 PIT 구간수"),
                 "childjoin": fetch(cur, SQL_CHECK_CHILDJOIN.format(date_start=ds, date_end=de),
                                    "진단 자식조인 부풀림"),
-                "fincov": fetch(cur, SQL_CHECK_FIN_COVERAGE.format(
-                    date_start=ds, date_end=de,
-                    fin_year_min=trade_year - 3, fin_year_max=trade_year), "진단 재무 커버리지"),
+                "fincov": fetch(cur, SQL_CHECK_FIN_COVERAGE.format(date_start=ds, date_end=de),
+                                "진단 재무 커버리지"),
                 "hsfix": fetch(cur, SQL_CHECK_HS_REASSEMBLY, "진단 HS 재결합"),
             }
 
@@ -699,7 +766,11 @@ def main() -> None:
         if c in co.columns:
             co[c] = pd.to_numeric(co[c], errors="coerce").astype("Int64")
     fin["companyid"] = pd.to_numeric(fin["companyid"], errors="coerce").astype("Int64")
-    fin["fin_year"] = pd.to_numeric(fin["fin_year"], errors="coerce").astype("Int64")
+    for c in ("fin_calendar_year", "fin_is_press_release",
+              "fin_is_restate_type_id", "fin_perimeter_change"):
+        fin[c] = pd.to_numeric(fin[c], errors="coerce").astype("Int64")
+    for c in ("fin_period_end", "fin_filing_date"):
+        fin[c] = pd.to_datetime(fin[c], errors="coerce")
 
     # 선적 파일에도 회사 이름·산업 정도는 붙여 둔다(눈으로 볼 때 필요). 재무는 붙이지 않는다.
     co_lite = co[["companyid", "companyname", "country_iso2", "industry",
@@ -723,7 +794,8 @@ def main() -> None:
         print(f"  {p.name:<20} {len(df):>9,}행  {p.stat().st_size/1e6:>7.1f} MB")
 
     print("\n[4/4] 진단 리포트")
-    write_checks(out_dir / "90_checks.md", ship, pair, firm, group, co, fin, chk, ds, de)
+    write_checks(out_dir / "90_checks.md", ship, pair, firm, group, co, fin, chk,
+                 ds, de, run_date)
     print(f"  {out_dir / '90_checks.md'}")
 
     print("\n" + "=" * 78)
@@ -740,10 +812,10 @@ def main() -> None:
     for name, df in (("01_shipment", ship), ("02_pair", pair),
                      ("03_firm", firm), ("04_group", group)):
         print(f"| `{folder}/{name}.parquet` | {desc[name]} | {ds}~{de} ({days}일) | "
-              f"{len(df):,} | `{Path(__file__).name}` | 2026-08-05 | 김영수 |")
+              f"{len(df):,} | `{Path(__file__).name}` | {run_date} | 김영수 |")
 
 
-def write_checks(path, ship, pair, firm, group, co, fin, chk, ds, de) -> None:
+def write_checks(path, ship, pair, firm, group, co, fin, chk, ds, de, run_date) -> None:
     """진단 8종 + 검증. 숫자만 적지 않고 '그래서 뭘 뜻하는지'를 같이 적는다."""
     n = len(ship)
     both = ship["con_companyid"].notna() & ship["shp_companyid"].notna()
@@ -760,7 +832,7 @@ def write_checks(path, ship, pair, firm, group, co, fin, chk, ds, de) -> None:
     A = L.append
     A(f"# 파일럿 추출 — 확인 결과\n")
     A(f"**표본**: {ds} ~ {de} ({days}일, 도착일 기준) · "
-      f"**생성**: `{Path(__file__).name}` · 2026-08-05\n")
+      f"**생성**: `{Path(__file__).name}` · {run_date}\n")
     A("숫자마다 '그래서 뭘 뜻하는지'를 아래에 붙여 뒀습니다.\n")
 
     A("\n## 0. 먼저 — 표본이 문서와 맞는가\n")
@@ -855,20 +927,32 @@ def write_checks(path, ship, pair, firm, group, co, fin, chk, ds, de) -> None:
     A("\n## 5. 재무는 몇 %에 붙나\n")
     f = chk["fincov"].iloc[0]
     mc = int(f["matched_companies"])
-    A(f"- 이 주간에 등장한 매칭 기업 **{mc:,}개**")
+    A(f"- 이 주간에 등장한 매칭 기업(+ 최종 모회사) **{mc:,}개**")
     A(f"- 연간 재무 보유 **{int(f['has_annual']):,}개** ({pct(int(f['has_annual']), mc)})")
     A(f"- 분기 재무 보유 **{int(f['has_quarterly']):,}개** ({pct(int(f['has_quarterly']), mc)})")
-    if len(fin):
-        A(f"- 실제로 붙인 재무의 회계연도 분포: "
+    n_fin_co = int(fin["companyid"].nunique())
+    A(f"- ↳ 대사: 실제로 내려받은 재무의 고유 회사 수 **{n_fin_co:,}개** — "
+      + ("위 '연간 재무 보유'와 일치합니다(진단 쿼리와 부착 규칙이 같은 창을 씁니다)."
+         if n_fin_co == int(f["has_annual"])
+         else f"⚠️ 위 값과 **{n_fin_co - int(f['has_annual']):+,}개 차이** — 진단 쿼리와 "
+              "부착 규칙의 조건이 어긋났다는 뜻이니 확인이 필요합니다."))
+    att = firm[firm["fin_calendar_year"].notna()]
+    if len(att):
+        A(f"- 실제로 붙은 재무의 회계연도 분포: "
           + ", ".join(f"{int(k)}년 {v:,}개"
-                      for k, v in fin["fin_year"].value_counts().sort_index().items()))
-        age = pd.to_numeric(fin["fin_age_days"], errors="coerce")
-        A(f"- 결산일과 거래일의 간격: 중위 {age.median():.0f}일 "
-          f"(최소 {age.min():.0f} · 최대 {age.max():.0f})")
-        cur_mix = fin["fin_currency"].value_counts()
-        usd = 100 * cur_mix.get("USD", 0) / len(fin)
+                      for k, v in att["fin_calendar_year"].value_counts().sort_index().items()))
+        age = pd.to_numeric(att["fin_age_days"], errors="coerce")
+        A(f"- 결산일 → 기준시점 간격: 중위 {age.median():.0f}일 "
+          f"(최소 **{age.min():.0f}** · 최대 **{age.max():.0f}**) — "
+          "음수가 있으면 미래 재무가 샌 것이고, 1,461일(4년)을 넘으면 소급 한도가 깨진 것입니다")
+        cur_mix = att["fin_currency"].value_counts()
+        usd = 100 * cur_mix.get("USD", 0) / len(att)
         A(f"- 표시 통화 상위: " + ", ".join(f"{k} {v:,}" for k, v in cur_mix.head(5).items())
           + f"  → **USD 는 {usd:.0f}% 뿐**")
+        pc = int(pd.to_numeric(att["fin_perimeter_change"], errors="coerce").fillna(0).sum())
+        A(f"- **사업 범위가 바뀐 회계기간**(자산매각·중단사업 재분류): {pc:,}개 "
+          f"({100*pc/len(att):.1f}%) — `fin_perimeter_change=1`. "
+          "이 기간은 재무의 기업 경계와 소유구조 기준 경계가 어긋날 수 있습니다")
     A("\n**뜻 (1) 커버리지**: 재무가 없는 회사가 많은 건 데이터 오류가 아니라 "
       "**비상장사는 재무를 공시하지 않기 때문**입니다. 재무를 요구하는 분석은 표본이 "
       "상장사 쪽으로 크게 치우칩니다 — 이건 데이터를 더 받아서 해결되는 문제가 아닙니다.")
@@ -914,7 +998,14 @@ def write_checks(path, ship, pair, firm, group, co, fin, chk, ds, de) -> None:
       "실측: 가장 이른 인스턴스가 Original 65.7% · Press Release 33.5%, 결산일 대비 중위 90일.\n")
     A("\n**뜻 (4) 정정본**: `ciqLatestInstanceFinPeriod` 는 각 기간의 **최신 정정본**을 줍니다. "
       "기술통계에는 이게 더 정확합니다. `fin_is_press_release=1` 인 행은 그 기간에 대해 "
-      "보도자료(감사 전 잠정치)밖에 없다는 뜻이니 제외하지 말고 플래그로만 다루세요.\n")
+      "보도자료(감사 전 잠정치)밖에 없다는 뜻이니 제외하지 말고 플래그로만 다루세요.")
+    A("\n정정 유형 중 `Reclassified` 는 **대부분 항목 재배치라 총액이 그대로**지만, "
+      "**약 9%는 자산매각·중단사업 재분류라 손익 총액 자체가 바뀝니다**"
+      "(Reclassified for Disposal 5.2% + Restated 3.6% + Discontinued Operations 0.1%). "
+      "이 과제에서 특히 중요한 이유는, 우리가 거래를 **소유구조로 분류**하기 때문입니다 — "
+      "2025년에 자회사를 매각하면 2023년 매출이 그 자회사를 빼고 다시 그려지는데 "
+      "그 자회사의 2023년 거래는 데이터에 그대로 남아, **재무와 관계분류의 기업 경계가 어긋납니다.** "
+      "`fin_perimeter_change=1` 로 해당 기간을 식별할 수 있습니다.\n")
 
     A("\n## 6. 자식 테이블을 조인하면 합계가 얼마나 틀어지나\n")
     cj = chk["childjoin"].copy()
@@ -1000,6 +1091,21 @@ def write_checks(path, ship, pair, firm, group, co, fin, chk, ds, de) -> None:
     orphan = firm["companyname"].isna().sum()
     A(f"- `panjivaCompanyCrossRef` 가 가리키는데 `ciqCompany` 에 행이 없는 companyId: "
       f"**{int(orphan):,}개** — 이름·산업이 빈칸으로 남습니다(크로스레퍼런스 품질 지표)")
+
+    # 재무 as-of 결합이 규칙대로 됐는지 (미래 재무 유입 / 소급 한도 초과)
+    ages = pd.concat([pd.to_numeric(d[c], errors="coerce")
+                      for d, c in ((firm, "fin_age_days"), (group, "fin_age_days"),
+                                   (pair, "shp_fin_age_days"), (pair, "con_fin_age_days"))
+                      if c in d.columns]).dropna()
+    if len(ages):
+        neg, over = int((ages < 0).sum()), int((ages > 1461).sum())
+        A(f"- 재무 as-of 결합: `fin_age_days` 음수 **{neg:,}건**(0이어야 정상 — "
+          f"미래 재무가 새면 여기서 잡힙니다), 4년 초과 **{over:,}건**(0이어야 정상)")
+    mixed = int((pd.to_numeric(pair.get("n_relationship"), errors="coerce") > 1).sum()) \
+        if "n_relationship" in pair.columns else 0
+    A(f"- 같은 거래쌍인데 기간 안에서 관계 분류가 갈린 쌍: **{mixed:,}건** — "
+      "0이 아니면 그 기간에 인수·분할이 있었다는 뜻이고, `relationship` 대표값 하나로 "
+      "요약하면 안 됩니다(집계 단위를 월·분기로 내려야 함)")
 
     tot = val.sum()
     exp_pair, exp_imp = val[both].sum(), val[ship["con_companyid"].notna()].sum()
