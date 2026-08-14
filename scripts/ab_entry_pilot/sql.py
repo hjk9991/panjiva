@@ -6,6 +6,9 @@ from typing import Iterable
 from .config import FIN_ITEMS, SECTORS
 
 
+SEGMENT_REVENUE_ITEMS = (3508, 3515)
+
+
 def _iso_date(value: str) -> str:
     """Validate and return an ISO date literal without accepting SQL fragments."""
 
@@ -276,6 +279,86 @@ select f.companyId as companyid,
        {native_columns},
        {usd_columns}
 from final f
+""".strip()
+
+
+def build_segment_revenue_sql(
+    company_ids: Iterable[int],
+    date_start: str,
+    date_end: str,
+) -> str:
+    """Build annual business/geographic segment revenue with period-end FX."""
+
+    ids = sorted({int(company_id) for company_id in company_ids})
+    if not ids:
+        raise ValueError("company_ids must not be empty")
+    start = _iso_date(date_start)
+    end = _iso_date(date_end)
+    if start >= end:
+        raise ValueError("date_start must be before date_end")
+    id_list = ", ".join(str(company_id) for company_id in ids)
+    item_list = ", ".join(str(item_id) for item_id in SEGMENT_REVENUE_ITEMS)
+
+    return f"""
+with segment_periods as (
+    select s.companyId, s.segmentId, s.segmentTypeId, s.segmentName,
+           fp.calendarYear, fi.periodEndDate, fi.filingDate,
+           fi.financialInstanceId, fi.currencyId,
+           d.dataItemId, d.dataItemValue, d.auditTypeId, d.unitTypeId,
+           d.nmFlag
+    from ciqSegment s
+    join ciqSegCollectStandCmpntData d on d.segmentId = s.segmentId
+    join ciqFinCollection fc
+      on fc.financialCollectionId = d.financialCollectionId
+    join ciqFinInstance fi
+      on fi.financialInstanceId = fc.financialInstanceId
+    join ciqFinPeriod fp on fp.financialPeriodId = fi.financialPeriodId
+    where s.companyId in ({id_list})
+      and fp.periodTypeId = 1
+      and fi.periodEndDate >= '{start}' and fi.periodEndDate < '{end}'
+      and fi.latestForFinancialPeriodFlag = 1
+      and d.dataItemId in ({item_list})
+    qualify row_number() over (
+        partition by s.companyId, fp.calendarYear, s.segmentId, d.dataItemId
+        order by fi.filingDate desc nulls last,
+                 fi.financialInstanceId desc,
+                 coalesce(d.nmFlag, 0)
+    ) = 1
+),
+fx_candidates as (
+    select sp.*, cu.ISOCode as currency,
+           iff(cu.ISOCode = 'USD', 1.0, er.priceClose) as fx_per_usd,
+           er.priceDate as fx_date,
+           row_number() over (
+               partition by sp.companyId, sp.calendarYear,
+                            sp.segmentId, sp.dataItemId
+               order by iff(cu.ISOCode = 'USD', sp.periodEndDate, er.priceDate) desc
+           ) as fx_rank
+    from segment_periods sp
+    left join ciqCurrency cu on cu.currencyId = sp.currencyId
+    left join ciqExchangeRate er on er.currencyId = sp.currencyId
+                                and er.latestSnapFlag = 1
+                                and er.priceDate <= sp.periodEndDate
+                                and er.priceDate >= dateadd(day, -14, sp.periodEndDate)
+)
+select companyId as companyid,
+       segmentId as segmentid,
+       segmentTypeId as segment_type_id,
+       segmentName as segment_name,
+       calendarYear as fin_calendar_year,
+       periodEndDate as fin_period_end,
+       filingDate as fin_filing_date,
+       dataItemId as dataitemid,
+       dataItemValue as revenue_native,
+       currency,
+       fx_per_usd,
+       fx_date,
+       dataItemValue / nullif(fx_per_usd, 0) as revenue_usd,
+       auditTypeId as audit_type_id,
+       unitTypeId as unit_type_id,
+       nmFlag as nm_flag
+from fx_candidates
+where fx_rank = 1
 """.strip()
 
 

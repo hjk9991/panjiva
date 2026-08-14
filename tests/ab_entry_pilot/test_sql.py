@@ -3,6 +3,7 @@ import pytest
 from scripts.ab_entry_pilot.sql import (
     build_company_sql,
     build_financial_sql,
+    build_segment_revenue_sql,
     build_trade_sql,
 )
 
@@ -84,3 +85,24 @@ def test_company_sql_is_current_attribute_snapshot_for_approved_ids():
         word not in f" {sql} "
         for word in (" create ", " insert ", " update ", " delete ", " merge ")
     )
+
+
+def test_segment_revenue_sql_is_read_only_and_annual():
+    sql = build_segment_revenue_sql([22, 11], "2015-01-01", "2026-01-01")
+    lowered = sql.lower()
+    assert "select" in lowered
+    assert "ciqsegment" in lowered
+    assert "ciqsegcollectstandcmpntdata" in lowered
+    assert "dataitemid in (3508, 3515)" in lowered
+    assert "periodtypeid = 1" in lowered
+    assert "companyid in (11, 22)" in lowered
+    assert "partition by s.companyid, fp.calendaryear, s.segmentid, d.dataitemid" in lowered
+    for forbidden in ("insert ", "update ", "delete ", "create ", "merge ", "drop "):
+        assert forbidden not in lowered
+
+
+def test_segment_revenue_sql_rejects_empty_ids_and_bad_dates():
+    with pytest.raises(ValueError, match="company_ids"):
+        build_segment_revenue_sql([], "2015-01-01", "2026-01-01")
+    with pytest.raises(ValueError, match="date_start"):
+        build_segment_revenue_sql([11], "2026-01-01", "2015-01-01")
