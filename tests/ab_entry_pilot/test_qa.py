@@ -4,8 +4,10 @@ import pytest
 from scripts.ab_entry_pilot.qa import (
     GateFailure,
     check_conservation,
+    check_entity_roles,
     check_finance_asof,
     check_keys,
+    check_license_boundary,
     check_shares,
 )
 
@@ -73,3 +75,33 @@ def test_source_and_firm_totals_must_be_conserved():
     )
     with pytest.raises(GateFailure, match="conservation"):
         check_conservation(source, firm)
+
+
+def test_forwarder_cannot_be_in_strategic_importer_sample():
+    firm = pd.DataFrame(
+        {
+            "sector_id": ["auto_8703"],
+            "ultimate_parent_companyid": [1],
+            "entity_role": ["forwarder_logistics"],
+            "strategic_importer_main": [1],
+        }
+    )
+    review = pd.DataFrame(
+        {
+            "sector_id": ["auto_8703"],
+            "ultimate_parent_companyid": [1],
+            "entity_role": ["forwarder_logistics"],
+            "evidence_note": ["CIQ industry and company activity"],
+            "review_date": ["2026-08-14"],
+        }
+    )
+    with pytest.raises(GateFailure, match="forwarder"):
+        check_entity_roles(firm, review)
+
+
+def test_license_boundary_rejects_pilot_parquet_in_data_center(tmp_path):
+    leaked = tmp_path / "data" / "panjiva_ab_entry_metadata"
+    leaked.mkdir(parents=True)
+    (leaked / "pilot_rows.parquet").write_bytes(b"PAR1")
+    with pytest.raises(GateFailure, match="license boundary"):
+        check_license_boundary(tmp_path)

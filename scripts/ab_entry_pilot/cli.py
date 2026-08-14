@@ -22,8 +22,10 @@ from .extract import (
 )
 from .qa import (
     check_conservation,
+    check_entity_roles,
     check_finance_asof,
     check_keys,
+    check_license_boundary,
     check_ownership,
     check_panel_sufficiency,
     check_shares,
@@ -41,6 +43,7 @@ from .transforms import (
 
 
 REFERENCE_L2 = Path(r"C:\panjiva\data\staging\within_firm_pilot_2q\L2")
+DATA_CENTER_ROOT = Path(r"C:\Users\master\OneDrive\Research\Data center")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -298,6 +301,7 @@ def build_panels() -> dict:
 
 def run_qa() -> dict:
     results = {}
+    review = pd.read_csv(OUT / "entity_review_top50.csv")
     for sample in ("main", "allocated"):
         source = pd.read_parquet(OUT / f"panel_source_quarter_{sample}.parquet")
         firm = pd.read_parquet(OUT / f"panel_firm_quarter_{sample}.parquet")
@@ -307,7 +311,9 @@ def run_qa() -> dict:
             "G2": check_conservation(source, firm),
             "G3": check_shares(source, firm),
             "G4": check_ownership(source),
+            "G6": check_entity_roles(firm, review),
             "G7": check_panel_sufficiency(firm, source),
+            "G8": check_license_boundary(DATA_CENTER_ROOT),
         }
         if "has_financials" in firm:
             sample_results["G5"] = check_finance_asof(firm)

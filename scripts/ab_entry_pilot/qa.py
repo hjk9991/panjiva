@@ -160,6 +160,64 @@ def check_panel_sufficiency(firm: pd.DataFrame, source: pd.DataFrame) -> dict:
     return {"gate": "G7", "sectors": results, "collapses": 0}
 
 
+def check_entity_roles(firm: pd.DataFrame, review: pd.DataFrame) -> dict:
+    allowed = {
+        "producer_brand_owner",
+        "distributor_retailer",
+        "forwarder_logistics",
+        "unclear",
+    }
+    keys = ["sector_id", "ultimate_parent_companyid"]
+    if review.empty or review.duplicated(keys).any() or review[keys].isna().any(axis=None):
+        raise GateFailure("G6 entity review has missing or duplicate keys")
+    invalid = sorted(set(review["entity_role"].dropna()) - allowed)
+    if invalid:
+        raise GateFailure(f"G6 invalid entity roles: {invalid}")
+    incomplete = review["review_date"].isna() | review["evidence_note"].fillna("").str.strip().eq("")
+    if incomplete.any():
+        raise GateFailure(f"G6 incomplete reviewed entities: {int(incomplete.sum())}")
+    forwarders = firm["entity_role"].eq("forwarder_logistics")
+    invalid_forwarders = int(
+        (forwarders & firm["strategic_importer_main"].eq(1)).sum()
+    )
+    if invalid_forwarders:
+        raise GateFailure(
+            f"G6 forwarder included in strategic importer sample: {invalid_forwarders}"
+        )
+    return {
+        "gate": "G6",
+        "review_rows": int(len(review)),
+        "roles": review["entity_role"].value_counts().to_dict(),
+        "forwarders_in_strategic_sample": 0,
+    }
+
+
+def check_license_boundary(data_center_root: Path | str) -> dict:
+    root = Path(data_center_root).resolve(strict=False)
+    leaks = []
+    exact_licensed_names = {
+        "entity_review_top50.csv",
+        "firm_master.parquet",
+        "firm_financials_annual.parquet",
+        "panel_source_quarter_main.parquet",
+        "panel_source_quarter_allocated.parquet",
+        "panel_firm_quarter_main.parquet",
+        "panel_firm_quarter_allocated.parquet",
+    }
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+        lowered_parts = [part.lower() for part in path.parts]
+        pilot_metadata_path = any("panjiva_ab_entry" in part for part in lowered_parts)
+        if path.name.lower() in exact_licensed_names:
+            leaks.append(str(path))
+        elif pilot_metadata_path and path.suffix.lower() in {".parquet", ".dta"}:
+            leaks.append(str(path))
+    if leaks:
+        raise GateFailure(f"G8 license boundary leak: {leaks[:10]}")
+    return {"gate": "G8", "root": str(root), "licensed_row_files": 0}
+
+
 def compare_week_totals(new: dict, reference: dict) -> dict:
     failures = {}
     for measure in ("shipment_count", "value_usd", "weight_kg", "teu"):
