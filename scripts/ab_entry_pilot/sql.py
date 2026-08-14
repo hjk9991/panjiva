@@ -277,3 +277,36 @@ select f.companyId as companyid,
        {usd_columns}
 from final f
 """.strip()
+
+
+def build_company_sql(company_ids: Iterable[int]) -> str:
+    """Build a current-attribute snapshot for observed importer parents."""
+
+    ids = sorted({int(company_id) for company_id in company_ids})
+    if not ids:
+        raise ValueError("company_ids must not be empty")
+    id_list = ", ".join(str(company_id) for company_id in ids)
+    return f"""
+with family as (
+    select ultimateParentCompanyId as companyId, count(*) as family_size
+    from ciqCompanyUltimateParent
+    where ultimateParentCompanyId in ({id_list})
+    group by ultimateParentCompanyId
+)
+select c.companyId as companyid,
+       c.companyName as companyname,
+       g.isoCountry2 as country_iso2,
+       g.country,
+       c.simpleIndustryId as simple_industry_id,
+       si.simpleIndustryDescription as industry,
+       ct.companyTypeName as company_type,
+       st.companyStatusTypeName as company_status,
+       f.family_size
+from ciqCompany c
+left join ciqCountryGeo g on g.countryId = c.countryId
+left join ciqSimpleIndustry si on si.simpleIndustryId = c.simpleIndustryId
+left join ciqCompanyType ct on ct.companyTypeId = c.companyTypeId
+left join ciqCompanyStatusType st on st.companyStatusTypeId = c.companyStatusTypeId
+left join family f on f.companyId = c.companyId
+where c.companyId in ({id_list})
+""".strip()

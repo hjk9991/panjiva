@@ -12,7 +12,7 @@ from pathlib import Path
 import pandas as pd
 
 from .config import OUT, SECTORS, VERSION
-from .sql import build_trade_sql
+from .sql import build_company_sql, build_financial_sql, build_trade_sql
 
 
 ENV_CANDIDATES = (
@@ -196,3 +196,89 @@ def extract_trade_chunks(
                 }
                 manifest = update_manifest(manifest_path, chunk_key, entry)
     return manifest
+
+
+def collect_parent_ids(chunk_root: Path | str) -> list[int]:
+    """Collect sorted unique matched importer-parent IDs from trade chunks."""
+
+    identifiers: set[int] = set()
+    for path in Path(chunk_root).glob("*/*/*.parquet"):
+        frame = pd.read_parquet(path, columns=["ultimate_parent_companyid"])
+        values = pd.to_numeric(
+            frame["ultimate_parent_companyid"], errors="coerce"
+        ).dropna()
+        identifiers.update(values.astype("int64").tolist())
+    return sorted(identifiers)
+
+
+def extract_parent_metadata(connection, *, batch_size: int = 2_000) -> dict:
+    """Extract current parent attributes and annual financial candidates in batches."""
+
+    if batch_size < 1:
+        raise ValueError("batch_size must be positive")
+    parent_ids = collect_parent_ids(OUT / "_chunks")
+    if not parent_ids:
+        raise RuntimeError("no matched importer parents found in completed chunks")
+
+    company_batches = []
+    financial_batches = []
+    for batch_number, offset in enumerate(range(0, len(parent_ids), batch_size)):
+        batch = parent_ids[offset : offset + batch_size]
+        company_target = ensure_output_path(
+            OUT / "_metadata" / f"company_{batch_number:04d}.parquet"
+        )
+        financial_target = ensure_output_path(
+            OUT / "_metadata" / f"financial_{batch_number:04d}.parquet"
+        )
+        company_batches.append(
+            run_chunk(connection.cursor(), build_company_sql(batch), company_target)
+        )
+        financial_batches.append(
+            run_chunk(
+                connection.cursor(),
+                build_financial_sql(batch, "2013-01-01", "2026-01-01"),
+                financial_target,
+            )
+        )
+
+    companies = (
+        pd.concat(company_batches, ignore_index=True)
+        .drop_duplicates("companyid")
+        .sort_values("companyid")
+        .reset_index(drop=True)
+    )
+    financials = (
+        pd.concat(financial_batches, ignore_index=True)
+        .drop_duplicates(["companyid", "fin_period_end"])
+        .sort_values(["companyid", "fin_period_end"])
+        .reset_index(drop=True)
+    )
+    company_target = ensure_output_path(OUT / "firm_master.parquet")
+    financial_target = ensure_output_path(OUT / "firm_financials_annual.parquet")
+    atomic_parquet(companies, company_target)
+    atomic_parquet(financials, financial_target)
+
+    manifest_path = ensure_output_path(OUT / "extract_manifest.json")
+    update_manifest(
+        manifest_path,
+        "metadata/company",
+        {
+            "status": "complete",
+            "rows": int(len(companies)),
+            "file_sha256": sha256_file(company_target),
+        },
+    )
+    update_manifest(
+        manifest_path,
+        "metadata/financials",
+        {
+            "status": "complete",
+            "rows": int(len(financials)),
+            "file_sha256": sha256_file(financial_target),
+        },
+    )
+    return {
+        "parents": len(parent_ids),
+        "company_rows": len(companies),
+        "financial_rows": len(financials),
+    }

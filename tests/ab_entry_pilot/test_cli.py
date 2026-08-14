@@ -1,6 +1,7 @@
 import pandas as pd
 
-from scripts.ab_entry_pilot.cli import build_parser, reference_week_totals
+import scripts.ab_entry_pilot.cli as cli_module
+from scripts.ab_entry_pilot.cli import build_parser, extract_full, reference_week_totals
 
 
 def test_cli_exposes_four_execution_commands():
@@ -58,3 +59,31 @@ def test_reference_week_totals_reproduce_main_and_allocated_rules(tmp_path):
         "weight_kg": 25.7,
         "teu": 2.57,
     }
+
+
+def test_extract_full_runs_trade_then_parent_metadata(monkeypatch):
+    calls = []
+
+    class Connection:
+        def cursor(self):
+            return "cursor"
+
+        def close(self):
+            calls.append("close")
+
+    monkeypatch.setattr(cli_module, "validate_week", lambda: calls.append("g0"))
+    monkeypatch.setattr(cli_module, "connect", lambda: Connection())
+    monkeypatch.setattr(
+        cli_module,
+        "extract_trade_chunks",
+        lambda cursor, quarters: calls.append(("trade", len(quarters))) or {"ok": True},
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "extract_parent_metadata",
+        lambda connection: calls.append("metadata") or {"parents": 2},
+        raising=False,
+    )
+    result = extract_full("2024Q1", "2024Q2")
+    assert calls == ["g0", ("trade", 2), "metadata", "close"]
+    assert result == {"trade_manifest": {"ok": True}, "metadata": {"parents": 2}}

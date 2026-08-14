@@ -14,6 +14,7 @@ from .extract import (
     atomic_parquet,
     connect,
     ensure_output_path,
+    extract_parent_metadata,
     extract_trade_chunks,
     run_chunk,
     sha256_file,
@@ -204,7 +205,9 @@ def extract_full(start_quarter: str, end_quarter: str) -> dict:
     ]
     connection = connect()
     try:
-        return extract_trade_chunks(connection.cursor(), quarters)
+        trade_manifest = extract_trade_chunks(connection.cursor(), quarters)
+        metadata = extract_parent_metadata(connection)
+        return {"trade_manifest": trade_manifest, "metadata": metadata}
     finally:
         connection.close()
 

@@ -1,6 +1,10 @@
 import pytest
 
-from scripts.ab_entry_pilot.sql import build_financial_sql, build_trade_sql
+from scripts.ab_entry_pilot.sql import (
+    build_company_sql,
+    build_financial_sql,
+    build_trade_sql,
+)
 
 
 def test_trade_sql_has_required_filters_and_no_mutation():
@@ -68,3 +72,15 @@ def test_financial_output_selects_employees_once():
     sql = build_financial_sql([101], "2013-01-01", "2026-01-01").lower()
     final_select = sql.split("select f.companyid as companyid", 1)[1]
     assert final_select.count("f.employees") == 1
+
+
+def test_company_sql_is_current_attribute_snapshot_for_approved_ids():
+    sql = build_company_sql([202, 101]).lower()
+    assert "from ciqcompany c" in sql
+    assert "ciqsimpleindustry" in sql
+    assert "ciqcompanystatustype" in sql
+    assert "c.companyid in (101, 202)" in sql
+    assert all(
+        word not in f" {sql} "
+        for word in (" create ", " insert ", " update ", " delete ", " merge ")
+    )
