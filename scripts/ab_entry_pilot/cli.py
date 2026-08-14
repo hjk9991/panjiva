@@ -88,9 +88,6 @@ def reference_week_totals(
     shipments = shipments[
         arrivals.ge(pd.Timestamp(date_start)) & arrivals.lt(pd.Timestamp(date_end))
     ].copy()
-    importer_id = shipments["consignee_up"].fillna(shipments["consignee_ciqid"])
-    shipments = shipments[importer_id.notna()]
-
     if sample == "main":
         selected = shipments[
             shipments["n_hs6"].eq(1) & _sector_mask(shipments["hs6_main"], sector_id)
@@ -222,7 +219,9 @@ def _read_chunks(sample: str) -> pd.DataFrame:
 def build_panels() -> dict:
     outputs = {}
     for sample in ("main", "allocated"):
-        source = add_activity(_read_chunks(sample))
+        source = _read_chunks(sample)
+        source = source[source["ultimate_parent_companyid"].notna()].copy()
+        source = add_activity(source)
         for definition in ("raw", "100k", "core"):
             source = add_transitions(source, definition)
         firm, source = build_firm_panel(source)

@@ -189,7 +189,6 @@ select importer_up as ultimate_parent_companyid,
        count(distinct iff(ownership_join_rows > 1, panjivaRecordId, null))
            as pit_overlap_shipment_count
 from mapped
-where importer_up is not null
 group by 1, 2, 3, 4
 """.strip()
 

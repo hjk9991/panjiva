@@ -35,6 +35,14 @@ def test_main_and_allocated_sql_use_distinct_hs_rules():
     assert "Manual:" in main
 
 
+def test_trade_sql_keeps_unmatched_importers_for_universe_reconciliation():
+    sql = build_trade_sql(
+        "auto_8703", "2024-03-01", "2024-03-08", "main"
+    ).lower()
+    final_select = sql.rsplit("select importer_up as ultimate_parent_companyid", 1)[1]
+    assert "where importer_up is not null" not in final_select
+
+
 def test_trade_sql_rejects_unapproved_identifiers():
     with pytest.raises(ValueError, match="sector_id"):
         build_trade_sql("8703'; drop table x; --", "2024-03-01", "2024-03-08", "main")
