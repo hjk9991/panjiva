@@ -6,6 +6,7 @@ from scripts.ab_entry_pilot.transforms import (
     add_transitions,
     attach_financials_asof,
     build_firm_panel,
+    make_entity_review_queue,
 )
 
 
@@ -90,3 +91,27 @@ def test_firm_panel_omits_quarters_with_no_raw_import_link():
     )
     firm, _ = build_firm_panel(balanced)
     assert firm["year_quarter"].tolist() == ["2024Q1"]
+
+
+def test_entity_review_queue_selects_top_firms_per_sector():
+    firm = pd.DataFrame(
+        {
+            "ultimate_parent_companyid": [1, 2, 3, 1, 2],
+            "sector_id": ["auto_8703"] * 3 + ["refrigerator_841810"] * 2,
+            "value_usd": [100.0, 90.0, 1.0, 5.0, 10.0],
+        }
+    )
+    master = pd.DataFrame(
+        {
+            "companyid": [1, 2, 3],
+            "companyname": ["One", "Two", "Three"],
+            "industry": ["Cars", "Logistics", "Cars"],
+        }
+    )
+    queue = make_entity_review_queue(firm, master, top_n=2)
+    assert queue.groupby("sector_id").size().to_dict() == {
+        "auto_8703": 2,
+        "refrigerator_841810": 2,
+    }
+    assert queue["entity_role"].eq("unclear").all()
+    assert set(queue["companyname"]) == {"One", "Two"}

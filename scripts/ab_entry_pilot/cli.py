@@ -31,7 +31,13 @@ from .qa import (
     write_full_report,
 )
 from .sql import build_trade_sql
-from .transforms import add_activity, add_transitions, build_firm_panel
+from .transforms import (
+    add_activity,
+    add_transitions,
+    attach_financials_asof,
+    build_firm_panel,
+    make_entity_review_queue,
+)
 
 
 REFERENCE_L2 = Path(r"C:\panjiva\data\staging\within_firm_pilot_2q\L2")
@@ -220,14 +226,68 @@ def _read_chunks(sample: str) -> pd.DataFrame:
 
 
 def build_panels() -> dict:
-    outputs = {}
+    company_master = pd.read_parquet(OUT / "firm_master.parquet")
+    financials = pd.read_parquet(OUT / "firm_financials_annual.parquet")
+    company_master["companyid"] = pd.to_numeric(
+        company_master["companyid"], errors="raise"
+    ).astype("int64")
+    built = {}
     for sample in ("main", "allocated"):
         source = _read_chunks(sample)
         source = source[source["ultimate_parent_companyid"].notna()].copy()
+        source["ultimate_parent_companyid"] = pd.to_numeric(
+            source["ultimate_parent_companyid"], errors="raise"
+        ).astype("int64")
         source = add_activity(source)
         for definition in ("raw", "100k", "core"):
             source = add_transitions(source, definition)
         firm, source = build_firm_panel(source)
+        firm = attach_financials_asof(firm, financials)
+        firm = firm.merge(
+            company_master.rename(
+                columns={"companyid": "ultimate_parent_companyid"}
+            ),
+            on="ultimate_parent_companyid",
+            how="left",
+            validate="many_to_one",
+        )
+        built[sample] = (firm, source)
+
+    review_target = ensure_output_path(OUT / "entity_review_top50.csv")
+    review = make_entity_review_queue(built["main"][0], company_master, top_n=50)
+    if review_target.exists():
+        existing = pd.read_csv(review_target)
+        review_columns = [
+            "sector_id",
+            "ultimate_parent_companyid",
+            "entity_role",
+            "evidence_note",
+            "review_date",
+        ]
+        existing = existing[[column for column in review_columns if column in existing]]
+        review = review.drop(columns=["entity_role", "evidence_note", "review_date"]).merge(
+            existing,
+            on=["sector_id", "ultimate_parent_companyid"],
+            how="left",
+            validate="one_to_one",
+        )
+        review["entity_role"] = review["entity_role"].fillna("unclear")
+        review["evidence_note"] = review["evidence_note"].fillna("")
+    review.to_csv(review_target, index=False, encoding="utf-8-sig")
+
+    roles = review[["sector_id", "ultimate_parent_companyid", "entity_role"]]
+    outputs = {}
+    for sample, (firm, source) in built.items():
+        firm = firm.merge(
+            roles,
+            on=["sector_id", "ultimate_parent_companyid"],
+            how="left",
+            validate="many_to_one",
+        )
+        firm["entity_role"] = firm["entity_role"].fillna("unclear")
+        firm["strategic_importer_main"] = firm["entity_role"].eq(
+            "producer_brand_owner"
+        ).astype("int8")
         source_target = ensure_output_path(OUT / f"panel_source_quarter_{sample}.parquet")
         firm_target = ensure_output_path(OUT / f"panel_firm_quarter_{sample}.parquet")
         atomic_parquet(source, source_target)

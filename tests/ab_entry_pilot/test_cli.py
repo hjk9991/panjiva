@@ -1,7 +1,13 @@
 import pandas as pd
 
 import scripts.ab_entry_pilot.cli as cli_module
-from scripts.ab_entry_pilot.cli import build_parser, extract_full, reference_week_totals
+import scripts.ab_entry_pilot.extract as extract_module
+from scripts.ab_entry_pilot.cli import (
+    build_panels,
+    build_parser,
+    extract_full,
+    reference_week_totals,
+)
 
 
 def test_cli_exposes_four_execution_commands():
@@ -87,3 +93,46 @@ def test_extract_full_runs_trade_then_parent_metadata(monkeypatch):
     result = extract_full("2024Q1", "2024Q2")
     assert calls == ["g0", ("trade", 2), "metadata", "close"]
     assert result == {"trade_manifest": {"ok": True}, "metadata": {"parents": 2}}
+
+
+def test_build_panels_attaches_finance_and_creates_entity_review_queue(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(cli_module, "OUT", tmp_path)
+    monkeypatch.setattr(extract_module, "OUT", tmp_path)
+    row = pd.DataFrame(
+        {
+            "ultimate_parent_companyid": [1.0],
+            "sector_id": ["auto_8703"],
+            "origin_country": ["JP"],
+            "year_quarter": ["2024Q1"],
+            "shipment_count": [4],
+            "shipment_equivalent": [4.0],
+            "value_usd": [2_000_000.0],
+            "weight_kg": [20.0],
+            "teu": [2.0],
+        }
+    )
+    for sample in ("main", "allocated"):
+        folder = tmp_path / "_chunks" / sample / "auto_8703"
+        folder.mkdir(parents=True)
+        row.to_parquet(folder / "2024Q1.parquet", index=False)
+    pd.DataFrame(
+        {"companyid": [1], "companyname": ["One Motors"], "industry": ["Cars"]}
+    ).to_parquet(tmp_path / "firm_master.parquet", index=False)
+    pd.DataFrame(
+        {
+            "companyid": [1],
+            "fin_period_end": pd.to_datetime(["2023-12-31"]),
+            "revenue_usd": [100.0],
+        }
+    ).to_parquet(tmp_path / "firm_financials_annual.parquet", index=False)
+
+    build_panels()
+
+    firm = pd.read_parquet(tmp_path / "panel_firm_quarter_main.parquet")
+    queue = pd.read_csv(tmp_path / "entity_review_top50.csv")
+    q1 = firm[firm["year_quarter"].eq("2024Q1")].iloc[0]
+    assert q1["revenue_usd"] == 100.0
+    assert q1["companyname"] == "One Motors"
+    assert queue["entity_role"].tolist() == ["unclear"]

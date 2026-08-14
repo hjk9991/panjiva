@@ -210,3 +210,41 @@ def attach_financials_asof(
         .drop(columns=["_row_order", "_company_key"])
         .reset_index(drop=True)
     )
+
+
+def make_entity_review_queue(
+    firm: pd.DataFrame,
+    company_master: pd.DataFrame,
+    *,
+    top_n: int = 50,
+) -> pd.DataFrame:
+    """Create the licensed top-importer queue without automatic role deletion."""
+
+    if top_n < 1:
+        raise ValueError("top_n must be positive")
+    totals = (
+        firm.groupby(["sector_id", "ultimate_parent_companyid"], as_index=False)[
+            "value_usd"
+        ]
+        .sum()
+        .rename(columns={"value_usd": "cumulative_value_usd"})
+        .sort_values(
+            ["sector_id", "cumulative_value_usd", "ultimate_parent_companyid"],
+            ascending=[True, False, True],
+            kind="mergesort",
+        )
+    )
+    queue = totals.groupby("sector_id", sort=False).head(top_n).copy()
+    master = company_master.drop_duplicates("companyid").rename(
+        columns={"companyid": "ultimate_parent_companyid"}
+    )
+    queue = queue.merge(
+        master,
+        on="ultimate_parent_companyid",
+        how="left",
+        validate="many_to_one",
+    )
+    queue["entity_role"] = "unclear"
+    queue["evidence_note"] = ""
+    queue["review_date"] = pd.NA
+    return queue.reset_index(drop=True)
