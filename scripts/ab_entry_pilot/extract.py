@@ -12,7 +12,12 @@ from pathlib import Path
 import pandas as pd
 
 from .config import OUT, SECTORS, VERSION
-from .sql import build_company_sql, build_financial_sql, build_trade_sql
+from .sql import (
+    build_company_sql,
+    build_financial_sql,
+    build_segment_revenue_sql,
+    build_trade_sql,
+)
 
 
 ENV_CANDIDATES = (
@@ -211,6 +216,23 @@ def collect_parent_ids(chunk_root: Path | str) -> list[int]:
     return sorted(identifiers)
 
 
+def collect_reviewed_producer_ids(review_path: Path | str | None = None) -> list[int]:
+    """Return reviewed producer/brand-owner IDs from the licensed review file."""
+
+    path = Path(review_path) if review_path is not None else OUT / "entity_review_top50.csv"
+    review = pd.read_csv(path)
+    required = {"ultimate_parent_companyid", "entity_role"}
+    missing = required.difference(review.columns)
+    if missing:
+        raise ValueError(f"entity review is missing columns: {sorted(missing)}")
+    selected = review.loc[
+        review["entity_role"].eq("producer_brand_owner"),
+        "ultimate_parent_companyid",
+    ]
+    identifiers = pd.to_numeric(selected, errors="coerce").dropna().astype("int64")
+    return sorted(set(identifiers.tolist()))
+
+
 def extract_parent_metadata(connection, *, batch_size: int = 2_000) -> dict:
     """Extract current parent attributes and annual financial candidates in batches."""
 
@@ -281,4 +303,55 @@ def extract_parent_metadata(connection, *, batch_size: int = 2_000) -> dict:
         "parents": len(parent_ids),
         "company_rows": len(companies),
         "financial_rows": len(financials),
+    }
+
+
+def extract_segment_revenue(connection, *, batch_size: int = 2_000) -> dict:
+    """Extract annual CapIQ segments for reviewed producers into licensed storage."""
+
+    if batch_size < 1:
+        raise ValueError("batch_size must be positive")
+    parent_ids = collect_reviewed_producer_ids()
+    if not parent_ids:
+        raise RuntimeError("no reviewed producer/brand-owner parents found")
+
+    batches = []
+    output_root = OUT / "auto_output_share"
+    for batch_number, offset in enumerate(range(0, len(parent_ids), batch_size)):
+        batch = parent_ids[offset : offset + batch_size]
+        target = ensure_output_path(
+            output_root / "_metadata" / f"segment_{batch_number:04d}.parquet"
+        )
+        batches.append(
+            run_chunk(
+                connection.cursor(),
+                build_segment_revenue_sql(batch, "2015-01-01", "2026-01-01"),
+                target,
+            )
+        )
+
+    segments = pd.concat(batches, ignore_index=True)
+    key_columns = ["companyid", "fin_calendar_year", "segmentid", "dataitemid"]
+    segments = (
+        segments.drop_duplicates(key_columns)
+        .sort_values(key_columns)
+        .reset_index(drop=True)
+    )
+    target = ensure_output_path(output_root / "firm_segment_revenue_annual.parquet")
+    atomic_parquet(segments, target)
+
+    update_manifest(
+        ensure_output_path(OUT / "extract_manifest.json"),
+        "metadata/segment_revenue",
+        {
+            "status": "complete",
+            "rows": int(len(segments)),
+            "company_count": len(parent_ids),
+            "file_sha256": sha256_file(target),
+        },
+    )
+    return {
+        "parents": len(parent_ids),
+        "rows": len(segments),
+        "batches": len(batches),
     }

@@ -7,8 +7,10 @@ import scripts.ab_entry_pilot.extract as extract_module
 from scripts.ab_entry_pilot.extract import (
     atomic_parquet,
     collect_parent_ids,
+    collect_reviewed_producer_ids,
     ensure_output_path,
     extract_parent_metadata,
+    extract_segment_revenue,
     run_chunk,
     sha256_file,
     update_manifest,
@@ -133,3 +135,70 @@ def test_extract_parent_metadata_writes_combined_company_and_finance_files(
     assert result == {"parents": 2, "company_rows": 2, "financial_rows": 2}
     assert companies["companyid"].tolist() == [1, 2]
     assert financials["companyid"].tolist() == [1, 2]
+
+
+def test_collect_reviewed_producer_ids_filters_roles_and_deduplicates(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(extract_module, "OUT", tmp_path)
+    pd.DataFrame(
+        {
+            "ultimate_parent_companyid": [3, 1, 2, 3],
+            "entity_role": [
+                "producer_brand_owner",
+                "unclear",
+                "producer_brand_owner",
+                "producer_brand_owner",
+            ],
+        }
+    ).to_csv(tmp_path / "entity_review_top50.csv", index=False)
+
+    assert collect_reviewed_producer_ids() == [2, 3]
+
+
+def test_extract_segment_revenue_batches_and_records_manifest(tmp_path, monkeypatch):
+    monkeypatch.setattr(extract_module, "OUT", tmp_path)
+    pd.DataFrame(
+        {
+            "ultimate_parent_companyid": [1, 2, 3],
+            "entity_role": ["producer_brand_owner"] * 3,
+        }
+    ).to_csv(tmp_path / "entity_review_top50.csv", index=False)
+    calls = []
+
+    def fake_run_chunk(cursor, sql, target):
+        batch_number = len(calls)
+        calls.append(sql)
+        frame = pd.DataFrame(
+            {
+                "companyid": [batch_number + 1],
+                "segmentid": [100 + batch_number],
+                "segment_type_id": [1],
+                "segment_name": ["Synthetic segment"],
+                "fin_calendar_year": [2024],
+                "dataitemid": [3508],
+                "revenue_usd": [10.0 + batch_number],
+            }
+        )
+        atomic_parquet(frame, target)
+        return frame
+
+    monkeypatch.setattr(extract_module, "run_chunk", fake_run_chunk)
+
+    class Connection:
+        def cursor(self):
+            return object()
+
+    result = extract_segment_revenue(Connection(), batch_size=2)
+
+    target = tmp_path / "auto_output_share" / "firm_segment_revenue_annual.parquet"
+    manifest = json.loads((tmp_path / "extract_manifest.json").read_text("utf-8"))
+    assert result == {"parents": 3, "rows": 2, "batches": 2}
+    assert len(calls) == 2
+    assert target.exists()
+    assert manifest["chunks"]["metadata/segment_revenue"] == {
+        "status": "complete",
+        "rows": 2,
+        "company_count": 3,
+        "file_sha256": sha256_file(target),
+    }

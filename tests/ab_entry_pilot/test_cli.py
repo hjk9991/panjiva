@@ -10,9 +10,15 @@ from scripts.ab_entry_pilot.cli import (
 )
 
 
-def test_cli_exposes_four_execution_commands():
+def test_cli_exposes_five_execution_commands():
     parser = build_parser()
-    for command in ("validate-week", "extract-full", "build", "qa"):
+    for command in (
+        "validate-week",
+        "extract-full",
+        "extract-segments",
+        "build",
+        "qa",
+    ):
         args = parser.parse_args([command])
         assert args.command == command
 
@@ -93,6 +99,25 @@ def test_extract_full_runs_trade_then_parent_metadata(monkeypatch):
     result = extract_full("2024Q1", "2024Q2")
     assert calls == ["g0", ("trade", 2), "metadata", "close"]
     assert result == {"trade_manifest": {"ok": True}, "metadata": {"parents": 2}}
+
+
+def test_extract_segments_dispatches_and_closes_connection(monkeypatch):
+    calls = []
+
+    class Connection:
+        def close(self):
+            calls.append("close")
+
+    monkeypatch.setattr(cli_module, "connect", lambda: Connection())
+    monkeypatch.setattr(
+        cli_module,
+        "extract_segment_revenue",
+        lambda connection: calls.append("segments") or {"rows": 2},
+        raising=False,
+    )
+
+    assert cli_module.main(["extract-segments"]) == 0
+    assert calls == ["segments", "close"]
 
 
 def test_build_panels_attaches_finance_and_creates_entity_review_queue(

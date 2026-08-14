@@ -15,6 +15,7 @@ from .extract import (
     connect,
     ensure_output_path,
     extract_parent_metadata,
+    extract_segment_revenue,
     extract_trade_chunks,
     run_chunk,
     sha256_file,
@@ -59,6 +60,7 @@ def build_parser() -> argparse.ArgumentParser:
     full.add_argument("--start-quarter", default=START_QUARTER)
     full.add_argument("--end-quarter", default=END_QUARTER)
 
+    commands.add_parser("extract-segments")
     commands.add_parser("build")
     commands.add_parser("qa")
     return parser
@@ -336,6 +338,12 @@ def main(argv: list[str] | None = None) -> int:
         validate_week(args.start, args.end)
     elif args.command == "extract-full":
         extract_full(args.start_quarter, args.end_quarter)
+    elif args.command == "extract-segments":
+        connection = connect()
+        try:
+            extract_segment_revenue(connection)
+        finally:
+            connection.close()
     elif args.command == "build":
         build_panels()
     elif args.command == "qa":
