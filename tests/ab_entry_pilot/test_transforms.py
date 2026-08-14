@@ -78,3 +78,15 @@ def test_financial_asof_is_strict_and_limited_to_730_days():
     assert out.loc[out.ultimate_parent_companyid.eq(1), "revenue_usd"].iat[0] == 10.0
     assert out.loc[out.ultimate_parent_companyid.eq(1), "fin_age_days"].iat[0] == 1
     assert out.loc[out.ultimate_parent_companyid.eq(2), "has_financials"].iat[0] == 0
+
+
+def test_firm_panel_omits_quarters_with_no_raw_import_link():
+    one_link = source_fixture().iloc[[0]].copy()
+    balanced = add_transitions(
+        add_activity(one_link),
+        definition="raw",
+        start_quarter="2024Q1",
+        end_quarter="2024Q2",
+    )
+    firm, _ = build_firm_panel(balanced)
+    assert firm["year_quarter"].tolist() == ["2024Q1"]

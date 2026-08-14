@@ -45,13 +45,17 @@ def build_firm_panel(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     source["sourcing_share_value"] = _safe_share(source["value_usd"], value_total)
     source["sourcing_share_weight"] = _safe_share(source["weight_kg"], weight_total)
 
+    active_firm_quarter = group["link_active_raw"].transform("max").eq(1)
+    firm_source = source.loc[active_firm_quarter].copy()
+    group = firm_source.groupby(FIRM_KEYS, dropna=False, sort=False)
+
     aggregate = {
         "value_usd": "sum",
         "weight_kg": "sum",
         "teu": "sum",
         "shipment_count": "sum",
     }
-    if "shipment_equivalent" in source:
+    if "shipment_equivalent" in firm_source:
         aggregate["shipment_equivalent"] = "sum"
     firm = group.agg(aggregate).reset_index()
 
