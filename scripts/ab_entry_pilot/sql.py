@@ -305,9 +305,11 @@ with segment_periods as (
            fp.calendarYear, fi.periodEndDate, fi.filingDate,
            fi.financialInstanceId, fi.currencyId,
            d.dataItemId, d.dataItemValue, d.auditTypeId, d.unitTypeId,
+           ut.unitTypeValue,
            d.nmFlag
     from ciqSegment s
     join ciqSegCollectStandCmpntData d on d.segmentId = s.segmentId
+    join ciqFinUnitType ut on ut.unitTypeId = d.unitTypeId
     join ciqFinCollection fc
       on fc.financialCollectionId = d.financialCollectionId
     join ciqFinInstance fi
@@ -349,11 +351,11 @@ select companyId as companyid,
        periodEndDate as fin_period_end,
        filingDate as fin_filing_date,
        dataItemId as dataitemid,
-       dataItemValue as revenue_native,
+       dataItemValue * unitTypeValue as revenue_native,
        currency,
        fx_per_usd,
        fx_date,
-       dataItemValue / nullif(fx_per_usd, 0) as revenue_usd,
+       dataItemValue * unitTypeValue / nullif(fx_per_usd, 0) as revenue_usd,
        auditTypeId as audit_type_id,
        unitTypeId as unit_type_id,
        nmFlag as nm_flag

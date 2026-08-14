@@ -94,6 +94,8 @@ def test_segment_revenue_sql_is_read_only_and_annual():
     assert "ciqsegment" in lowered
     assert "ciqsegcollectstandcmpntdata" in lowered
     assert "dataitemid in (3508, 3515)" in lowered
+    assert "ciqfinunittype" in lowered
+    assert "dataitemvalue * unittypevalue" in lowered
     assert "periodtypeid = 1" in lowered
     assert "companyid in (11, 22)" in lowered
     assert "partition by s.companyid, fp.calendaryear, s.segmentid, d.dataitemid" in lowered
