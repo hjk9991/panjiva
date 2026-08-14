@@ -9,6 +9,7 @@ from scripts.ab_entry_pilot.qa import (
     check_keys,
     check_license_boundary,
     check_shares,
+    write_sanitized_report,
 )
 
 
@@ -105,3 +106,19 @@ def test_license_boundary_rejects_pilot_parquet_in_data_center(tmp_path):
     (leaked / "pilot_rows.parquet").write_bytes(b"PAR1")
     with pytest.raises(GateFailure, match="license boundary"):
         check_license_boundary(tmp_path)
+
+
+def test_sanitized_report_removes_company_identity_fields(tmp_path):
+    target = tmp_path / "summary.md"
+    write_sanitized_report(
+        {
+            "G1": {"status": "pass", "rows": 100, "companyname": "Secret Co"},
+            "G6": {"ultimate_parent_companyid": 123, "roles": {"producer": 5}},
+        },
+        target,
+    )
+    text = target.read_text(encoding="utf-8")
+    assert "Secret Co" not in text
+    assert "123" not in text
+    assert "rows" in text
+    assert "producer" in text

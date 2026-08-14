@@ -242,3 +242,41 @@ def write_full_report(results: dict, path: Path | str) -> None:
     for name, result in results.items():
         lines.extend([f"## {name}", "", "```json", json.dumps(result, ensure_ascii=False, indent=2), "```", ""])
     target.write_text("\n".join(lines), encoding="utf-8")
+
+
+def _sanitize_result(value):
+    forbidden = ("company", "ultimate_parent", "companyid", "companyname", "top_")
+    if isinstance(value, dict):
+        return {
+            key: _sanitize_result(item)
+            for key, item in value.items()
+            if not any(token in str(key).lower() for token in forbidden)
+        }
+    if isinstance(value, list):
+        if all(isinstance(item, (str, int, float, bool, type(None))) for item in value):
+            return value[:20]
+        return []
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def write_sanitized_report(results: dict, path: Path | str) -> None:
+    """Write aggregate QA only, dropping company identity-bearing fields."""
+
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    sanitized = _sanitize_result(results)
+    text = "\n".join(
+        [
+            "# Panjiva–CapIQ AB-entry pilot: sanitized QA summary",
+            "",
+            "This report contains aggregate gate results only; no licensed rows or company identities.",
+            "",
+            "```json",
+            json.dumps(sanitized, ensure_ascii=False, indent=2),
+            "```",
+            "",
+        ]
+    )
+    target.write_text(text, encoding="utf-8")

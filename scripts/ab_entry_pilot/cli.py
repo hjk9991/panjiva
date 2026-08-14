@@ -31,6 +31,7 @@ from .qa import (
     check_shares,
     compare_week_totals,
     write_full_report,
+    write_sanitized_report,
 )
 from .sql import build_trade_sql
 from .transforms import (
@@ -319,6 +320,13 @@ def run_qa() -> dict:
             sample_results["G5"] = check_finance_asof(firm)
         results[sample] = sample_results
     write_full_report(results, OUT / "qa_full.md")
+    write_sanitized_report(
+        results,
+        DATA_CENTER_ROOT
+        / "quality_reports"
+        / "panjiva_ab_entry"
+        / "2026-08-14-pilot-summary.md",
+    )
     return results
 
 
