@@ -41,7 +41,7 @@ def build_trade_sql(
         allocation = "1.0"
     else:
         assignment_filter = sector_predicate
-        allocation = "1.0 / n_hs6"
+        allocation = "1.0::double / n_hs6"
 
     return f"""
 with base as (

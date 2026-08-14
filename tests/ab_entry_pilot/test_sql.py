@@ -29,7 +29,7 @@ def test_main_and_allocated_sql_use_distinct_hs_rules():
         "refrigerator_841810", "2024-03-01", "2024-03-08", "allocated"
     )
     assert "n_hs6 = 1" in main
-    assert "1.0 / n_hs6" in allocated
+    assert "1.0::double / n_hs6" in allocated
     assert "Classified:" in main
     assert "Parsed:" in main
     assert "Manual:" in main
