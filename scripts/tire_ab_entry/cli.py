@@ -15,6 +15,8 @@ from .extract import (
     validate_quarter,
 )
 from .schema_probe import discover_parent_candidates, probe_schema
+from .transforms import build_game_outputs
+from .qa import capture_g0_validation, run_runtime_qa
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -26,6 +28,9 @@ def build_parser() -> argparse.ArgumentParser:
     validation.add_argument("--quarter", required=True)
     extraction = commands.add_parser("extract-full")
     extraction.add_argument("--game", choices=("raw", "finished", "both"), required=True)
+    build = commands.add_parser("build")
+    build.add_argument("--game", choices=("raw", "finished"), required=True)
+    commands.add_parser("qa")
     return parser
 
 
@@ -50,18 +55,47 @@ def main(argv: list[str] | None = None) -> int:
                 }
             )
             return 1
-    if args.command in {"validate-quarter", "extract-full"}:
+    if args.command in {"validate-quarter", "extract-full", "build", "qa"}:
         try:
             seed_snapshot = load_parent_seed()
             parent_ids = seed_snapshot.parent_ids
             parent_seed_sha256 = seed_snapshot.sha256
-            description_identity = load_description_identity()
+            if args.command in {"validate-quarter", "extract-full"}:
+                description_identity = load_description_identity()
         except Exception:
             _print_json(
                 {
                     "status": "error",
                     "command": args.command,
                     "error_category": "parent_seed_gate_failed",
+                }
+            )
+            return 1
+    if args.command in {"build", "qa"}:
+        try:
+            if args.command == "build":
+                result = build_game_outputs(
+                    game=args.game,
+                    parent_seed_sha256=parent_seed_sha256,
+                )
+                _print_json({"status": "ok", "command": args.command, **result})
+                return 0
+            result = run_runtime_qa(parent_seed_sha256=parent_seed_sha256)
+            exit_code = int(result.get("exit_code", 1))
+            _print_json(
+                {
+                    "status": "ok" if exit_code == 0 else "failed",
+                    "command": args.command,
+                    **result,
+                }
+            )
+            return exit_code
+        except Exception:
+            _print_json(
+                {
+                    "status": "error",
+                    "command": args.command,
+                    "error_category": f"{args.command}_operation_failed",
                 }
             )
             return 1
@@ -91,6 +125,14 @@ def main(argv: list[str] | None = None) -> int:
                 parent_ids=parent_ids,
                 parent_seed_sha256=parent_seed_sha256,
                 description_identity=description_identity,
+            )
+            result["g0_validation"] = capture_g0_validation(
+                connection,
+                args.quarter,
+                parent_ids=parent_ids,
+                parent_seed_sha256=parent_seed_sha256,
+                description_identity=description_identity,
+                validation_root=result.get("validation_root"),
             )
         else:
             result = extract_full(

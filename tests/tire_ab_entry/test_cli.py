@@ -22,6 +22,8 @@ def test_cli_exposes_schema_and_parent_commands():
     assert parser.parse_args(["discover-parents"]).command == "discover-parents"
     assert parser.parse_args(["validate-quarter", "--quarter", "2024Q1"]).quarter == "2024Q1"
     assert parser.parse_args(["extract-full", "--game", "both"]).game == "both"
+    assert parser.parse_args(["build", "--game", "raw"]).game == "raw"
+    assert parser.parse_args(["qa"]).command == "qa"
 
 
 def test_probe_schema_command_prints_json_and_closes_connection(monkeypatch, capsys):
@@ -193,10 +195,20 @@ def test_validate_quarter_uses_isolated_orchestrator(monkeypatch, capsys):
         lambda value, quarter, **kwargs: calls.append((value, quarter, kwargs))
         or {"run_id": "test", "games": ["raw", "finished"]},
     )
+    monkeypatch.setattr(
+        cli_module,
+        "capture_g0_validation",
+        lambda value, quarter, **kwargs: calls.append(("g0", quarter, kwargs))
+        or {"metrics_path": r"C:\panjiva\_validation\test\g0.parquet"},
+    )
     assert cli_module.main(["validate-quarter", "--quarter", "2024Q1"]) == 0
     assert calls[0][1] == "2024Q1"
+    assert calls[1][0] == "g0"
+    assert calls[1][2]["parent_seed_sha256"] == "seedhash"
     assert calls[-1] == "close"
-    assert json.loads(capsys.readouterr().out)["run_id"] == "test"
+    output = json.loads(capsys.readouterr().out)
+    assert output["run_id"] == "test"
+    assert output["g0_validation"]["metrics_path"].endswith("g0.parquet")
 
 
 def test_validate_quarter_rejects_syntax_before_seed_or_connection(monkeypatch, capsys):
@@ -212,3 +224,29 @@ def test_validate_quarter_rejects_syntax_before_seed_or_connection(monkeypatch, 
         "error_category": "invalid_quarter",
         "status": "error",
     }
+
+
+def test_build_and_qa_refuse_missing_seed_before_any_artifact_read(monkeypatch, capsys):
+    calls = []
+    monkeypatch.setattr(
+        cli_module, "load_parent_seed",
+        lambda: (_ for _ in ()).throw(ValueError("licensed secret")),
+    )
+    monkeypatch.setattr(cli_module, "build_game_outputs", lambda **kwargs: calls.append("build"))
+    monkeypatch.setattr(cli_module, "run_runtime_qa", lambda **kwargs: calls.append("qa"))
+    assert cli_module.main(["build", "--game", "raw"]) == 1
+    assert cli_module.main(["qa"]) == 1
+    assert calls == []
+    output = capsys.readouterr().out
+    assert "secret" not in output
+
+
+def test_build_and_qa_are_offline_and_propagate_qa_exit(monkeypatch, capsys):
+    seed = ParentSeedSnapshot({"MICHELIN": 1, "GOODYEAR": 2, "HANKOOK": 3}, "seed")
+    monkeypatch.setattr(cli_module, "load_parent_seed", lambda: seed)
+    monkeypatch.setattr(cli_module, "load_description_identity", lambda: (_ for _ in ()).throw(AssertionError("offline command does not need schema")))
+    monkeypatch.setattr(cli_module, "connect", lambda: (_ for _ in ()).throw(AssertionError("offline command")))
+    monkeypatch.setattr(cli_module, "build_game_outputs", lambda **kwargs: {"game": kwargs["game"], "status": "built"})
+    assert cli_module.main(["build", "--game", "finished"]) == 0
+    monkeypatch.setattr(cli_module, "run_runtime_qa", lambda **kwargs: {"exit_code": 1, "supplier_game_eligible": False})
+    assert cli_module.main(["qa"]) == 1
