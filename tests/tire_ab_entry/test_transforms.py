@@ -205,7 +205,7 @@ def test_confirmed_finished_description_candidate_gets_effective_manufacturer():
     source["review_pending_technically_eligible"] = 1
     items = build_review_items(source, game="finished")
     assert items["manufacturer_parent_id"].iat[0] == 30
-    assert items["link_identity_type"].iat[0] == "description_candidate_parent"
+    assert items["link_identity_type"].iat[0] == "shipper_company"
     reviews = items.drop(columns="value_usd").assign(
         review_status="confirmed", source_note="human plant evidence"
     ).astype("string")
@@ -214,6 +214,34 @@ def test_confirmed_finished_description_candidate_gets_effective_manufacturer():
     assert reviewed["manual_main_eligible"].iat[0] == 1
     assert reviewed["manual_confirmed_eligible"].iat[0] == 1
     assert reviewed["import_route"].iat[0] == "distributor_intermediated"
+
+
+def test_finished_candidate_reviews_are_isolated_by_foreign_shipper():
+    source = pd.concat(
+        [
+            _source_rows().iloc[[2]].assign(shipper_up=101),
+            _source_rows().iloc[[2]].assign(shipper_up=202),
+        ],
+        ignore_index=True,
+    )
+    source["review_pending_technically_eligible"] = 1
+    items = build_review_items(source, game="finished")
+    assert len(items) == 2
+    assert set(items["link_identity_type"]) == {"shipper_ultimate_parent"}
+    assert set(items["link_identity_value"]) == {"101", "202"}
+    one_review = items.iloc[[0]].drop(columns="value_usd").assign(
+        review_status="confirmed", source_note="one foreign shipper reviewed"
+    )
+    reviewed = apply_manual_reviews(source, game="finished", reviews=one_review)
+    assert reviewed["manual_main_eligible"].sum() == 1
+    assert reviewed["manual_confirmed_eligible"].sum() == 1
+
+
+def test_finished_candidate_without_foreign_shipper_identity_is_unreviewable():
+    source = _source_rows().iloc[[2]].copy()
+    source[["shipper_up", "shipper_companyid", "shipper_panjiva_id"]] = pd.NA
+    with pytest.raises(ValueError, match="stable supplier/plant identity"):
+        build_review_items(source, game="finished")
 
 
 @pytest.mark.parametrize(
@@ -266,6 +294,17 @@ def test_review_item_identity_is_manufacturer_supplier_and_context_scoped():
         ]
     ).issubset(items.columns)
     assert items.groupby(["manufacturer_parent_id", "review_group"]).ngroups == 2
+
+    raw_suppliers = pd.concat(
+        [
+            _source_rows().iloc[[0]].assign(shipper_up=101),
+            _source_rows().iloc[[0]].assign(shipper_up=202),
+        ],
+        ignore_index=True,
+    )
+    raw_items = build_review_items(raw_suppliers, game="raw")
+    assert len(raw_items) == 2
+    assert set(raw_items["link_identity_value"]) == {"101", "202"}
 
 
 def test_quarterly_panel_contract_rejects_unexpected_columns_and_duplicate_rows():

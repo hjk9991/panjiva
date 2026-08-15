@@ -626,15 +626,8 @@ def _with_review_keys(frame: pd.DataFrame, game: str) -> pd.DataFrame:
     shipper_parent = pd.to_numeric(source["shipper_up"], errors="coerce")
     shipper_company = pd.to_numeric(source["shipper_companyid"], errors="coerce")
     shipper_panjiva = pd.to_numeric(source["shipper_panjiva_id"], errors="coerce")
-    description_candidate = pd.to_numeric(
-        source["description_candidate_parent_id"], errors="coerce"
-    )
     identity_type = pd.Series("unresolved", index=source.index, dtype="string")
     identity_value = pd.Series(pd.NA, index=source.index, dtype="string")
-    if game == "finished":
-        mask = description_candidate.notna() & source["description_candidate"].eq(1)
-        identity_type.loc[mask] = "description_candidate_parent"
-        identity_value.loc[mask] = description_candidate.loc[mask].astype("int64").astype("string")
     for values, label in (
         (shipper_parent, "shipper_ultimate_parent"),
         (shipper_company, "shipper_company"),
