@@ -7,6 +7,14 @@ import json
 
 from scripts.ab_entry_pilot.extract import connect
 
+from .extract import (
+    PARENT_SEED_PATH,
+    extract_full,
+    load_description_identity,
+    load_parent_seed,
+    sha256_file,
+    validate_quarter,
+)
 from .schema_probe import discover_parent_candidates, probe_schema
 
 
@@ -15,6 +23,10 @@ def build_parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("probe-schema")
     commands.add_parser("discover-parents")
+    validation = commands.add_parser("validate-quarter")
+    validation.add_argument("--quarter", required=True)
+    extraction = commands.add_parser("extract-full")
+    extraction.add_argument("--game", choices=("raw", "finished", "both"), required=True)
     return parser
 
 
@@ -24,6 +36,23 @@ def _print_json(payload: dict) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    parent_ids = None
+    parent_seed_sha256 = None
+    description_identity = None
+    if args.command in {"validate-quarter", "extract-full"}:
+        try:
+            parent_ids = load_parent_seed()
+            parent_seed_sha256 = sha256_file(PARENT_SEED_PATH)
+            description_identity = load_description_identity()
+        except Exception:
+            _print_json(
+                {
+                    "status": "error",
+                    "command": args.command,
+                    "error_category": "parent_seed_gate_failed",
+                }
+            )
+            return 1
     try:
         connection = connect()
     except Exception:
@@ -41,8 +70,24 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "probe-schema":
             result = probe_schema(connection)
-        else:
+        elif args.command == "discover-parents":
             result = discover_parent_candidates(connection)
+        elif args.command == "validate-quarter":
+            result = validate_quarter(
+                connection,
+                args.quarter,
+                parent_ids=parent_ids,
+                parent_seed_sha256=parent_seed_sha256,
+                description_identity=description_identity,
+            )
+        else:
+            result = extract_full(
+                connection,
+                game=args.game,
+                parent_ids=parent_ids,
+                parent_seed_sha256=parent_seed_sha256,
+                description_identity=description_identity,
+            )
     except Exception:
         primary_failed = True
 

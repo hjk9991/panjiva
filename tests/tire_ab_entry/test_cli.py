@@ -19,6 +19,8 @@ def test_cli_exposes_schema_and_parent_commands():
     parser = build_parser()
     assert parser.parse_args(["probe-schema"]).command == "probe-schema"
     assert parser.parse_args(["discover-parents"]).command == "discover-parents"
+    assert parser.parse_args(["validate-quarter", "--quarter", "2024Q1"]).quarter == "2024Q1"
+    assert parser.parse_args(["extract-full", "--game", "both"]).game == "both"
 
 
 def test_probe_schema_command_prints_json_and_closes_connection(monkeypatch, capsys):
@@ -129,3 +131,58 @@ def test_cli_preserves_primary_category_when_probe_and_close_fail(
         "error_category": "operation_failed",
         "status": "error",
     }
+
+
+def test_extract_full_refuses_bad_seed_before_opening_connection(monkeypatch, capsys):
+    calls = []
+    monkeypatch.setattr(
+        cli_module,
+        "load_parent_seed",
+        lambda: (_ for _ in ()).throw(ValueError("seed secret password=x")),
+    )
+    monkeypatch.setattr(cli_module, "connect", lambda: calls.append("connect"))
+    assert cli_module.main(["extract-full", "--game", "both"]) == 1
+    assert calls == []
+    output = capsys.readouterr().out
+    assert "secret" not in output
+    assert json.loads(output)["error_category"] == "parent_seed_gate_failed"
+
+
+def test_extract_full_passes_games_and_closes_before_single_json(monkeypatch, capsys):
+    calls = []
+    connection = Connection(calls)
+    monkeypatch.setattr(cli_module, "load_parent_seed", lambda: {"MICHELIN": 1, "GOODYEAR": 2, "HANKOOK": 3})
+    monkeypatch.setattr(cli_module, "sha256_file", lambda path: "seedhash")
+    monkeypatch.setattr(cli_module, "load_description_identity", lambda: None)
+    monkeypatch.setattr(cli_module, "connect", lambda: connection)
+    monkeypatch.setattr(
+        cli_module,
+        "extract_full",
+        lambda value, **kwargs: calls.append((value, kwargs)) or {"completed": 96},
+    )
+    assert cli_module.main(["extract-full", "--game", "both"]) == 0
+    assert calls[-1] == "close"
+    invocation = calls[0]
+    assert invocation[0] is connection
+    assert invocation[1]["game"] == "both"
+    assert invocation[1]["parent_seed_sha256"] == "seedhash"
+    assert json.loads(capsys.readouterr().out)["completed"] == 96
+
+
+def test_validate_quarter_uses_isolated_orchestrator(monkeypatch, capsys):
+    calls = []
+    connection = Connection(calls)
+    monkeypatch.setattr(cli_module, "load_parent_seed", lambda: {"MICHELIN": 1, "GOODYEAR": 2, "HANKOOK": 3})
+    monkeypatch.setattr(cli_module, "sha256_file", lambda path: "seedhash")
+    monkeypatch.setattr(cli_module, "load_description_identity", lambda: None)
+    monkeypatch.setattr(cli_module, "connect", lambda: connection)
+    monkeypatch.setattr(
+        cli_module,
+        "validate_quarter",
+        lambda value, quarter, **kwargs: calls.append((value, quarter, kwargs))
+        or {"run_id": "test", "games": ["raw", "finished"]},
+    )
+    assert cli_module.main(["validate-quarter", "--quarter", "2024Q1"]) == 0
+    assert calls[0][1] == "2024Q1"
+    assert calls[-1] == "close"
+    assert json.loads(capsys.readouterr().out)["run_id"] == "test"
