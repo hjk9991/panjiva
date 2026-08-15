@@ -1,6 +1,7 @@
 from pathlib import Path
 import hashlib
 import json
+import os
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -103,7 +104,24 @@ def test_strict_pending_verifies_file_and_all_contract_hashes(tmp_path):
         "file_sha256": extract_module.sha256_file(target),
         **expected["raw/2024Q1"],
     }
-    manifest = {"chunks": {"raw/2024Q1": entry}}
+    entry["code_version"] = extract_module.CODE_VERSION
+    entry.update(
+        {
+                "quarter": "2024Q1",
+                "game": "raw",
+                "attempt_count": 1,
+                "row_count": 1,
+            "allocated_value_usd_sum": float(frame["value_usd"].sum()),
+            "shipment_equivalent_sum": float(frame["shipment_equivalent"].sum()),
+                "nonadditive_count_sum": float(frame["shipment_count_nonadditive"].sum()),
+                "started_at": "2026-08-15T00:00:00Z",
+                "finished_at": "2026-08-15T00:00:01Z",
+            }
+    )
+    manifest = {
+        "manifest_version": extract_module.MANIFEST_VERSION,
+        "chunks": {"raw/2024Q1": entry},
+    }
     assert pending_chunks(["raw/2024Q1"], manifest, expected=expected) == []
 
     for field in ("sql_sha256", "parent_seed_sha256", "output_schema_fingerprint", "contract_version"):
@@ -112,6 +130,127 @@ def test_strict_pending_verifies_file_and_all_contract_hashes(tmp_path):
         assert pending_chunks(["raw/2024Q1"], stale, expected=expected) == ["raw/2024Q1"]
     target.write_bytes(b"corrupt")
     assert pending_chunks(["raw/2024Q1"], manifest, expected=expected) == ["raw/2024Q1"]
+
+
+@pytest.mark.parametrize(
+    ("field", "stale_value"),
+    [
+        ("code_version", "old-code"),
+        ("row_count", 999),
+        ("allocated_value_usd_sum", 999.0),
+        ("shipment_equivalent_sum", 999.0),
+        ("nonadditive_count_sum", 999.0),
+    ],
+)
+def test_strict_resume_recomputes_entry_version_counts_and_sums(
+    tmp_path, monkeypatch, field, stale_value
+):
+    monkeypatch.setattr(
+        extract_module, "validate_output_path", lambda path: Path(path).resolve()
+    )
+    kwargs = dict(
+        connection=object(),
+        game="raw",
+        quarter="2024Q1",
+        parent_ids={"MICHELIN": 101, "GOODYEAR": 202, "HANKOOK": 303},
+        parent_seed_sha256="seed",
+        output_root=tmp_path,
+    )
+    extract_module.extract_chunk(
+        **kwargs, query_fn=lambda connection, sql: output_frame()
+    )
+    path = tmp_path / "_manifests" / "raw.json"
+    manifest = json.loads(path.read_text())
+    manifest["chunks"]["raw/2024Q1"][field] = stale_value
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+    calls = []
+    result = extract_module.extract_chunk(
+        **kwargs,
+        query_fn=lambda connection, sql: calls.append(1) or output_frame(),
+    )
+    assert result["status"] == "success"
+    assert calls == [1]
+
+
+def test_strict_resume_rejects_stale_top_level_manifest_version(tmp_path):
+    with pytest.raises(extract_module.ManifestContractError, match="version"):
+        pending_chunks(
+            ["raw/2024Q1"],
+            {"manifest_version": "old-version", "chunks": {}},
+            expected={"raw/2024Q1": {"output_path": str(tmp_path / "x.parquet")}},
+        )
+
+
+@pytest.mark.parametrize("payload", ["{corrupt", '{"manifest_version": "x"}'])
+def test_existing_corrupt_or_malformed_manifest_fails_without_losing_audit_trail(
+    tmp_path, monkeypatch, payload
+):
+    monkeypatch.setattr(
+        extract_module, "validate_output_path", lambda path: Path(path).resolve()
+    )
+    manifest_path = tmp_path / "_manifests" / "raw.json"
+    manifest_path.parent.mkdir(parents=True)
+    manifest_path.write_text(payload, encoding="utf-8")
+    original = manifest_path.read_bytes()
+    calls = []
+    with pytest.raises(extract_module.ManifestContractError):
+        extract_module.extract_chunk(
+            object(),
+            "raw",
+            "2024Q2",
+            {"MICHELIN": 101, "GOODYEAR": 202, "HANKOOK": 303},
+            parent_seed_sha256="seed",
+            output_root=tmp_path,
+            query_fn=lambda connection, sql: calls.append(1) or output_frame("2024Q2"),
+        )
+    assert calls == []
+    assert manifest_path.read_bytes() == original
+
+
+@pytest.mark.parametrize("mutation", ["extra_column", "wrong_quarter", "duplicate_key"])
+def test_strict_resume_reloads_and_revalidates_exact_parquet_contract(
+    tmp_path, monkeypatch, mutation
+):
+    monkeypatch.setattr(
+        extract_module, "validate_output_path", lambda path: Path(path).resolve()
+    )
+    kwargs = dict(
+        connection=object(),
+        game="raw",
+        quarter="2024Q1",
+        parent_ids={"MICHELIN": 101, "GOODYEAR": 202, "HANKOOK": 303},
+        parent_seed_sha256="seed",
+        output_root=tmp_path,
+    )
+    extract_module.extract_chunk(
+        **kwargs, query_fn=lambda connection, sql: output_frame()
+    )
+    target = tmp_path / "_chunks" / "raw" / "2024Q1.parquet"
+    frame = pd.read_parquet(target)
+    if mutation == "extra_column":
+        frame["unexpected"] = 1
+    elif mutation == "wrong_quarter":
+        frame["year_quarter"] = "2024Q2"
+    else:
+        frame = pd.concat([frame, frame], ignore_index=True)
+    frame.to_parquet(target, index=False)
+    manifest_path = tmp_path / "_manifests" / "raw.json"
+    manifest = json.loads(manifest_path.read_text())
+    entry = manifest["chunks"]["raw/2024Q1"]
+    entry["file_sha256"] = extract_module.sha256_file(target)
+    entry["output_schema_fingerprint"] = extract_module.output_schema_fingerprint(frame)
+    entry["row_count"] = len(frame)
+    entry["allocated_value_usd_sum"] = float(frame["value_usd"].sum())
+    entry["shipment_equivalent_sum"] = float(frame["shipment_equivalent"].sum())
+    entry["nonadditive_count_sum"] = float(frame["shipment_count_nonadditive"].sum())
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    calls = []
+    result = extract_module.extract_chunk(
+        **kwargs,
+        query_fn=lambda connection, sql: calls.append(1) or output_frame(),
+    )
+    assert result["status"] == "success"
+    assert calls == [1]
 
 
 def test_validate_output_accepts_empty_schema_and_rejects_bad_values():
@@ -309,11 +448,13 @@ def reviewed_seed_fixture(tmp_path, monkeypatch):
 
 def test_parent_seed_gate_returns_exact_keyed_mapping_and_provenance(tmp_path, monkeypatch):
     seed_path, pointer = reviewed_seed_fixture(tmp_path, monkeypatch)
-    assert extract_module.load_parent_seed(seed_path, candidate_pointer_path=pointer) == {
+    snapshot = extract_module.load_parent_seed(seed_path, candidate_pointer_path=pointer)
+    assert snapshot.parent_ids == {
         "MICHELIN": 101,
         "GOODYEAR": 202,
         "HANKOOK": 303,
     }
+    assert snapshot.sha256 == hashlib.sha256(seed_path.read_bytes()).hexdigest()
 
 
 @pytest.mark.parametrize("mode", ["missing", "extra", "duplicate", "null", "unreviewed", "bad_time"])
@@ -403,11 +544,43 @@ def test_parent_seed_uses_one_stable_loaded_pointer_snapshot_during_publication_
         race_after_loaded_resolution,
     )
 
-    assert extract_module.load_parent_seed(
+    snapshot = extract_module.load_parent_seed(
         seed_path, candidate_pointer_path=pointer_path
-    ) == {"MICHELIN": 101, "GOODYEAR": 202, "HANKOOK": 303}
+    )
+    assert snapshot.parent_ids == {"MICHELIN": 101, "GOODYEAR": 202, "HANKOOK": 303}
     assert pointer_reads == [1]
     assert extract_module.sha256_file(pointer_path) != old_pointer_hash
+
+
+def test_parent_seed_mapping_and_hash_come_from_one_csv_byte_snapshot(
+    tmp_path, monkeypatch
+):
+    seed_path, pointer_path = reviewed_seed_fixture(tmp_path, monkeypatch)
+    old_bytes = seed_path.read_bytes()
+    old_hash = hashlib.sha256(old_bytes).hexdigest()
+    replacement = pd.read_csv(seed_path)
+    replacement["manufacturer_parent_id"] = [999, 888, 777]
+    replacement_path = tmp_path / "replacement-seed.csv"
+    replacement.to_csv(replacement_path, index=False)
+    real_read_bytes = Path.read_bytes
+    reads = []
+
+    def swap_after_snapshot(path):
+        payload = real_read_bytes(path)
+        if Path(path).resolve() == seed_path.resolve():
+            reads.append(1)
+            os.replace(replacement_path, seed_path)
+        return payload
+
+    monkeypatch.setattr(Path, "read_bytes", swap_after_snapshot)
+    snapshot = extract_module.load_parent_seed(
+        seed_path, candidate_pointer_path=pointer_path
+    )
+
+    assert reads == [1]
+    assert snapshot.parent_ids == {"MICHELIN": 101, "GOODYEAR": 202, "HANKOOK": 303}
+    assert snapshot.sha256 == old_hash
+    assert extract_module.sha256_file(seed_path) != old_hash
 
 
 def test_runtime_seed_and_chunk_paths_are_canonical():

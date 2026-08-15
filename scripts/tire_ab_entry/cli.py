@@ -8,11 +8,10 @@ import json
 from scripts.ab_entry_pilot.extract import connect
 
 from .extract import (
-    PARENT_SEED_PATH,
     extract_full,
     load_description_identity,
     load_parent_seed,
-    sha256_file,
+    quarter_bounds,
     validate_quarter,
 )
 from .schema_probe import discover_parent_candidates, probe_schema
@@ -39,10 +38,23 @@ def main(argv: list[str] | None = None) -> int:
     parent_ids = None
     parent_seed_sha256 = None
     description_identity = None
+    if args.command == "validate-quarter":
+        try:
+            quarter_bounds(args.quarter)
+        except ValueError:
+            _print_json(
+                {
+                    "status": "error",
+                    "command": args.command,
+                    "error_category": "invalid_quarter",
+                }
+            )
+            return 1
     if args.command in {"validate-quarter", "extract-full"}:
         try:
-            parent_ids = load_parent_seed()
-            parent_seed_sha256 = sha256_file(PARENT_SEED_PATH)
+            seed_snapshot = load_parent_seed()
+            parent_ids = seed_snapshot.parent_ids
+            parent_seed_sha256 = seed_snapshot.sha256
             description_identity = load_description_identity()
         except Exception:
             _print_json(

@@ -13,6 +13,8 @@ import time
 from datetime import date
 from datetime import datetime, timezone
 from contextlib import contextmanager
+from dataclasses import dataclass
+from io import BytesIO
 import threading
 from typing import Callable, Iterable, Mapping
 
@@ -52,6 +54,16 @@ SEED_COLUMNS = (
     "source_candidate_pointer_sha256",
     "source_candidate_metadata_sha256",
 )
+
+
+@dataclass(frozen=True)
+class ParentSeedSnapshot:
+    """One validated in-memory CSV snapshot and the hash of those exact bytes."""
+
+    parent_ids: dict[str, int]
+    sha256: str
+
+
 ADDITIVE_MEASURES = (
     "shipment_equivalent",
     "value_usd",
@@ -249,13 +261,17 @@ def load_parent_seed(
     seed_path: Path | str = PARENT_SEED_PATH,
     *,
     candidate_pointer_path: Path | str = PARENT_CANDIDATE_POINTER_PATH,
-) -> dict[str, int]:
+) -> ParentSeedSnapshot:
     """Validate the human-reviewed seed and its current candidate provenance."""
 
     seed = Path(seed_path)
     pointer_path = Path(candidate_pointer_path)
     try:
-        frame = pd.read_csv(seed, dtype={"manufacturer_key": "string"})
+        seed_bytes = seed.read_bytes()
+        seed_hash = hashlib.sha256(seed_bytes).hexdigest()
+        frame = pd.read_csv(
+            BytesIO(seed_bytes), dtype={"manufacturer_key": "string"}
+        )
     except Exception as error:
         raise ValueError("reviewed parent seed is missing or unreadable") from error
     missing_columns = set(SEED_COLUMNS).difference(frame.columns)
@@ -325,7 +341,10 @@ def load_parent_seed(
         )
         if int(keyed[key]) not in available:
             raise ValueError("parent seed selection is absent from its keyed candidates")
-    return {key: int(keyed[key]) for key in MANUFACTURER_KEYS}
+    return ParentSeedSnapshot(
+        parent_ids={key: int(keyed[key]) for key in MANUFACTURER_KEYS},
+        sha256=seed_hash,
+    )
 
 
 def validate_output_frame(frame: pd.DataFrame, quarter: str) -> pd.DataFrame:
@@ -334,9 +353,15 @@ def validate_output_frame(frame: pd.DataFrame, quarter: str) -> pd.DataFrame:
     quarter_bounds(quarter)
     if frame.columns.duplicated().any():
         raise ValueError("output has duplicate columns")
-    missing = set(REQUIRED_OUTPUT_COLUMNS).difference(frame.columns)
-    if missing:
-        raise ValueError(f"output schema is missing required columns: {sorted(missing)}")
+    actual_columns = tuple(str(column) for column in frame.columns)
+    if actual_columns != REQUIRED_OUTPUT_COLUMNS:
+        missing = sorted(set(REQUIRED_OUTPUT_COLUMNS).difference(actual_columns))
+        extra = sorted(set(actual_columns).difference(REQUIRED_OUTPUT_COLUMNS))
+        raise ValueError(
+            "output does not match the exact required columns "
+            f"(missing={missing}, extra={extra}, order_mismatch="
+            f"{not missing and not extra})"
+        )
     if not frame.empty and not frame["year_quarter"].astype("string").eq(quarter).all():
         raise ValueError("output quarter does not match requested quarter")
     numeric_columns = [
@@ -506,6 +531,8 @@ def pending_chunks(
 ) -> list[str]:
     """Return input-ordered chunks that do not have a recorded success."""
 
+    if expected is not None:
+        _validate_manifest_contract(manifest)
     entries = manifest.get("chunks", {}) if isinstance(manifest, dict) else {}
     pending = []
     for chunk in chunks:
@@ -513,34 +540,9 @@ def pending_chunks(
         verified = isinstance(entry, dict) and entry.get("status") == "success"
         if verified and expected is not None:
             contract = expected.get(chunk)
-            verified = isinstance(contract, Mapping)
-            if verified:
-                for field in (
-                    "sql_sha256",
-                    "parent_seed_sha256",
-                    "output_schema_fingerprint",
-                    "contract_version",
-                    "output_path",
-                ):
-                    if field in contract and contract.get(field) is not None:
-                        verified = verified and entry.get(field) == contract.get(field)
-                path = Path(str(contract.get("output_path", "")))
-                try:
-                    verified = bool(
-                        verified
-                        and path.is_file()
-                        and entry.get("file_sha256") == sha256_file(path)
-                    )
-                    if verified:
-                        restored = pd.read_parquet(path)
-                        verified = (
-                            output_schema_fingerprint(restored)
-                            == entry.get("output_schema_fingerprint")
-                        )
-                except OSError:
-                    verified = False
-                except Exception:
-                    verified = False
+            verified = isinstance(contract, Mapping) and _verified_success_entry(
+                chunk, entry, contract
+            )
         if not verified:
             pending.append(chunk)
     return pending
@@ -552,6 +554,10 @@ class ChunkExtractionError(RuntimeError):
     def __init__(self, category: str):
         self.category = category
         super().__init__(f"chunk extraction failed ({category})")
+
+
+class ManifestContractError(RuntimeError):
+    """An existing manifest cannot safely be used or overwritten."""
 
 
 def _utc_now() -> str:
@@ -625,26 +631,117 @@ def _read_manifest(path: Path) -> dict:
         return {"manifest_version": MANIFEST_VERSION, "chunks": {}}
     try:
         manifest = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {"manifest_version": MANIFEST_VERSION, "chunks": {}}
-    if not isinstance(manifest, dict) or not isinstance(manifest.get("chunks"), dict):
-        return {"manifest_version": MANIFEST_VERSION, "chunks": {}}
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ManifestContractError("existing manifest is unreadable or corrupt") from error
+    _validate_manifest_contract(manifest)
     return manifest
+
+
+SUCCESS_ENTRY_FIELDS = {
+    "quarter",
+    "game",
+    "status",
+    "attempt_count",
+    "row_count",
+    "allocated_value_usd_sum",
+    "shipment_equivalent_sum",
+    "nonadditive_count_sum",
+    "sql_sha256",
+    "parent_seed_sha256",
+    "output_schema_fingerprint",
+    "file_sha256",
+    "output_path",
+    "started_at",
+    "finished_at",
+    "code_version",
+    "contract_version",
+}
+
+
+def _validate_manifest_contract(manifest: object) -> None:
+    if not isinstance(manifest, dict) or set(manifest) != {
+        "manifest_version",
+        "chunks",
+    }:
+        raise ManifestContractError("existing manifest has a malformed top-level contract")
+    if manifest.get("manifest_version") != MANIFEST_VERSION:
+        raise ManifestContractError("existing manifest version does not match runtime")
+    chunks = manifest.get("chunks")
+    if not isinstance(chunks, dict) or not all(
+        isinstance(key, str) and isinstance(value, dict)
+        for key, value in chunks.items()
+    ):
+        raise ManifestContractError("existing manifest chunks contract is malformed")
+
+
+def _manifest_metrics(frame: pd.DataFrame) -> dict[str, int | float]:
+    return {
+        "row_count": int(len(frame)),
+        "allocated_value_usd_sum": float(frame["value_usd"].sum()),
+        "shipment_equivalent_sum": float(frame["shipment_equivalent"].sum()),
+        "nonadditive_count_sum": float(frame["shipment_count_nonadditive"].sum()),
+    }
+
+
+def _verified_success_entry(
+    chunk_key: str, entry: Mapping[str, object], contract: Mapping[str, object]
+) -> bool:
+    if set(entry) != SUCCESS_ENTRY_FIELDS or entry.get("status") != "success":
+        return False
+    try:
+        game, quarter = chunk_key.split("/", 1)
+        validate_game(game)
+        quarter_bounds(quarter)
+        if entry.get("game") != game or entry.get("quarter") != quarter:
+            return False
+        if entry.get("code_version") != CODE_VERSION:
+            return False
+        if entry.get("contract_version") != CONTRACT_VERSION:
+            return False
+        if not isinstance(entry.get("attempt_count"), int) or int(
+            entry["attempt_count"]
+        ) < 1:
+            return False
+        for field in (
+            "sql_sha256",
+            "parent_seed_sha256",
+            "output_schema_fingerprint",
+            "contract_version",
+            "output_path",
+        ):
+            if field in contract and contract.get(field) is not None:
+                if entry.get(field) != contract.get(field):
+                    return False
+        path = Path(str(contract.get("output_path", "")))
+        if not path.is_file() or entry.get("file_sha256") != sha256_file(path):
+            return False
+        restored = pd.read_parquet(path)
+        validate_output_frame(restored, quarter)
+        if output_schema_fingerprint(restored) != entry.get(
+            "output_schema_fingerprint"
+        ):
+            return False
+        metrics = _manifest_metrics(restored)
+        return all(entry.get(field) == value for field, value in metrics.items())
+    except Exception:
+        return False
 
 
 def _entry_file_verified(entry: object) -> bool:
     if not isinstance(entry, dict) or entry.get("status") != "success":
         return False
     try:
-        path = Path(str(entry["output_path"]))
-        restored = pd.read_parquet(path)
-        return bool(
-            entry.get("file_sha256") == sha256_file(path)
-            and entry.get("output_schema_fingerprint")
-            == output_schema_fingerprint(restored)
+        key = f"{entry['game']}/{entry['quarter']}"
+        return _verified_success_entry(
+            key,
+            entry,
+            {
+                "output_path": entry["output_path"],
+                "sql_sha256": entry["sql_sha256"],
+                "parent_seed_sha256": entry["parent_seed_sha256"],
+                "contract_version": CONTRACT_VERSION,
+            },
         )
-    except (KeyError, OSError, ValueError):
-        return False
     except Exception:
         return False
 

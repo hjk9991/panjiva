@@ -2,6 +2,7 @@ import json
 
 import scripts.tire_ab_entry.cli as cli_module
 from scripts.tire_ab_entry.cli import build_parser
+from scripts.tire_ab_entry.extract import ParentSeedSnapshot
 
 
 class Connection:
@@ -151,8 +152,13 @@ def test_extract_full_refuses_bad_seed_before_opening_connection(monkeypatch, ca
 def test_extract_full_passes_games_and_closes_before_single_json(monkeypatch, capsys):
     calls = []
     connection = Connection(calls)
-    monkeypatch.setattr(cli_module, "load_parent_seed", lambda: {"MICHELIN": 1, "GOODYEAR": 2, "HANKOOK": 3})
-    monkeypatch.setattr(cli_module, "sha256_file", lambda path: "seedhash")
+    monkeypatch.setattr(
+        cli_module,
+        "load_parent_seed",
+        lambda: ParentSeedSnapshot(
+            {"MICHELIN": 1, "GOODYEAR": 2, "HANKOOK": 3}, "seedhash"
+        ),
+    )
     monkeypatch.setattr(cli_module, "load_description_identity", lambda: None)
     monkeypatch.setattr(cli_module, "connect", lambda: connection)
     monkeypatch.setattr(
@@ -172,8 +178,13 @@ def test_extract_full_passes_games_and_closes_before_single_json(monkeypatch, ca
 def test_validate_quarter_uses_isolated_orchestrator(monkeypatch, capsys):
     calls = []
     connection = Connection(calls)
-    monkeypatch.setattr(cli_module, "load_parent_seed", lambda: {"MICHELIN": 1, "GOODYEAR": 2, "HANKOOK": 3})
-    monkeypatch.setattr(cli_module, "sha256_file", lambda path: "seedhash")
+    monkeypatch.setattr(
+        cli_module,
+        "load_parent_seed",
+        lambda: ParentSeedSnapshot(
+            {"MICHELIN": 1, "GOODYEAR": 2, "HANKOOK": 3}, "seedhash"
+        ),
+    )
     monkeypatch.setattr(cli_module, "load_description_identity", lambda: None)
     monkeypatch.setattr(cli_module, "connect", lambda: connection)
     monkeypatch.setattr(
@@ -186,3 +197,18 @@ def test_validate_quarter_uses_isolated_orchestrator(monkeypatch, capsys):
     assert calls[0][1] == "2024Q1"
     assert calls[-1] == "close"
     assert json.loads(capsys.readouterr().out)["run_id"] == "test"
+
+
+def test_validate_quarter_rejects_syntax_before_seed_or_connection(monkeypatch, capsys):
+    calls = []
+    monkeypatch.setattr(cli_module, "load_parent_seed", lambda: calls.append("seed"))
+    monkeypatch.setattr(cli_module, "connect", lambda: calls.append("connect"))
+
+    assert cli_module.main(["validate-quarter", "--quarter", "2024q1"]) == 1
+
+    assert calls == []
+    assert json.loads(capsys.readouterr().out) == {
+        "command": "validate-quarter",
+        "error_category": "invalid_quarter",
+        "status": "error",
+    }
