@@ -15,7 +15,9 @@ from scripts.tire_ab_entry.artifacts import (
     atomic_write_parquet,
     candidate_publication_lock,
     publish_candidate_artifact_set,
+    resolve_current_candidate_generation,
     sanitize_candidate_csv,
+    stage_candidate_generation,
 )
 
 
@@ -58,6 +60,27 @@ def _publish_generation_worker(root_text, generation, start_event, queue):
     except Exception as error:
         queue.put(type(error).__name__)
         raise
+
+
+def _stage_and_die_worker(root_text, generation, ready_event):
+    from pathlib import Path
+    import time
+    import pandas as pd
+    import scripts.tire_ab_entry.artifacts as worker_artifacts
+
+    worker_artifacts.validate_output_path = lambda path: Path(path).resolve()
+    root = Path(root_text)
+    frame = pd.DataFrame({"generation": [generation], "payload": [generation]})
+    lock_path = root / ".candidates.publication.lock"
+    with worker_artifacts.candidate_publication_lock(lock_path, timeout_seconds=10):
+        worker_artifacts.stage_candidate_generation(
+            frame,
+            frame,
+            {"generation": generation},
+            generations_root=root / "_generations",
+        )
+        ready_event.set()
+        time.sleep(60)
 
 
 def test_atomic_writer_uses_unique_temps_during_concurrent_writes(tmp_path):
@@ -131,6 +154,23 @@ def test_atomic_writer_detects_content_change_before_replace(tmp_path):
     assert _temporary_residue(tmp_path) == ()
 
 
+def test_atomic_writer_retries_transient_windows_replace_denial(tmp_path, monkeypatch):
+    target = tmp_path / "artifact.bin"
+    real_replace = artifacts_module.os.replace
+    attempts = []
+
+    def transient_replace(source, destination):
+        attempts.append((source, destination))
+        if len(attempts) == 1:
+            raise PermissionError("transient Windows sharing denial")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(artifacts_module.os, "replace", transient_replace)
+    atomic_write_bytes(b"published", target)
+    assert target.read_bytes() == b"published"
+    assert len(attempts) == 2
+
+
 def test_atomic_parquet_validates_exact_dataframe_content(tmp_path):
     target = tmp_path / "artifact.parquet"
     frame = pd.DataFrame({"id": pd.Series([1, 2], dtype="int64"), "name": ["a", "b"]})
@@ -202,9 +242,11 @@ def test_multiprocess_publication_sidecar_matches_one_complete_generation(tmp_pa
         assert process.exitcode == 0
     assert [queue.get(timeout=2) for _ in processes] == [None, None]
 
-    canonical_path = tmp_path / "candidates.parquet"
-    csv_path = tmp_path / "candidates.csv"
-    metadata_path = tmp_path / "candidates.metadata.json"
+    current_path = tmp_path / "candidates.current.json"
+    current = resolve_current_candidate_generation(current_path)
+    canonical_path = current["canonical_path"]
+    csv_path = current["csv_path"]
+    metadata_path = current["metadata_path"]
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     canonical = pd.read_parquet(canonical_path)
     review = pd.read_csv(csv_path)
@@ -215,5 +257,61 @@ def test_multiprocess_publication_sidecar_matches_one_complete_generation(tmp_pa
         "canonical_parquet": sha256(canonical_path),
         "sanitized_csv": sha256(csv_path),
     }
+    assert not (tmp_path / ".candidates.publication.lock").exists()
+    assert _temporary_residue(tmp_path) == ()
+
+
+def test_process_death_releases_lock_and_orphan_generation_never_becomes_current(
+    tmp_path,
+):
+    baseline = pd.DataFrame({"generation": ["BASE"], "payload": ["base"]})
+    publish_candidate_artifact_set(
+        baseline,
+        baseline,
+        {"generation": "BASE"},
+        canonical_path=tmp_path / "candidates.parquet",
+        csv_path=tmp_path / "candidates.csv",
+        metadata_path=tmp_path / "candidates.metadata.json",
+        lock_timeout_seconds=5,
+    )
+    current_path = tmp_path / "candidates.current.json"
+    baseline_current = resolve_current_candidate_generation(current_path)
+
+    context = multiprocessing.get_context("spawn")
+    ready_event = context.Event()
+    crashing = context.Process(
+        target=_stage_and_die_worker,
+        args=(str(tmp_path), "CRASH", ready_event),
+    )
+    crashing.start()
+    assert ready_event.wait(timeout=15)
+    crashing.terminate()
+    crashing.join(timeout=10)
+    assert crashing.exitcode != 0
+
+    still_current = resolve_current_candidate_generation(current_path)
+    assert still_current["generation_id"] == baseline_current["generation_id"]
+    assert set(pd.read_parquet(still_current["canonical_path"])["generation"]) == {
+        "BASE"
+    }
+    assert len(tuple((tmp_path / "_generations").iterdir())) == 2
+
+    recovered = pd.DataFrame({"generation": ["RECOVERED"], "payload": ["ok"]})
+    publish_candidate_artifact_set(
+        recovered,
+        recovered,
+        {"generation": "RECOVERED"},
+        canonical_path=tmp_path / "candidates.parquet",
+        csv_path=tmp_path / "candidates.csv",
+        metadata_path=tmp_path / "candidates.metadata.json",
+        lock_timeout_seconds=5,
+    )
+    new_current = resolve_current_candidate_generation(current_path)
+    assert set(pd.read_parquet(new_current["canonical_path"])["generation"]) == {
+        "RECOVERED"
+    }
+    assert tuple((tmp_path / "_generations").iterdir()) == (
+        new_current["generation_path"],
+    )
     assert not (tmp_path / ".candidates.publication.lock").exists()
     assert _temporary_residue(tmp_path) == ()

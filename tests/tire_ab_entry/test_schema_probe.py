@@ -10,6 +10,7 @@ from scripts.tire_ab_entry.schema_probe import (
     APPROVED_DATABASE,
     APPROVED_SCHEMA,
     CANDIDATE_COLUMNS,
+    PARENT_CANDIDATE_CURRENT_PATH,
     PARENT_CANDIDATE_METADATA_PATH,
     SCHEMA_OUTPUT_PATH,
     PARENT_CANDIDATE_PARQUET_PATH,
@@ -443,8 +444,12 @@ def test_discover_parent_candidates_preserves_candidate_schema_without_selection
     result = discover_parent_candidates(connection, output_path=target)
 
     saved = pd.read_csv(target)
-    canonical_path = tmp_path / "manufacturer_parent_candidates.parquet"
-    metadata_path = tmp_path / "manufacturer_parent_candidates.metadata.json"
+    projection_canonical_path = tmp_path / "manufacturer_parent_candidates.parquet"
+    projection_metadata_path = tmp_path / "manufacturer_parent_candidates.metadata.json"
+    current_path = tmp_path / "manufacturer_parent_candidates.current.json"
+    current = probe_module.artifacts.resolve_current_candidate_generation(current_path)
+    canonical_path = current["canonical_path"]
+    metadata_path = current["metadata_path"]
     canonical = pd.read_parquet(canonical_path)
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     assert len(publication_calls) == 1
@@ -466,6 +471,13 @@ def test_discover_parent_candidates_preserves_candidate_schema_without_selection
     }
     assert result["canonical_path"] == str(canonical_path)
     assert result["metadata_path"] == str(metadata_path)
+    assert result["current_manifest_path"] == str(current_path)
+    assert result["generation_id"] == current["generation_id"]
+    assert result["projection_paths"] == {
+        "canonical_parquet": str(projection_canonical_path),
+        "sanitized_csv": str(target),
+        "metadata": str(projection_metadata_path),
+    }
     assert metadata["sql_contract_version"] == "tire-parent-candidate-v2"
     assert metadata["query_hash_contract_version"] == "sql-plus-ordered-parameters-v1"
     assert metadata["query_contract_sha256"] == compute_query_contract_hash(
@@ -496,6 +508,9 @@ def test_runtime_paths_are_exact_and_licensed():
     )
     assert PARENT_CANDIDATE_METADATA_PATH == Path(
         r"C:\panjiva\data\staging\ab_entry_tire_v1\review\manufacturer_parent_candidates.metadata.json"
+    )
+    assert PARENT_CANDIDATE_CURRENT_PATH == Path(
+        r"C:\panjiva\data\staging\ab_entry_tire_v1\review\manufacturer_parent_candidates.current.json"
     )
 
 

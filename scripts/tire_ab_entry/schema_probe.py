@@ -38,6 +38,9 @@ PARENT_CANDIDATE_PARQUET_PATH = (
 PARENT_CANDIDATE_METADATA_PATH = (
     OUTPUT_ROOT / "review" / "manufacturer_parent_candidates.metadata.json"
 )
+PARENT_CANDIDATE_CURRENT_PATH = (
+    OUTPUT_ROOT / "review" / "manufacturer_parent_candidates.current.json"
+)
 PARENT_QUERY_CONTRACT_VERSION = "tire-parent-candidate-v2"
 QUERY_HASH_CONTRACT_VERSION = "sql-plus-ordered-parameters-v1"
 DESCRIPTION_COLUMN_PREFERENCE = (
@@ -462,8 +465,11 @@ def discover_parent_candidates(
         "candidate_counts": counts,
         "candidate_count": int(len(frame)),
         "output_path": str(target),
-        "canonical_path": str(canonical_target),
-        "metadata_path": str(metadata_target),
+        "canonical_path": str(publication["canonical_path"]),
+        "metadata_path": str(publication["metadata_path"]),
+        "current_manifest_path": str(publication["current_manifest_path"]),
+        "generation_id": publication["generation_id"],
+        "projection_paths": publication["projection_paths"],
         "metadata_sha256": publication["metadata_sha256"],
         "review_status": "human_selection_required",
         "row_count_warnings": warnings,
