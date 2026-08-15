@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from copy import deepcopy
-from datetime import datetime, timezone
 from io import BytesIO
 import hashlib
 import json
@@ -225,12 +224,16 @@ def candidate_publication_lock(
 GENERATION_CANONICAL_NAME = "manufacturer_parent_candidates.parquet"
 GENERATION_CSV_NAME = "manufacturer_parent_candidates.csv"
 GENERATION_METADATA_NAME = "manufacturer_parent_candidates.metadata.json"
-CURRENT_MANIFEST_VERSION = "candidate-generation-pointer-v1"
+GENERATION_COMMITTED_NAME = "generation.committed.json"
+CURRENT_MANIFEST_VERSION = "candidate-generation-pointer-v2"
+LEGACY_CURRENT_MANIFEST_VERSION = "candidate-generation-pointer-v1"
+COMMITTED_MARKER_VERSION = "candidate-generation-committed-v1"
 
 
 def _new_generation_id() -> str:
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-    return f"{timestamp}-{os.getpid()}-{uuid.uuid4().hex}"
+    # A full UUID is collision-resistant without making Windows artifact paths
+    # long enough to exceed legacy MAX_PATH handling in third-party libraries.
+    return uuid.uuid4().hex
 
 
 def stage_candidate_generation(
@@ -297,35 +300,68 @@ def _verify_generation(generation: dict) -> None:
         raise RuntimeError("generation sanitized CSV hash changed")
 
 
-def _current_manifest_path(csv_path: Path) -> Path:
-    return csv_path.with_suffix(".current.json")
+def _publication_identity_from_csv(csv_path: Path) -> str:
+    identity = csv_path.stem.strip().casefold()
+    if not identity or identity in {".", ".."} or Path(identity).name != identity:
+        raise ValueError("candidate publication has an invalid identity")
+    return identity
 
 
-def _generations_root(csv_path: Path) -> Path:
-    return csv_path.parent / "_generations"
+def _publication_identity_from_current(current_path: Path) -> str:
+    suffix = ".current.json"
+    name = current_path.name
+    if not name.casefold().endswith(suffix):
+        raise ValueError("candidate current manifest must end in .current.json")
+    identity = name[: -len(suffix)].strip().casefold()
+    if not identity or identity in {".", ".."} or Path(identity).name != identity:
+        raise ValueError("candidate current manifest has an invalid identity")
+    return identity
 
 
-def _commit_generation(current_path: Path, staged: dict) -> str:
+def _current_manifest_path(csv_path: Path, publication_identity: str) -> Path:
+    return csv_path.parent / f"{publication_identity}.current.json"
+
+
+def _generations_root(csv_path: Path, publication_identity: str) -> Path:
+    return csv_path.parent / "_generations" / publication_identity
+
+
+def _commit_generation(
+    current_path: Path, staged: dict, publication_identity: str
+) -> str:
     payload = {
         "manifest_version": CURRENT_MANIFEST_VERSION,
+        "publication_identity": publication_identity,
         "generation_id": staged["generation_id"],
         "metadata_sha256": staged["metadata_sha256"],
     }
     return atomic_write_json(payload, current_path)
 
 
-def resolve_current_candidate_generation(current_path: Path | str) -> dict:
-    """Resolve and validate the one generation trusted by the atomic pointer."""
+def resolve_candidate_generation_manifest(
+    current_path: Path | str, pointer: dict
+) -> dict:
+    """Resolve a previously loaded immutable generation pointer."""
 
     pointer_path = validate_output_path(current_path)
-    pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
-    required = {"manifest_version", "generation_id", "metadata_sha256"}
-    if set(pointer) != required or pointer["manifest_version"] != CURRENT_MANIFEST_VERSION:
+    identity = _publication_identity_from_current(pointer_path)
+    version = pointer.get("manifest_version")
+    legacy_required = {"manifest_version", "generation_id", "metadata_sha256"}
+    current_required = legacy_required | {"publication_identity"}
+    if version == CURRENT_MANIFEST_VERSION and set(pointer) == current_required:
+        if pointer["publication_identity"] != identity:
+            raise RuntimeError("current candidate manifest identity does not match path")
+        root = validate_output_path(
+            pointer_path.parent / "_generations" / identity
+        )
+    elif version == LEGACY_CURRENT_MANIFEST_VERSION and set(pointer) == legacy_required:
+        # Read-only migration support for the pilot's original shared generation root.
+        root = validate_output_path(pointer_path.parent / "_generations")
+    else:
         raise RuntimeError("current candidate manifest has an invalid contract")
     generation_id = str(pointer["generation_id"])
     if not generation_id or Path(generation_id).name != generation_id:
         raise RuntimeError("current candidate manifest has an invalid generation ID")
-    root = validate_output_path(_generations_root(pointer_path.with_suffix(".csv")))
     generation_path = validate_output_path(root / generation_id)
     if generation_path.parent != root:
         raise RuntimeError("current candidate generation escaped its approved root")
@@ -342,11 +378,21 @@ def resolve_current_candidate_generation(current_path: Path | str) -> dict:
         "metadata_sha256": pointer["metadata_sha256"],
         "metadata": metadata,
         "current_manifest_path": pointer_path,
+        "publication_identity": identity,
+        "manifest_version": version,
     }
     if metadata.get("generation_id") != generation_id:
         raise RuntimeError("current candidate metadata generation does not match pointer")
     _verify_generation(generation)
     return generation
+
+
+def resolve_current_candidate_generation(current_path: Path | str) -> dict:
+    """Resolve and validate the one generation trusted by the atomic pointer."""
+
+    pointer_path = validate_output_path(current_path)
+    pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+    return resolve_candidate_generation_manifest(pointer_path, pointer)
 
 
 def _repair_projections(generation: dict, targets: tuple[Path, Path, Path]) -> None:
@@ -357,7 +403,20 @@ def _repair_projections(generation: dict, targets: tuple[Path, Path, Path]) -> N
         atomic_write_bytes(source.read_bytes(), target)
 
 
-def _cleanup_orphan_generations(root: Path, keep_generation_id: str | None) -> None:
+def _mark_generation_committed(generation: dict, publication_identity: str) -> None:
+    marker = {
+        "marker_version": COMMITTED_MARKER_VERSION,
+        "publication_identity": publication_identity,
+        "generation_id": generation["generation_id"],
+        "metadata_sha256": generation["metadata_sha256"],
+    }
+    atomic_write_json(
+        marker,
+        Path(generation["generation_path"]) / GENERATION_COMMITTED_NAME,
+    )
+
+
+def _cleanup_incomplete_generations(root: Path, keep_generation_id: str | None) -> None:
     if not root.exists():
         return
     canonical_root = validate_output_path(root)
@@ -367,7 +426,8 @@ def _cleanup_orphan_generations(root: Path, keep_generation_id: str | None) -> N
         canonical_candidate = validate_output_path(candidate)
         if canonical_candidate.parent != canonical_root:
             raise RuntimeError("orphan generation path escaped its approved root")
-        shutil.rmtree(canonical_candidate)
+        if not (canonical_candidate / GENERATION_COMMITTED_NAME).exists():
+            shutil.rmtree(canonical_candidate)
 
 
 def publish_candidate_artifact_set(
@@ -389,9 +449,10 @@ def publish_candidate_artifact_set(
     if len({os.path.normcase(str(path)) for path in targets}) != 3:
         raise ValueError("candidate publication paths must be distinct")
     canonical_target, csv_target, metadata_target = targets
-    lock_path = csv_target.parent / f".{csv_target.stem}.publication.lock"
-    current_path = _current_manifest_path(csv_target)
-    generations_root = _generations_root(csv_target)
+    publication_identity = _publication_identity_from_csv(csv_target)
+    lock_path = csv_target.parent / f".{publication_identity}.publication.lock"
+    current_path = _current_manifest_path(csv_target, publication_identity)
+    generations_root = _generations_root(csv_target, publication_identity)
     with candidate_publication_lock(
         lock_path,
         timeout_seconds=lock_timeout_seconds,
@@ -399,8 +460,9 @@ def publish_candidate_artifact_set(
         previous = None
         if current_path.exists():
             previous = resolve_current_candidate_generation(current_path)
+            _mark_generation_committed(previous, publication_identity)
             _repair_projections(previous, targets)
-        _cleanup_orphan_generations(
+        _cleanup_incomplete_generations(
             generations_root,
             previous["generation_id"] if previous is not None else None,
         )
@@ -410,10 +472,13 @@ def publish_candidate_artifact_set(
             metadata,
             generations_root=generations_root,
         )
-        pointer_hash = _commit_generation(current_path, staged)
+        pointer_hash = _commit_generation(
+            current_path, staged, publication_identity
+        )
         committed = resolve_current_candidate_generation(current_path)
+        _mark_generation_committed(committed, publication_identity)
         _repair_projections(committed, targets)
-        _cleanup_orphan_generations(generations_root, committed["generation_id"])
+        _cleanup_incomplete_generations(generations_root, committed["generation_id"])
         return {
             **committed,
             "current_manifest_sha256": pointer_hash,

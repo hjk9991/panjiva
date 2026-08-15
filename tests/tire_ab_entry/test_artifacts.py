@@ -15,6 +15,7 @@ from scripts.tire_ab_entry.artifacts import (
     atomic_write_parquet,
     candidate_publication_lock,
     publish_candidate_artifact_set,
+    resolve_candidate_generation_manifest,
     resolve_current_candidate_generation,
     sanitize_candidate_csv,
     stage_candidate_generation,
@@ -77,7 +78,7 @@ def _stage_and_die_worker(root_text, generation, ready_event):
             frame,
             frame,
             {"generation": generation},
-            generations_root=root / "_generations",
+            generations_root=root / "_generations" / "candidates",
         )
         ready_event.set()
         time.sleep(60)
@@ -294,7 +295,8 @@ def test_process_death_releases_lock_and_orphan_generation_never_becomes_current
     assert set(pd.read_parquet(still_current["canonical_path"])["generation"]) == {
         "BASE"
     }
-    assert len(tuple((tmp_path / "_generations").iterdir())) == 2
+    generations_root = tmp_path / "_generations" / "candidates"
+    assert len(tuple(generations_root.iterdir())) == 2
 
     recovered = pd.DataFrame({"generation": ["RECOVERED"], "payload": ["ok"]})
     publish_candidate_artifact_set(
@@ -310,8 +312,69 @@ def test_process_death_releases_lock_and_orphan_generation_never_becomes_current
     assert set(pd.read_parquet(new_current["canonical_path"])["generation"]) == {
         "RECOVERED"
     }
-    assert tuple((tmp_path / "_generations").iterdir()) == (
-        new_current["generation_path"],
-    )
+    completed = tuple(generations_root.iterdir())
+    assert len(completed) == 2
+    assert baseline_current["generation_path"] in completed
+    assert new_current["generation_path"] in completed
     assert not (tmp_path / ".candidates.publication.lock").exists()
     assert _temporary_residue(tmp_path) == ()
+
+
+def test_two_named_publications_in_one_directory_are_namespace_isolated(tmp_path):
+    for name, generation in (("alpha", "A"), ("beta", "B")):
+        frame = pd.DataFrame({"generation": [generation]})
+        publish_candidate_artifact_set(
+            frame,
+            frame,
+            {"generation": generation},
+            canonical_path=tmp_path / f"{name}.parquet",
+            csv_path=tmp_path / f"{name}.csv",
+            metadata_path=tmp_path / f"{name}.metadata.json",
+        )
+
+    alpha = resolve_current_candidate_generation(tmp_path / "alpha.current.json")
+    beta = resolve_current_candidate_generation(tmp_path / "beta.current.json")
+    assert alpha["generation_path"].parent.name == "alpha"
+    assert beta["generation_path"].parent.name == "beta"
+    assert alpha["generation_path"].parent != beta["generation_path"].parent
+    assert set(pd.read_parquet(alpha["canonical_path"])["generation"]) == {"A"}
+    assert set(pd.read_parquet(beta["canonical_path"])["generation"]) == {"B"}
+
+
+def test_reader_with_loaded_old_pointer_survives_concurrent_new_publication(tmp_path):
+    frame = pd.DataFrame({"generation": ["OLD"]})
+    paths = {
+        "canonical_path": tmp_path / "candidates.parquet",
+        "csv_path": tmp_path / "candidates.csv",
+        "metadata_path": tmp_path / "candidates.metadata.json",
+    }
+    publish_candidate_artifact_set(frame, frame, {"generation": "OLD"}, **paths)
+    current_path = tmp_path / "candidates.current.json"
+    loaded = threading.Event()
+    published = threading.Event()
+
+    def lock_free_reader():
+        manifest = json.loads(current_path.read_text(encoding="utf-8"))
+        loaded.set()
+        assert published.wait(timeout=10)
+        return resolve_candidate_generation_manifest(current_path, manifest)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        reader = executor.submit(lock_free_reader)
+        assert loaded.wait(timeout=5)
+        new_frame = pd.DataFrame({"generation": ["NEW"]})
+        publish_candidate_artifact_set(
+            new_frame, new_frame, {"generation": "NEW"}, **paths
+        )
+        published.set()
+        old_generation = reader.result(timeout=10)
+
+    new_generation = resolve_current_candidate_generation(current_path)
+    assert set(pd.read_parquet(old_generation["canonical_path"])["generation"]) == {
+        "OLD"
+    }
+    assert set(pd.read_parquet(new_generation["canonical_path"])["generation"]) == {
+        "NEW"
+    }
+    assert old_generation["generation_path"].exists()
+    assert new_generation["generation_path"].exists()
