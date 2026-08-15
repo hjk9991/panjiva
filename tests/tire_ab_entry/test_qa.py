@@ -6,45 +6,54 @@ import pytest
 import scripts.tire_ab_entry.extract as extract_module
 import scripts.tire_ab_entry.qa as qa_module
 from tests.tire_ab_entry.test_extract import output_frame
+from scripts.tire_ab_entry.transforms import (
+    apply_manual_reviews,
+    build_game_artifacts,
+    build_review_items,
+)
 from scripts.tire_ab_entry.qa import (
     build_manual_review_queue,
     capture_g0_validation,
     evaluate_gates,
+    validate_transform_artifact,
 )
 
 
+def _review_items(game="raw", values=(60.0, 31.0, 9.0)):
+    size = len(values)
+    return pd.DataFrame(
+        {
+            "game": [game] * size,
+            "manufacturer_parent_id": [1] * size,
+            "review_group": ["rubber" if game == "raw" else "passenger"] * size,
+            "origin_country": ["KOR"] * size,
+            "input_group": ["rubber" if game == "raw" else pd.NA] * size,
+            "finished_market": [pd.NA if game == "raw" else "passenger"] * size,
+            "link_identity_type": ["ultimate_parent"] * size,
+            "link_identity_value": [f"SYN-{i}" for i in range(size)],
+            "review_item_id": [f"HASH-{game}-{i}" for i in range(size)],
+            "value_usd": list(values),
+        }
+    )
+
+
 def test_manual_review_queue_requires_human_status_and_covers_crossing_top_90():
-    items = pd.DataFrame(
-        {
-            "game": ["raw"] * 3,
-            "review_group": ["rubber"] * 3,
-            "review_item_id": ["SYN-A", "SYN-B", "SYN-C"],
-            "value_usd": [60.0, 31.0, 9.0],
-        }
+    items = _review_items()
+    reviews = items.iloc[:2].drop(columns="value_usd").assign(
+        review_status=["confirmed", "probable"],
+        source_note=["synthetic source A", "synthetic source B"],
     )
-    reviews = pd.DataFrame(
-        {
-            "game": ["raw", "raw"],
-            "review_group": ["rubber", "rubber"],
-            "review_item_id": ["SYN-A", "SYN-B"],
-            "review_status": ["confirmed", "probable"],
-            "source_note": ["synthetic source A", "synthetic source B"],
-        }
-    )
-    queue = build_manual_review_queue(items, reviews)
-    assert list(queue["review_item_id"]) == ["SYN-A", "SYN-B", "SYN-C"]
+    queue = build_manual_review_queue(items, reviews.astype("string"))
+    assert list(queue["review_item_id"]) == ["HASH-raw-0", "HASH-raw-1", "HASH-raw-2"]
     assert list(queue["required_top90"]) == [1, 1, 0]
     assert queue.loc[queue["required_top90"].eq(1), "review_complete"].all()
-    assert queue.loc[queue["review_item_id"].eq("SYN-A"), "main_eligible"].iat[0] == 1
-    assert queue.loc[queue["review_item_id"].eq("SYN-A"), "confirmed_eligible"].iat[0] == 1
-    assert queue.loc[queue["review_item_id"].eq("SYN-B"), "confirmed_eligible"].iat[0] == 0
+    assert queue.loc[queue["review_item_id"].eq("HASH-raw-0"), "main_eligible"].iat[0] == 1
+    assert queue.loc[queue["review_item_id"].eq("HASH-raw-0"), "confirmed_eligible"].iat[0] == 1
+    assert queue.loc[queue["review_item_id"].eq("HASH-raw-1"), "confirmed_eligible"].iat[0] == 0
 
 
 def test_manual_review_queue_never_auto_approves_and_rejects_bad_review_contract():
-    items = pd.DataFrame(
-        {"game": ["finished"], "review_group": ["passenger"],
-         "review_item_id": ["SYN-X"], "value_usd": [1.0]}
-    )
+    items = _review_items("finished", (1.0,))
     queue = build_manual_review_queue(items)
     assert pd.isna(queue["review_status"]).all()
     assert queue["review_complete"].eq(0).all()
@@ -112,6 +121,12 @@ def _qa_fixture(tmp_path):
             "manufacturer_conflict_value_usd": [0.0] * 6,
             "importer_pit_same_parent_overlap_value_usd": [0.0] * 6,
             "shipper_pit_same_parent_overlap_value_usd": [0.0] * 6,
+            "importer_pit_same_parent_overlap": [0] * 6,
+            "shipper_pit_same_parent_overlap": [0] * 6,
+            "importer_pit_same_parent_overlap_shipment_count_nonadditive": [0] * 6,
+            "shipper_pit_same_parent_overlap_shipment_count_nonadditive": [0] * 6,
+            "importer_pit_same_parent_overlap_shipment_equivalent": [0.0] * 6,
+            "shipper_pit_same_parent_overlap_shipment_equivalent": [0.0] * 6,
             "estimation_eligible": [1] * 6,
         }
     )
@@ -137,18 +152,23 @@ def _qa_fixture(tmp_path):
     )
     validation = pd.DataFrame(
         {"game": ["raw", "finished"], "quarter": ["2024Q1"] * 2,
-         "direct_row_count": [6, 6], "direct_value_usd": [60.0, 60.0],
+         "direct_output_row_count": [6, 6], "direct_unique_shipment_count": [6, 6],
+         "direct_value_usd": [60.0, 60.0],
          "direct_shipment_equivalent": [6.0, 6.0],
          "isolated_row_count": [6, 6], "isolated_value_usd": [60.0, 60.0],
          "isolated_shipment_equivalent": [6.0, 6.0], "reconciled": [1, 1]}
     )
-    queue = pd.DataFrame(
-        {"game": ["raw", "finished"], "review_group": ["all", "all"],
-         "review_item_id": ["SYN-R", "SYN-F"], "value_usd": [60.0, 60.0],
-         "cumulative_value_share": [1.0, 1.0], "required_top90": [1, 1],
-         "review_status": ["confirmed", "probable"], "source_note": ["a", "b"],
-         "review_complete": [1, 1], "main_eligible": [1, 1],
-         "confirmed_eligible": [1, 0]}
+    queue = pd.concat(
+        [
+            build_manual_review_queue(
+                items,
+                items.drop(columns="value_usd").assign(
+                    review_status="confirmed", source_note="human"
+                ),
+            )
+            for items in (_review_items("raw", (60.0,)), _review_items("finished", (60.0,)))
+        ],
+        ignore_index=True,
     )
     annual_origin = pd.DataFrame(
         [(m, origin, year, 1) for m in (1, 2, 3) for origin in ("KOR", "JPN")
@@ -156,7 +176,8 @@ def _qa_fixture(tmp_path):
         columns=["manufacturer_parent_id", "link_id", "year", "active"],
     )
     inside = tmp_path / "licensed" / "panel.parquet"
-    return raw, finished, origin_panels, seed, validation, queue, annual_origin, inside
+    annual = {"raw": annual_origin.copy(), "finished": annual_origin.copy()}
+    return raw, finished, origin_panels, seed, validation, queue, annual, inside
 
 
 def test_all_gates_pass_and_g6_only_controls_supplier_eligibility(tmp_path):
@@ -204,7 +225,13 @@ def test_required_gate_failure_is_nonzero(tmp_path, gate):
     elif gate == "G7":
         queue.loc[0, "review_complete"] = 0
     elif gate == "G8":
-        annual = annual.loc[~((annual["manufacturer_parent_id"] == 1) & (annual["link_id"] == "JPN") & (annual["year"] == 2024))]
+        annual["finished"] = annual["finished"].loc[
+            ~(
+                (annual["finished"]["manufacturer_parent_id"] == 1)
+                & (annual["finished"]["link_id"] == "JPN")
+                & (annual["finished"]["year"] == 2024)
+            )
+        ]
         kwargs["annual_origin"] = annual
     else:
         kwargs["licensed_paths"] = [tmp_path / "escaped.parquet"]
@@ -234,6 +261,31 @@ def test_zero_denominators_are_explicit_not_applicable_and_do_not_pass(tmp_path)
     assert result["supplier_game_eligible"] is False
 
 
+def test_g3_fails_on_zero_value_pit_overlap_occurrence(tmp_path):
+    raw, finished, panels, seed, validation, queue, annual, inside = _qa_fixture(tmp_path)
+    raw.loc[0, "importer_pit_same_parent_overlap"] = 1
+    raw.loc[0, "importer_pit_same_parent_overlap_value_usd"] = 0.0
+    result = evaluate_gates(
+        chunks={"raw": raw, "finished": finished}, origin_panels=panels,
+        parent_seed=seed, validation_metrics=validation, review_queue=queue,
+        annual_origin=annual, licensed_paths=[inside], licensed_root=tmp_path / "licensed",
+    )
+    assert result["gates"].set_index("gate").loc["G3", "status"] == "fail"
+
+
+def test_g8_reports_each_game_and_does_not_pool_origin_coverage(tmp_path):
+    raw, finished, panels, seed, validation, queue, annual, inside = _qa_fixture(tmp_path)
+    annual["finished"] = annual["finished"].iloc[0:0]
+    result = evaluate_gates(
+        chunks={"raw": raw, "finished": finished}, origin_panels=panels,
+        parent_seed=seed, validation_metrics=validation, review_queue=queue,
+        annual_origin=annual, licensed_paths=[inside], licensed_root=tmp_path / "licensed",
+    )
+    row = result["gates"].set_index("gate").loc["G8"]
+    assert row["status"] == "fail"
+    assert "raw" in row["detail"] and "finished" in row["detail"]
+
+
 def test_capture_g0_validation_writes_only_inside_validation_run(tmp_path, monkeypatch):
     monkeypatch.setattr(extract_module, "validate_output_path", lambda path: Path(path).resolve())
     monkeypatch.setattr(qa_module, "validate_output_path", lambda path: Path(path).resolve())
@@ -247,8 +299,8 @@ def test_capture_g0_validation_writes_only_inside_validation_run(tmp_path, monke
         )
     calls = []
     metrics = [
-        pd.DataFrame({"ROW_COUNT": [1], "VALUE_USD": [12.0], "SHIPMENT_EQUIVALENT": [1.0]}),
-        pd.DataFrame({"ROW_COUNT": [1], "VALUE_USD": [12.0], "SHIPMENT_EQUIVALENT": [1.0]}),
+        pd.DataFrame({"OUTPUT_ROW_COUNT": [1], "UNIQUE_SHIPMENT_COUNT": [1], "VALUE_USD": [12.0], "SHIPMENT_EQUIVALENT": [1.0]}),
+        pd.DataFrame({"OUTPUT_ROW_COUNT": [1], "UNIQUE_SHIPMENT_COUNT": [1], "VALUE_USD": [12.0], "SHIPMENT_EQUIVALENT": [1.0]}),
     ]
     result = capture_g0_validation(
         object(), "2024Q1", parent_ids={"MICHELIN": 1, "GOODYEAR": 2, "HANKOOK": 3},
@@ -260,4 +312,53 @@ def test_capture_g0_validation_writes_only_inside_validation_run(tmp_path, monke
     saved = pd.read_parquet(result["metrics_path"])
     assert list(saved["game"]) == ["raw", "finished"]
     assert saved["reconciled"].eq(1).all()
+    assert result["reconciled"] is True
     assert not (tmp_path / "panel_source_quarter_raw.parquet").exists()
+
+
+@pytest.mark.parametrize(
+    "mutation", ["extra", "missing", "dtype", "text_dtype", "duplicate"]
+)
+def test_transform_artifact_validator_is_exact_and_fail_closed(mutation):
+    source = output_frame().assign(
+        review_pending_technically_eligible=1,
+        shipper_up=10,
+        shipper_companyid=11,
+        shipper_panjiva_id=12,
+    )
+    reviewed = apply_manual_reviews(source, game="raw", reviews=None)
+    artifacts = build_game_artifacts(reviewed, game="raw")
+    frame = artifacts["origin_quarterly"].copy()
+    validate_transform_artifact("origin_quarterly", "raw", frame)
+    if mutation == "extra":
+        frame["unexpected"] = 1
+    elif mutation == "missing":
+        frame = frame.drop(columns="value_usd")
+    elif mutation == "dtype":
+        frame["value_usd"] = "not-numeric"
+    elif mutation == "text_dtype":
+        frame["origin_country"] = pd.Series(
+            [123] * len(frame), index=frame.index, dtype="object"
+        )
+    else:
+        frame = pd.concat([frame, frame], ignore_index=True)
+    with pytest.raises(ValueError, match="artifact"):
+        validate_transform_artifact("origin_quarterly", "raw", frame)
+
+
+@pytest.mark.parametrize("game", ["raw", "finished"])
+def test_all_named_transform_artifacts_satisfy_runtime_contract(game):
+    source = output_frame().assign(
+        review_pending_technically_eligible=1,
+        shipper_up=10,
+        shipper_companyid=11,
+        shipper_panjiva_id=12,
+    )
+    artifacts = build_game_artifacts(
+        apply_manual_reviews(source, game=game, reviews=None), game=game
+    )
+    artifacts["review_queue"] = build_manual_review_queue(
+        build_review_items(source, game=game), None
+    )
+    for name, frame in artifacts.items():
+        validate_transform_artifact(name, game, frame)

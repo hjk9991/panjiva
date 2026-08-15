@@ -11,6 +11,9 @@ from scripts.tire_ab_entry.sql import (
     DescriptionIdentity,
     build_finished_sql,
     build_raw_sql,
+    build_validation_sql,
+    reference_review_pending_technical_eligibility,
+    reference_validation_identity,
 )
 
 
@@ -141,6 +144,81 @@ def test_raw_sql_rejects_frob_uses_half_open_dates_and_allocates_every_additive_
     assert "sum(container_count * allocation_factor) as container_count" in sql
     assert "sum(allocation_factor) as shipment_equivalent" in sql
     assert "count(distinct panjivarecordid) as shipment_count" in sql
+
+
+@pytest.mark.parametrize("game", ["raw", "finished"])
+def test_validation_sql_counts_record_level_unique_shipments_and_output_rows(game):
+    sql = normalized(
+        build_validation_sql(game, PARENT_IDS, "2024-01-01", "2024-04-01")
+    )
+    assert "count(distinct panjivarecordid) as unique_shipment_count" in sql
+    assert "sum(allocation_factor) as shipment_equivalent" in sql
+    assert "as output_row_count" in sql
+    assert "from finalized" in sql
+    assert "count(*) as unique_shipment_count" not in sql
+
+
+def test_multi_hs_one_record_allocation_reconciles_to_one_unique_shipment():
+    metrics = reference_validation_identity(
+        [("SYN-1", 0.5), ("SYN-1", 0.5)]
+    )
+    assert metrics == {
+        "unique_shipment_count": 1,
+        "shipment_equivalent": 1.0,
+        "allocation_identity_reconciled": 1,
+    }
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"hs_eligible": 0},
+        {"manufacturer_conflict": 1},
+        {"description_ambiguous": 1},
+        {"importer_xref_ambiguous": 1},
+        {"shipper_xref_ambiguous": 1},
+        {"importer_pit_ambiguous": 1},
+        {"shipper_pit_ambiguous": 1},
+        {"importer_historical_backcast": 1},
+        {"shipper_historical_backcast": 1},
+        {"import_route": "unattributed"},
+    ],
+)
+def test_pending_review_technical_predicate_never_releases_hard_failures(override):
+    flags = {
+        "hs_eligible": 1,
+        "manufacturer_conflict": 0,
+        "description_ambiguous": 0,
+        "importer_xref_ambiguous": 0,
+        "shipper_xref_ambiguous": 0,
+        "importer_pit_ambiguous": 0,
+        "shipper_pit_ambiguous": 0,
+        "importer_historical_backcast": 0,
+        "shipper_historical_backcast": 0,
+        "import_route": "distributor_intermediated",
+    }
+    flags.update(override)
+    assert reference_review_pending_technical_eligibility(**flags) == 0
+
+
+def test_description_candidate_can_remain_technically_eligible_pending_review():
+    assert reference_review_pending_technical_eligibility(
+        hs_eligible=1,
+        manufacturer_conflict=0,
+        description_ambiguous=0,
+        importer_xref_ambiguous=0,
+        shipper_xref_ambiguous=0,
+        importer_pit_ambiguous=0,
+        shipper_pit_ambiguous=0,
+        importer_historical_backcast=0,
+        shipper_historical_backcast=0,
+        import_route="distributor_intermediated",
+    ) == 1
+    sql = normalized(build_finished_sql(PARENT_IDS, "2024-01-01", "2024-04-01"))
+    finalized = sql.split("finalized as (", 1)[1].split(") select", 1)[0]
+    predicate = finalized.split("as review_pending_technically_eligible", 1)[0]
+    assert "description_candidate = 0" not in predicate.rsplit("iff(", 1)[1]
+    assert "importer_historical_backcast = 0" in predicate
 
 
 def test_hs_parsing_scope_and_review_flags_are_explicit():

@@ -9,6 +9,7 @@ from scripts.tire_ab_entry.transforms import (
     build_dynamic_link_moments,
     build_game_artifacts,
     build_quarterly_panels,
+    build_review_items,
     load_verified_game_chunks,
 )
 import scripts.tire_ab_entry.extract as extract_module
@@ -99,6 +100,19 @@ def _source_rows(game="raw"):
     common = {
         "manufacturer_parent_id": [1, 1, 1],
         "shipper_up": [10, 10, pd.NA],
+        "shipper_companyid": [110, 110, 120],
+        "shipper_panjiva_id": [1110, 1110, 1120],
+        "description_candidate_parent_id": [pd.NA, pd.NA, 30],
+        "description_candidate": [0, 0, 1],
+        "hs_eligible": [1, 1, 1],
+        "manufacturer_conflict": [0, 0, 0],
+        "description_ambiguous": [0, 0, 0],
+        "importer_xref_ambiguous": [0, 0, 0],
+        "shipper_xref_ambiguous": [0, 0, 0],
+        "importer_pit_ambiguous": [0, 0, 0],
+        "shipper_pit_ambiguous": [0, 0, 0],
+        "importer_historical_backcast": [0, 0, 0],
+        "shipper_historical_backcast": [0, 0, 0],
         "origin_country": ["KOR", "KOR", "JPN"],
         "year_quarter": ["2024Q1"] * 3,
         "input_group": ["rubber", "rubber", "rubber"],
@@ -120,6 +134,7 @@ def _source_rows(game="raw"):
         "hs_review_value_usd": [0.0, 10.0, 0.0],
         "estimation_eligible": [1, 1, 1],
         "sensitivity_eligible": [1, 1, 0],
+        "review_pending_technically_eligible": [1, 1, 0],
     }
     return pd.DataFrame(common)
 
@@ -155,22 +170,102 @@ def test_split_hs_rows_sum_to_one_equivalent_but_not_one_distinct_count():
 
 def test_manual_decisions_define_main_and_confirmed_sensitivity_value():
     source = _source_rows().assign(hs_full_code=["SYN-A", "SYN-B", "SYN-C"])
-    reviews = pd.DataFrame(
-        {
-            "game": ["raw"] * 3,
-            "review_group": ["rubber"] * 3,
-            "review_item_id": ["SYN-A", "SYN-B", "SYN-C"],
-            "review_status": ["confirmed", "probable", "unclear"],
-            "source_note": ["human A", "human B", "human C"],
-        }
+    items = build_review_items(source, game="raw")
+    reviews = items.drop(columns="value_usd").copy()
+    reviews["review_status"] = reviews["origin_country"].map(
+        {"KOR": "confirmed", "JPN": "unclear"}
     )
+    reviews["source_note"] = "human evidence"
     reviewed = apply_manual_reviews(source, game="raw", reviews=reviews)
     assert list(reviewed["manual_main_eligible"]) == [1, 1, 0]
-    assert list(reviewed["manual_confirmed_eligible"]) == [1, 0, 0]
+    assert list(reviewed["manual_confirmed_eligible"]) == [1, 1, 0]
     panel = build_quarterly_panels(reviewed, game="raw")["origin"]
     assert panel["manual_main_eligible_value_usd"].sum() == 100.0
-    assert panel["manual_confirmed_value_usd"].sum() == 60.0
+    assert panel["manual_confirmed_value_usd"].sum() == 100.0
     assert panel["manual_main_eligible_shipment_equivalent"].sum() == 1.0
+
+
+def test_probable_releases_main_only_and_pending_technical_failure_stays_excluded():
+    source = _source_rows().iloc[[0, 2]].copy()
+    source["hs_full_code"] = ["SYN-A", "SYN-C"]
+    items = build_review_items(source, game="raw")
+    reviews = items.drop(columns="value_usd").copy()
+    reviews["review_status"] = reviews["origin_country"].map(
+        {"KOR": "probable", "JPN": "confirmed"}
+    )
+    reviews["source_note"] = "human evidence"
+    reviewed = apply_manual_reviews(source, game="raw", reviews=reviews)
+    assert list(reviewed["manual_main_eligible"]) == [1, 0]
+    assert list(reviewed["manual_confirmed_eligible"]) == [0, 0]
+
+
+def test_confirmed_finished_description_candidate_gets_effective_manufacturer():
+    source = _source_rows().iloc[[2]].copy()
+    source["manufacturer_parent_id"] = pd.NA
+    source["review_pending_technically_eligible"] = 1
+    items = build_review_items(source, game="finished")
+    assert items["manufacturer_parent_id"].iat[0] == 30
+    assert items["link_identity_type"].iat[0] == "description_candidate_parent"
+    reviews = items.drop(columns="value_usd").assign(
+        review_status="confirmed", source_note="human plant evidence"
+    ).astype("string")
+    reviewed = apply_manual_reviews(source, game="finished", reviews=reviews)
+    assert reviewed["manufacturer_parent_id"].iat[0] == 30
+    assert reviewed["manual_main_eligible"].iat[0] == 1
+    assert reviewed["manual_confirmed_eligible"].iat[0] == 1
+    assert reviewed["import_route"].iat[0] == "distributor_intermediated"
+
+
+@pytest.mark.parametrize(
+    ("column", "bad_value"),
+    [
+        ("hs_eligible", 0),
+        ("manufacturer_conflict", 1),
+        ("description_ambiguous", 1),
+        ("importer_xref_ambiguous", 1),
+        ("shipper_xref_ambiguous", 1),
+        ("importer_pit_ambiguous", 1),
+        ("shipper_pit_ambiguous", 1),
+        ("importer_historical_backcast", 1),
+        ("shipper_historical_backcast", 1),
+        ("import_route", "conflict"),
+    ],
+)
+def test_manual_confirmation_cannot_override_any_hard_failure(column, bad_value):
+    source = _source_rows().iloc[[0]].copy()
+    source[column] = bad_value
+    source["review_pending_technically_eligible"] = 1
+    items = build_review_items(source, game="raw")
+    reviews = items.drop(columns="value_usd").assign(
+        review_status="confirmed", source_note="human evidence"
+    )
+    reviewed = apply_manual_reviews(source, game="raw", reviews=reviews)
+    assert reviewed["manual_main_eligible"].iat[0] == 0
+    assert reviewed["manual_confirmed_eligible"].iat[0] == 0
+
+
+def test_review_item_identity_is_manufacturer_supplier_and_context_scoped():
+    source = pd.concat(
+        [
+            _source_rows().iloc[[0]],
+            _source_rows().iloc[[0]].assign(manufacturer_parent_id=2),
+            _source_rows().iloc[[0]].assign(origin_country="JPN"),
+        ],
+        ignore_index=True,
+    ).assign(hs_full_code=["SYN-A", "SYN-A", "SYN-A"])
+    items = build_review_items(source, game="raw")
+    assert len(items) == 3
+    assert items["review_item_id"].nunique() == 3
+    assert set(
+        [
+            "manufacturer_parent_id",
+            "origin_country",
+            "link_identity_type",
+            "link_identity_value",
+            "input_group",
+        ]
+    ).issubset(items.columns)
+    assert items.groupby(["manufacturer_parent_id", "review_group"]).ngroups == 2
 
 
 def test_quarterly_panel_contract_rejects_unexpected_columns_and_duplicate_rows():

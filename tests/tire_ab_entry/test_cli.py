@@ -199,7 +199,7 @@ def test_validate_quarter_uses_isolated_orchestrator(monkeypatch, capsys):
         cli_module,
         "capture_g0_validation",
         lambda value, quarter, **kwargs: calls.append(("g0", quarter, kwargs))
-        or {"metrics_path": r"C:\panjiva\_validation\test\g0.parquet"},
+        or {"metrics_path": r"C:\panjiva\_validation\test\g0.parquet", "reconciled": True},
     )
     assert cli_module.main(["validate-quarter", "--quarter", "2024Q1"]) == 0
     assert calls[0][1] == "2024Q1"
@@ -209,6 +209,38 @@ def test_validate_quarter_uses_isolated_orchestrator(monkeypatch, capsys):
     output = json.loads(capsys.readouterr().out)
     assert output["run_id"] == "test"
     assert output["g0_validation"]["metrics_path"].endswith("g0.parquet")
+
+
+def test_validate_quarter_returns_nonzero_when_g0_does_not_reconcile(monkeypatch, capsys):
+    calls = []
+    connection = Connection(calls)
+    monkeypatch.setattr(
+        cli_module,
+        "load_parent_seed",
+        lambda: ParentSeedSnapshot(
+            {"MICHELIN": 1, "GOODYEAR": 2, "HANKOOK": 3}, "seedhash"
+        ),
+    )
+    monkeypatch.setattr(cli_module, "load_description_identity", lambda: None)
+    monkeypatch.setattr(cli_module, "connect", lambda: connection)
+    monkeypatch.setattr(
+        cli_module,
+        "validate_quarter",
+        lambda *args, **kwargs: {
+            "run_id": "mismatch",
+            "validation_root": r"C:\panjiva\_validation\mismatch",
+            "games": [],
+        },
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "capture_g0_validation",
+        lambda *args, **kwargs: {"reconciled": False, "metrics_path": "isolated"},
+    )
+    assert cli_module.main(["validate-quarter", "--quarter", "2024Q1"]) == 1
+    assert calls == ["close"]
+    output = json.loads(capsys.readouterr().out)
+    assert output["error_category"] == "g0_reconciliation_failed"
 
 
 def test_validate_quarter_rejects_syntax_before_seed_or_connection(monkeypatch, capsys):

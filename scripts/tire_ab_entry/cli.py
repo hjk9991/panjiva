@@ -113,6 +113,7 @@ def main(argv: list[str] | None = None) -> int:
 
     result = None
     primary_failed = False
+    g0_failed = False
     try:
         if args.command == "probe-schema":
             result = probe_schema(connection)
@@ -134,6 +135,7 @@ def main(argv: list[str] | None = None) -> int:
                 description_identity=description_identity,
                 validation_root=result.get("validation_root"),
             )
+            g0_failed = not bool(result["g0_validation"].get("reconciled"))
         else:
             result = extract_full(
                 connection,
@@ -151,15 +153,19 @@ def main(argv: list[str] | None = None) -> int:
     except Exception:
         close_failed = True
 
-    if primary_failed or close_failed:
+    if primary_failed or g0_failed or close_failed:
         payload = {
             "status": "error",
             "command": args.command,
             "error_category": (
-                "operation_failed" if primary_failed else "connection_close_failed"
+                "operation_failed"
+                if primary_failed
+                else "g0_reconciliation_failed"
+                if g0_failed
+                else "connection_close_failed"
             ),
         }
-        if primary_failed and close_failed:
+        if (primary_failed or g0_failed) and close_failed:
             payload["connection_close_failed"] = True
         _print_json(payload)
         return 1

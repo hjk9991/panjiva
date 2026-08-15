@@ -37,9 +37,9 @@ except ImportError:  # pragma: no cover - licensed writes are Windows-only
     msvcrt = None
 
 
-CONTRACT_VERSION = "tire-extraction-contract-v1"
+CONTRACT_VERSION = "tire-extraction-contract-v2"
 MANIFEST_VERSION = "tire-extraction-manifest-v1"
-CODE_VERSION = "tire-extraction-code-v1"
+CODE_VERSION = "tire-extraction-code-v2"
 PARENT_SEED_PATH = OUTPUT_ROOT / "review" / "manufacturer_parent_seed.csv"
 PARENT_CANDIDATE_POINTER_PATH = (
     OUTPUT_ROOT / "review" / "manufacturer_parent_candidates.current.json"
@@ -114,6 +114,7 @@ OUTPUT_KEY_COLUMNS = (
     "relationship",
     "import_route",
     "supplier_relationship",
+    "review_pending_technically_eligible",
     "sensitivity_eligible",
     "estimation_eligible",
 )

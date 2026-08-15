@@ -9,6 +9,8 @@ labelled nonadditive and are never represented as exact panel counts.
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
+import hashlib
+import json
 import math
 from pathlib import Path
 
@@ -46,6 +48,18 @@ SOURCE_REQUIRED = {
     "shipment_count_nonadditive",
     "estimation_eligible",
     "sensitivity_eligible",
+    "review_pending_technically_eligible",
+    "hs_eligible",
+    "manufacturer_conflict",
+    "description_candidate",
+    "description_candidate_parent_id",
+    "description_ambiguous",
+    "importer_xref_ambiguous",
+    "shipper_xref_ambiguous",
+    "importer_pit_ambiguous",
+    "shipper_pit_ambiguous",
+    "importer_historical_backcast",
+    "shipper_historical_backcast",
     *ADDITIVE_COLUMNS,
 }
 DIAGNOSTIC_VALUE_COLUMNS = tuple(
@@ -58,6 +72,38 @@ MANUAL_SOURCE_COLUMNS = {
     "manual_confirmed_eligible",
 }
 ALLOWED_SOURCE_COLUMNS = set(REQUIRED_OUTPUT_COLUMNS) | MANUAL_SOURCE_COLUMNS
+REVIEW_IDENTITY_COLUMNS = (
+    "game",
+    "manufacturer_parent_id",
+    "review_group",
+    "origin_country",
+    "input_group",
+    "finished_market",
+    "link_identity_type",
+    "link_identity_value",
+    "review_item_id",
+)
+
+
+def normalize_review_identity(frame: pd.DataFrame) -> pd.DataFrame:
+    """Canonicalize CSV/Parquet review keys before any exact-key merge."""
+
+    result = frame.copy()
+    missing = set(REVIEW_IDENTITY_COLUMNS).difference(result.columns)
+    if missing:
+        raise ValueError(f"review identity is missing columns: {sorted(missing)}")
+    manufacturer = pd.to_numeric(result["manufacturer_parent_id"], errors="coerce")
+    if (
+        manufacturer.isna().any()
+        or manufacturer.le(0).any()
+        or not manufacturer.map(lambda value: float(value).is_integer()).all()
+    ):
+        raise ValueError("review manufacturer identity must be a positive integer")
+    result["manufacturer_parent_id"] = manufacturer.astype("Int64")
+    for column in REVIEW_IDENTITY_COLUMNS:
+        if column != "manufacturer_parent_id":
+            result[column] = result[column].astype("string")
+    return result
 
 
 def _validate_source(frame: pd.DataFrame) -> pd.DataFrame:
@@ -87,6 +133,8 @@ def _validate_source(frame: pd.DataFrame) -> pd.DataFrame:
         "shipper_up",
         "estimation_eligible",
         "sensitivity_eligible",
+        "review_pending_technically_eligible",
+        "description_candidate_parent_id",
     }
     numeric.update(column for column in result if column.endswith("_value_usd"))
     for column in numeric.intersection(result.columns):
@@ -95,8 +143,14 @@ def _validate_source(frame: pd.DataFrame) -> pd.DataFrame:
         if not finite.all() or (values.dropna() < 0).any():
             raise ValueError(f"source numeric column is invalid: {column}")
         result[column] = values
-    if result["manufacturer_parent_id"].isna().any():
-        raise ValueError("manufacturer_parent_id cannot be missing")
+    effective = result["manufacturer_parent_id"].fillna(
+        pd.to_numeric(result["description_candidate_parent_id"], errors="coerce")
+    )
+    if effective.isna().any() or effective.le(0).any():
+        raise ValueError(
+            "source requires manufacturer_parent_id or description candidate parent"
+        )
+    result["manufacturer_parent_id"] = effective.astype("Int64")
     return result
 
 
@@ -403,7 +457,7 @@ def build_dynamic_link_moments(
     persistence_events = (active_risk & balanced["active"].eq(1)).sum()
     entry_n = int(entry_risk.sum())
     active_n = int(active_risk.sum())
-    return pd.DataFrame(
+    result = pd.DataFrame(
         {
             "window_start": [int(start_year)],
             "window_end": [int(end_year)],
@@ -417,6 +471,9 @@ def build_dynamic_link_moments(
             "targeted": [0],
         }
     )
+    for column in ("entry_rate", "exit_rate", "persistence_rate"):
+        result[column] = pd.to_numeric(result[column], errors="coerce").astype("Float64")
+    return result
 
 
 def load_verified_game_chunks(
@@ -541,29 +598,83 @@ def build_review_items(frame: pd.DataFrame, *, game: str) -> pd.DataFrame:
 
     source = _validate_source(frame)
     source = _with_review_keys(source, game)
-    source["game"] = game
     return (
-        source.groupby(["game", "review_group", "review_item_id"], as_index=False, sort=True)["value_usd"]
+        source.groupby(
+            list(REVIEW_IDENTITY_COLUMNS),
+            as_index=False,
+            sort=True,
+            dropna=False,
+        )["value_usd"]
         .sum()
-        .loc[:, ["game", "review_group", "review_item_id", "value_usd"]]
+        .loc[:, [*REVIEW_IDENTITY_COLUMNS, "value_usd"]]
     )
 
 
 def _with_review_keys(frame: pd.DataFrame, game: str) -> pd.DataFrame:
     source = frame.copy()
+    effective_manufacturer = pd.to_numeric(
+        source["manufacturer_parent_id"], errors="coerce"
+    )
+    candidate_manufacturer = pd.to_numeric(
+        source["description_candidate_parent_id"], errors="coerce"
+    )
+    source["manufacturer_parent_id"] = effective_manufacturer.fillna(
+        candidate_manufacturer
+    ).astype("Int64")
+    if source["manufacturer_parent_id"].isna().any():
+        raise ValueError("review item lacks a manufacturer or description candidate")
+    shipper_parent = pd.to_numeric(source["shipper_up"], errors="coerce")
+    shipper_company = pd.to_numeric(source["shipper_companyid"], errors="coerce")
+    shipper_panjiva = pd.to_numeric(source["shipper_panjiva_id"], errors="coerce")
+    description_candidate = pd.to_numeric(
+        source["description_candidate_parent_id"], errors="coerce"
+    )
+    identity_type = pd.Series("unresolved", index=source.index, dtype="string")
+    identity_value = pd.Series(pd.NA, index=source.index, dtype="string")
+    if game == "finished":
+        mask = description_candidate.notna() & source["description_candidate"].eq(1)
+        identity_type.loc[mask] = "description_candidate_parent"
+        identity_value.loc[mask] = description_candidate.loc[mask].astype("int64").astype("string")
+    for values, label in (
+        (shipper_parent, "shipper_ultimate_parent"),
+        (shipper_company, "shipper_company"),
+        (shipper_panjiva, "shipper_panjiva"),
+    ):
+        mask = identity_value.isna() & values.notna() & values.gt(0)
+        identity_type.loc[mask] = label
+        identity_value.loc[mask] = values.loc[mask].astype("int64").astype("string")
+    if identity_value.isna().any():
+        raise ValueError("review item lacks a stable supplier/plant identity")
+    source["link_identity_type"] = identity_type
+    source["link_identity_value"] = identity_value
     if game == "raw":
         source["review_group"] = source["input_group"].astype("string")
-        source["review_item_id"] = source["hs_full_code"].astype("string")
     elif game == "finished":
         source["review_group"] = source["finished_market"].astype("string")
-        identity = source[
-            ["hs_full_code", "import_route", "shipper_up", "description_candidate_parent_id"]
-        ].astype("string").fillna("[MISSING]")
-        source["review_item_id"] = identity.agg("|".join, axis=1)
     else:
         raise ValueError("game must be raw or finished")
     source["game"] = game
-    return source
+    identity_columns = [
+        "game",
+        "manufacturer_parent_id",
+        "review_group",
+        "origin_country",
+        "input_group",
+        "finished_market",
+        "link_identity_type",
+        "link_identity_value",
+    ]
+    source["review_item_id"] = source[identity_columns].apply(
+        lambda row: hashlib.sha256(
+            json.dumps(
+                [None if pd.isna(value) else str(value) for value in row],
+                ensure_ascii=True,
+                separators=(",", ":"),
+            ).encode("ascii")
+        ).hexdigest(),
+        axis=1,
+    ).astype("string")
+    return normalize_review_identity(source)
 
 
 def apply_manual_reviews(
@@ -575,20 +686,14 @@ def apply_manual_reviews(
     """Apply explicit human decisions; never infer or auto-approve a status."""
 
     source = _with_review_keys(_validate_source(frame), game)
-    review_columns = [
-        "game",
-        "review_group",
-        "review_item_id",
-        "review_status",
-        "source_note",
-    ]
+    review_columns = [*REVIEW_IDENTITY_COLUMNS, "review_status", "source_note"]
     if reviews is None:
         source["manual_review_status"] = pd.NA
         source["manual_review_source_note"] = pd.NA
     else:
         if set(reviews.columns) != set(review_columns):
             raise ValueError("manual reviews have an invalid exact contract")
-        if reviews.duplicated(review_columns[:3]).any():
+        if reviews.duplicated(list(REVIEW_IDENTITY_COLUMNS)).any():
             raise ValueError("manual reviews have duplicate keys")
         status = reviews["review_status"].astype("string")
         notes = reviews["source_note"].astype("string")
@@ -599,7 +704,7 @@ def apply_manual_reviews(
             or notes.str.strip().eq("").any()
         ):
             raise ValueError("manual reviews require approved status and source_note")
-        decisions = reviews.rename(
+        decisions = normalize_review_identity(reviews).rename(
             columns={
                 "review_status": "manual_review_status",
                 "source_note": "manual_review_source_note",
@@ -607,21 +712,56 @@ def apply_manual_reviews(
         )
         source = source.merge(
             decisions,
-            on=review_columns[:3],
+            on=list(REVIEW_IDENTITY_COLUMNS),
             how="left",
             validate="many_to_one",
             sort=False,
         )
     status = source["manual_review_status"].astype("string")
+    route_allowed = source["import_route"].isin(
+        {"manufacturer_direct", "distributor_intermediated"}
+    )
+    if game == "finished":
+        route_allowed |= (
+            source["description_candidate"].eq(1)
+            & pd.to_numeric(
+                source["description_candidate_parent_id"], errors="coerce"
+            ).notna()
+        )
+    technical = (
+        source["review_pending_technically_eligible"].eq(1)
+        & source["hs_eligible"].eq(1)
+        & source["manufacturer_conflict"].eq(0)
+        & source["description_ambiguous"].eq(0)
+        & source["importer_xref_ambiguous"].eq(0)
+        & source["shipper_xref_ambiguous"].eq(0)
+        & source["importer_pit_ambiguous"].eq(0)
+        & source["shipper_pit_ambiguous"].eq(0)
+        & source["importer_historical_backcast"].eq(0)
+        & source["shipper_historical_backcast"].eq(0)
+        & route_allowed
+    )
     source["manual_main_eligible"] = (
-        status.isin({"confirmed", "probable"}).fillna(False)
-        & source["estimation_eligible"].eq(1)
+        status.isin({"confirmed", "probable"}).fillna(False) & technical
     ).astype("int8")
     source["manual_confirmed_eligible"] = (
-        status.eq("confirmed").fillna(False)
-        & source["sensitivity_eligible"].eq(1)
+        status.eq("confirmed").fillna(False) & technical
     ).astype("int8")
-    return source.drop(columns=["game", "review_group", "review_item_id"])
+    released_description = (
+        source["manual_main_eligible"].eq(1)
+        & source["description_candidate"].eq(1)
+        & source["import_route"].eq("unattributed")
+    )
+    source.loc[released_description, "import_route"] = "distributor_intermediated"
+    return source.drop(
+        columns=[
+            "game",
+            "review_group",
+            "link_identity_type",
+            "link_identity_value",
+            "review_item_id",
+        ]
+    )
 
 
 def build_game_outputs(
@@ -640,7 +780,7 @@ def build_game_outputs(
     )
     source_manifest_sha256 = chunks.attrs["source_manifest_sha256"]
     source_chunk_sha256 = list(chunks.attrs["source_chunk_sha256"])
-    from .qa import build_manual_review_queue
+    from .qa import build_manual_review_queue, validate_transform_artifact
 
     review_items = build_review_items(chunks, game=game)
     review_path = root / "review" / "manual_link_reviews.csv"
@@ -657,16 +797,22 @@ def build_game_outputs(
     }
     hashes = {}
     for name, frame in {**outputs, "review_queue": review_queue}.items():
+        validate_transform_artifact(name, game, frame)
         hashes[name] = artifact_io.atomic_write_parquet(frame, targets[name])
     manifest = {
-        "manifest_version": "tire-transform-manifest-v1",
+        "manifest_version": "tire-transform-manifest-v2",
         "game": game,
         "parent_seed_sha256": parent_seed_sha256,
         "source_manifest_sha256": source_manifest_sha256,
         "source_chunk_sha256": source_chunk_sha256,
         "outputs": {
-            name: {"path": str(targets[name]), "sha256": hashes[name]}
-            for name in targets
+            name: {
+                "path": str(targets[name]),
+                "sha256": hashes[name],
+                "columns": list(frame.columns),
+                "dtypes": [str(dtype) for dtype in frame.dtypes],
+            }
+            for name, frame in {**outputs, "review_queue": review_queue}.items()
         },
         "shipment_measurement_status": (
             "shipment_equivalent_pilot_proxy;exact_panel_distinct_unavailable"

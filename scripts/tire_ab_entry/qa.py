@@ -13,17 +13,25 @@ import pandas as pd
 from .config import MANUFACTURER_KEYS, OUTPUT_ROOT, validate_output_path
 from . import artifacts as artifact_io
 from . import extract as extraction
-from .transforms import load_verified_game_chunks
+from .sql import build_validation_sql
+from .transforms import (
+    ADDITIVE_COLUMNS,
+    DIAGNOSTIC_VALUE_COLUMNS,
+    REVIEW_IDENTITY_COLUMNS,
+    load_verified_game_chunks,
+    normalize_review_identity,
+)
 
 
-REVIEW_KEYS = ("game", "review_group", "review_item_id")
+REVIEW_KEYS = REVIEW_IDENTITY_COLUMNS
 REVIEW_STATUSES = {"confirmed", "probable", "unclear"}
 ADDITIVE = ("value_usd", "weight_kg", "teu", "container_count", "shipment_equivalent")
 REQUIRED_GATES = {"G0", "G1", "G2", "G3", "G4", "G5", "G7", "G8", "G9"}
 G0_COLUMNS = (
     "game",
     "quarter",
-    "direct_row_count",
+    "direct_output_row_count",
+    "direct_unique_shipment_count",
     "direct_value_usd",
     "direct_shipment_equivalent",
     "isolated_row_count",
@@ -31,6 +39,132 @@ G0_COLUMNS = (
     "isolated_shipment_equivalent",
     "reconciled",
 )
+
+_PANEL_DERIVED_SUMS = (
+    "shipment_count_source_group_sum_nonadditive",
+    "current_parent_fallback_value_usd",
+    "pit_overlap_value_usd",
+    "description_review_value_usd",
+    "main_eligible_value_usd",
+    "confirmed_sensitivity_value_usd",
+    "manual_main_eligible_value_usd",
+    "manual_confirmed_value_usd",
+    "manual_main_eligible_shipment_equivalent",
+    "manual_confirmed_shipment_equivalent",
+    "manufacturer_direct_value_usd",
+    "distributor_intermediated_value_usd",
+    "unattributed_value_usd",
+)
+_PANEL_DIAGNOSTICS = tuple(
+    column
+    for column in DIAGNOSTIC_VALUE_COLUMNS
+    if column not in ADDITIVE_COLUMNS and column not in _PANEL_DERIVED_SUMS
+)
+_PANEL_TRAILING = (
+    "shipment_measurement_status",
+    "current_parent_fallback_value_share",
+    "pit_overlap_value_share",
+    "description_review_value_share",
+    "main_eligible_value_share",
+    "confirmed_sensitivity_value_share",
+    "manual_main_eligible_value_share",
+    "manual_confirmed_value_share",
+    "manufacturer_direct_value_share",
+    "distributor_intermediated_value_share",
+    "unattributed_value_share",
+)
+
+
+def _artifact_columns(name: str, game: str) -> tuple[str, ...]:
+    if game not in {"raw", "finished"}:
+        raise ValueError("artifact game must be raw or finished")
+    market = "input_group" if game == "raw" else "finished_market"
+    route = () if game == "raw" else ("import_route",)
+    measures = (*ADDITIVE_COLUMNS, *_PANEL_DERIVED_SUMS, *_PANEL_DIAGNOSTICS, *_PANEL_TRAILING)
+    if name == "origin_quarterly":
+        return (
+            "game", "link_level", "link_id", "manufacturer_parent_id",
+            "origin_country", *route, market, "year_quarter", *measures,
+        )
+    if name == "supplier_quarterly":
+        return (
+            "game", "link_level", "link_id", "manufacturer_parent_id",
+            "supplier_parent_id", "supplier_parent_matched", "origin_country",
+            *route, market, "year_quarter", *measures,
+        )
+    if name == "annual":
+        return (
+            "game", "manufacturer_parent_id", "link_id", "year", "value_usd",
+            "shipment_equivalent_sum",
+            "shipment_count_source_group_sum_nonadditive", "observed", "active",
+            "entry_raw", "entry_value", "entry_core", "entry_core_censored",
+            "entry_core_count_basis", "entry_core_measurement_status",
+        )
+    if name == "dynamic_moments":
+        return (
+            "game", "window_start", "window_end", "entry_risk_n",
+            "active_risk_n", "entry_rate", "exit_rate", "persistence_rate",
+            "targeted", "measurement_status",
+        )
+    if name == "review_queue":
+        return (
+            *REVIEW_IDENTITY_COLUMNS, "value_usd", "cumulative_value_share",
+            "required_top90", "review_status", "source_note", "review_complete",
+            "main_eligible", "confirmed_eligible",
+        )
+    raise ValueError("unknown transform artifact")
+
+
+def _artifact_keys(name: str, game: str) -> tuple[str, ...]:
+    columns = _artifact_columns(name, game)
+    if name == "origin_quarterly":
+        return tuple(columns[: columns.index("value_usd")])
+    if name == "supplier_quarterly":
+        return tuple(columns[: columns.index("value_usd")])
+    if name == "annual":
+        return ("game", "manufacturer_parent_id", "link_id", "year")
+    if name == "dynamic_moments":
+        return ("game", "window_start", "window_end")
+    return REVIEW_IDENTITY_COLUMNS
+
+
+def validate_transform_artifact(name: str, game: str, frame: pd.DataFrame) -> None:
+    """Fail closed on exact names, semantic types, keys, and fixed content."""
+
+    expected = _artifact_columns(name, game)
+    if tuple(frame.columns) != expected or frame.columns.duplicated().any():
+        raise ValueError(f"transform artifact {name} has an invalid exact schema")
+    if frame.duplicated(list(_artifact_keys(name, game))).any():
+        raise ValueError(f"transform artifact {name} has duplicate keys")
+    text = {
+        "game", "link_level", "link_id", "origin_country", "year_quarter", "input_group",
+        "finished_market", "import_route", "shipment_measurement_status",
+        "entry_core_count_basis", "entry_core_measurement_status",
+        "measurement_status", "review_group", "link_identity_type",
+        "link_identity_value", "review_item_id", "review_status", "source_note",
+    }
+    for column in expected:
+        if column in text:
+            series = frame[column]
+            object_strings = (
+                pd.api.types.is_object_dtype(series.dtype)
+                and series.dropna().map(lambda value: isinstance(value, str)).all()
+            )
+            valid_text = (
+                object_strings
+                if pd.api.types.is_object_dtype(series.dtype)
+                else pd.api.types.is_string_dtype(series.dtype)
+            )
+            if not valid_text:
+                raise ValueError(f"transform artifact {name} text type is invalid")
+        elif not pd.api.types.is_numeric_dtype(frame[column].dtype):
+            raise ValueError(f"transform artifact {name} numeric type is invalid")
+    if not frame.empty and not frame["game"].astype("string").eq(game).all():
+        raise ValueError(f"transform artifact {name} game content is invalid")
+    if name.endswith("quarterly"):
+        expected_level = "origin" if name.startswith("origin") else "supplier"
+        if not frame["link_level"].astype("string").eq(expected_level).all():
+            raise ValueError(f"transform artifact {name} link level is invalid")
 
 
 def build_manual_review_queue(
@@ -44,6 +178,7 @@ def build_manual_review_queue(
         missing = sorted(required_items.difference(items.columns))
         extra = sorted(set(items.columns).difference(required_items))
         raise ValueError(f"review items contract mismatch (missing={missing}, extra={extra})")
+    items = normalize_review_identity(items)
     if items.duplicated(list(REVIEW_KEYS)).any():
         raise ValueError("review items have duplicate keys")
     queue = items.copy()
@@ -53,11 +188,15 @@ def build_manual_review_queue(
     if not queue["value_usd"].map(lambda value: math.isfinite(float(value))).all():
         raise ValueError("review item value_usd must be finite and nonnegative")
     queue = queue.sort_values(
-        ["game", "review_group", "value_usd", "review_item_id"],
-        ascending=[True, True, False, True],
+        [
+            "game", "manufacturer_parent_id", "review_group", "value_usd",
+            "review_item_id",
+        ],
+        ascending=[True, True, True, False, True],
         kind="stable",
     ).reset_index(drop=True)
-    group = queue.groupby(["game", "review_group"], sort=False)["value_usd"]
+    review_groups = ["game", "manufacturer_parent_id", "review_group"]
+    group = queue.groupby(review_groups, sort=False)["value_usd"]
     total = group.transform("sum")
     prior = group.cumsum() - queue["value_usd"]
     queue["cumulative_value_share"] = group.cumsum().div(total.where(total.gt(0)))
@@ -74,6 +213,7 @@ def build_manual_review_queue(
             raise ValueError(
                 f"reviews exact contract mismatch (missing={missing}, extra={extra})"
             )
+        reviews = normalize_review_identity(reviews)
         if reviews.duplicated(list(REVIEW_KEYS)).any():
             raise ValueError("reviews have duplicate keys")
         status = reviews["review_status"].astype("string")
@@ -131,7 +271,13 @@ def _g0(chunks: Mapping[str, pd.DataFrame], validation: pd.DataFrame) -> dict:
         row = rows.iloc[0]
         checks.append(
             int(row["reconciled"]) == 1
-            and int(row["direct_row_count"]) == int(row["isolated_row_count"])
+            and int(row["direct_output_row_count"]) == int(row["isolated_row_count"])
+            and math.isclose(
+                float(row["direct_unique_shipment_count"]),
+                float(row["direct_shipment_equivalent"]),
+                rel_tol=1e-10,
+                abs_tol=1e-8,
+            )
             and math.isclose(float(row["direct_value_usd"]), float(row["isolated_value_usd"]), rel_tol=1e-10, abs_tol=1e-6)
             and math.isclose(float(row["direct_shipment_equivalent"]), float(row["isolated_shipment_equivalent"]), rel_tol=1e-10, abs_tol=1e-8)
         )
@@ -189,14 +335,18 @@ def _g3(chunks: Mapping[str, pd.DataFrame], seed: pd.DataFrame) -> dict:
         valid &= seed["review_status"].eq("reviewed").all()
         overlap = 0.0
         for frame in chunks.values():
-            for column in (
-                "importer_pit_same_parent_overlap_value_usd",
-                "shipper_pit_same_parent_overlap_value_usd",
-            ):
-                if column not in frame:
-                    valid = False
-                else:
-                    overlap += float(frame[column].sum())
+            for side in ("importer", "shipper"):
+                columns = (
+                    f"{side}_pit_same_parent_overlap",
+                    f"{side}_pit_same_parent_overlap_shipment_count_nonadditive",
+                    f"{side}_pit_same_parent_overlap_shipment_equivalent",
+                    f"{side}_pit_same_parent_overlap_value_usd",
+                )
+                for column in columns:
+                    if column not in frame:
+                        valid = False
+                    else:
+                        overlap += float(pd.to_numeric(frame[column]).sum())
         valid &= math.isclose(overlap, 0.0, abs_tol=1e-9)
     return _gate("G3", "pass" if valid else "fail", int(valid), "three unique reviewed parents and zero PIT-overlap value")
 
@@ -240,8 +390,9 @@ def _g7(queue: pd.DataFrame) -> dict:
     required = queue.loc[queue["required_top90"].eq(1)]
     if required.empty:
         return _gate("G7", "not_applicable", pd.NA, "no positive-value top-90 review set")
-    groups = queue[["game", "review_group"]].drop_duplicates()
-    covered_groups = required.groupby(["game", "review_group"])["review_complete"].all()
+    group_columns = ["game", "manufacturer_parent_id", "review_group"]
+    groups = queue[group_columns].drop_duplicates()
+    covered_groups = required.groupby(group_columns)["review_complete"].all()
     valid = (
         set(queue["game"]) == {"raw", "finished"}
         and len(covered_groups) == len(groups)
@@ -250,19 +401,39 @@ def _g7(queue: pd.DataFrame) -> dict:
     return _gate("G7", "pass" if valid else "fail", int(valid), "top 90 percent cumulative value is manually reviewed in every game/group")
 
 
-def _g8(annual: pd.DataFrame, seed: pd.DataFrame) -> dict:
+def _g8(annual: Mapping[str, pd.DataFrame], seed: pd.DataFrame) -> dict:
     required = {"manufacturer_parent_id", "link_id", "year", "active"}
-    if not required.issubset(annual.columns):
-        return _gate("G8", "fail", 0, "annual origin contract is malformed")
-    scope = annual.loc[annual["year"].isin((2022, 2023, 2024)) & annual["active"].eq(1)]
-    counts = scope.groupby(["manufacturer_parent_id", "year"])["link_id"].nunique()
+    if set(annual) != {"raw", "finished"}:
+        return _gate("G8", "fail", 0, "raw and finished annual games are required")
     expected = pd.MultiIndex.from_product(
         [sorted(seed["manufacturer_parent_id"].unique()), [2022, 2023, 2024]],
         names=["manufacturer_parent_id", "year"],
     )
-    counts = counts.reindex(expected, fill_value=0)
-    valid = len(expected) == 9 and counts.ge(2).all()
-    return _gate("G8", "pass" if valid else "fail", int(counts.min()) if len(counts) else 0, "each manufacturer-year has at least two active origin links in 2022-2024")
+    minima = {}
+    valid = len(expected) == 9
+    for game in ("raw", "finished"):
+        frame = annual[game]
+        if not required.issubset(frame.columns):
+            minima[game] = 0
+            valid = False
+            continue
+        scope = frame.loc[
+            frame["year"].isin((2022, 2023, 2024)) & frame["active"].eq(1)
+        ]
+        counts = scope.groupby(["manufacturer_parent_id", "year"])["link_id"].nunique()
+        counts = counts.reindex(expected, fill_value=0)
+        minima[game] = int(counts.min()) if len(counts) else 0
+        valid &= counts.ge(2).all()
+    detail = (
+        "minimum active origins by game: "
+        + ", ".join(f"{game}={minima.get(game, 0)}" for game in ("raw", "finished"))
+    )
+    return _gate(
+        "G8",
+        "pass" if valid else "fail",
+        min(minima.values()) if minima else 0,
+        detail,
+    )
 
 
 def _g9(paths: Iterable[Path | str], root: Path | str) -> dict:
@@ -279,7 +450,7 @@ def evaluate_gates(
     parent_seed: pd.DataFrame,
     validation_metrics: pd.DataFrame,
     review_queue: pd.DataFrame,
-    annual_origin: pd.DataFrame,
+    annual_origin: Mapping[str, pd.DataFrame],
     licensed_paths: Iterable[Path | str],
     licensed_root: Path | str,
 ) -> dict:
@@ -335,31 +506,28 @@ def capture_g0_validation(
     records = []
     sql_hashes = {}
     for game in ("raw", "finished"):
-        base_sql = extraction._build_sql(
+        direct_sql = build_validation_sql(
             game, parent_ids, start, end, description_identity
-        ).rstrip().rstrip(";")
-        direct_sql = f"""
-select count(*) as row_count,
-       coalesce(sum(value_usd), 0) as value_usd,
-       coalesce(sum(shipment_equivalent), 0) as shipment_equivalent
-from (
-{base_sql}
-) as g0_source
-""".strip()
+        )
         sql_hashes[game] = hashlib.sha256(direct_sql.encode("utf-8")).hexdigest()
         result = query(connection, direct_sql)
         if not isinstance(result, pd.DataFrame):
             raise ValueError("G0 direct SQL result must be a dataframe")
         result = result.copy()
         result.columns = [str(column).strip().lower() for column in result.columns]
-        if tuple(result.columns) != ("row_count", "value_usd", "shipment_equivalent") or len(result) != 1:
+        if tuple(result.columns) != (
+            "output_row_count",
+            "unique_shipment_count",
+            "value_usd",
+            "shipment_equivalent",
+        ) or len(result) != 1:
             raise ValueError("G0 direct SQL result has an invalid exact contract")
         row = result.iloc[0]
         values = [pd.to_numeric(pd.Series([row[column]]), errors="coerce").iat[0] for column in result.columns]
         if any(pd.isna(value) or not math.isfinite(float(value)) or float(value) < 0 for value in values):
             raise ValueError("G0 direct SQL metrics must be finite and nonnegative")
-        if not float(values[0]).is_integer():
-            raise ValueError("G0 row_count must be integral")
+        if not float(values[0]).is_integer() or not float(values[1]).is_integer():
+            raise ValueError("G0 output and unique shipment counts must be integral")
         manifest = extraction._read_manifest(run_root / "_manifests" / f"{game}.json")
         entry = manifest["chunks"].get(f"{game}/{quarter}")
         if (
@@ -369,16 +537,18 @@ from (
             raise ValueError("G0 isolated validation chunk is stale or unverified")
         reconciled = (
             int(values[0]) == int(entry["row_count"])
-            and math.isclose(float(values[1]), float(entry["allocated_value_usd_sum"]), rel_tol=1e-10, abs_tol=1e-6)
-            and math.isclose(float(values[2]), float(entry["shipment_equivalent_sum"]), rel_tol=1e-10, abs_tol=1e-8)
+            and math.isclose(float(values[1]), float(values[3]), rel_tol=1e-10, abs_tol=1e-8)
+            and math.isclose(float(values[2]), float(entry["allocated_value_usd_sum"]), rel_tol=1e-10, abs_tol=1e-6)
+            and math.isclose(float(values[3]), float(entry["shipment_equivalent_sum"]), rel_tol=1e-10, abs_tol=1e-8)
         )
         records.append(
             {
                 "game": game,
                 "quarter": quarter,
-                "direct_row_count": int(values[0]),
-                "direct_value_usd": float(values[1]),
-                "direct_shipment_equivalent": float(values[2]),
+                "direct_output_row_count": int(values[0]),
+                "direct_unique_shipment_count": int(values[1]),
+                "direct_value_usd": float(values[2]),
+                "direct_shipment_equivalent": float(values[3]),
                 "isolated_row_count": int(entry["row_count"]),
                 "isolated_value_usd": float(entry["allocated_value_usd_sum"]),
                 "isolated_shipment_equivalent": float(entry["shipment_equivalent_sum"]),
@@ -405,6 +575,7 @@ from (
         "quarter": quarter,
         "metrics_path": str(metrics_path),
         "pointer_path": str(pointer_path),
+        "reconciled": bool(metrics["reconciled"].eq(1).all()),
     }
 
 
@@ -430,7 +601,7 @@ def _load_transform_outputs(
         "outputs",
         "shipment_measurement_status",
     }
-    if set(manifest) != required or manifest.get("manifest_version") != "tire-transform-manifest-v1":
+    if set(manifest) != required or manifest.get("manifest_version") != "tire-transform-manifest-v2":
         raise ValueError("transform manifest has an invalid exact contract")
     if (
         manifest.get("game") != game
@@ -452,12 +623,21 @@ def _load_transform_outputs(
     paths = [manifest_path]
     for name in sorted(expected_names):
         entry = manifest["outputs"][name]
-        if not isinstance(entry, dict) or set(entry) != {"path", "sha256"}:
+        if not isinstance(entry, dict) or set(entry) != {
+            "path", "sha256", "columns", "dtypes"
+        }:
             raise ValueError("transform output entry has an invalid exact contract")
         path = Path(str(entry["path"])).resolve(strict=False)
         if not path.is_relative_to(root) or extraction.sha256_file(path) != entry["sha256"]:
             raise ValueError("transform output path or checksum is stale")
-        frames[name] = pd.read_parquet(path)
+        frame = pd.read_parquet(path)
+        if (
+            entry["columns"] != list(frame.columns)
+            or entry["dtypes"] != [str(dtype) for dtype in frame.dtypes]
+        ):
+            raise ValueError("transform output manifest schema is stale")
+        validate_transform_artifact(name, game, frame)
+        frames[name] = frame
         paths.append(path)
     return frames, paths
 
@@ -543,7 +723,7 @@ def run_runtime_qa(
         parent_seed=seed,
         validation_metrics=validation,
         review_queue=review_queue,
-        annual_origin=loaded["raw"]["annual"],
+        annual_origin={game: loaded[game]["annual"] for game in loaded},
         licensed_paths=licensed_paths,
         licensed_root=root,
     )

@@ -213,6 +213,52 @@ def reference_raw_route(
     }
 
 
+def reference_review_pending_technical_eligibility(
+    *,
+    hs_eligible: int,
+    manufacturer_conflict: int,
+    description_ambiguous: int,
+    importer_xref_ambiguous: int,
+    shipper_xref_ambiguous: int,
+    importer_pit_ambiguous: int,
+    shipper_pit_ambiguous: int,
+    importer_historical_backcast: int,
+    shipper_historical_backcast: int,
+    import_route: str,
+) -> int:
+    """Audited pending-review predicate excluding every hard technical failure."""
+
+    return int(
+        hs_eligible == 1
+        and manufacturer_conflict == 0
+        and description_ambiguous == 0
+        and importer_xref_ambiguous == 0
+        and shipper_xref_ambiguous == 0
+        and importer_pit_ambiguous == 0
+        and shipper_pit_ambiguous == 0
+        and importer_historical_backcast == 0
+        and shipper_historical_backcast == 0
+        and import_route in {"manufacturer_direct", "distributor_intermediated"}
+    )
+
+
+def reference_validation_identity(
+    rows: Iterable[tuple[str, float]], *, tolerance: float = 1e-9
+) -> dict[str, int | float]:
+    """Reference record/allocation identity used by the G0 gate."""
+
+    materialized = [(str(record_id), float(weight)) for record_id, weight in rows]
+    unique = len({record_id for record_id, _ in materialized})
+    equivalent = sum(weight for _, weight in materialized)
+    return {
+        "unique_shipment_count": unique,
+        "shipment_equivalent": equivalent,
+        "allocation_identity_reconciled": int(
+            abs(float(unique) - equivalent) <= tolerance
+        ),
+    }
+
+
 def _base_ctes(
     parent_ids: tuple[int, int, int],
     start: str,
@@ -615,6 +661,20 @@ finalized as (
     select r.*,
            iff(
                hs_eligible = 1
+               and manufacturer_conflict = 0
+               and description_ambiguous = 0
+               and import_route = 'manufacturer_direct'
+               and importer_xref_ambiguous = 0
+               and shipper_xref_ambiguous = 0
+               and importer_pit_ambiguous = 0
+               and shipper_pit_ambiguous = 0
+               and importer_historical_backcast = 0
+               and shipper_historical_backcast = 0,
+               1,
+               0
+           ) as review_pending_technically_eligible,
+           iff(
+               hs_eligible = 1
                and import_route = 'manufacturer_direct'
                and importer_xref_ambiguous = 0
                and shipper_xref_ambiguous = 0
@@ -808,6 +868,28 @@ finalized as (
            iff(
                hs_eligible = 1
                and manufacturer_conflict = 0
+               and description_ambiguous = 0
+               and importer_xref_ambiguous = 0
+               and shipper_xref_ambiguous = 0
+               and importer_pit_ambiguous = 0
+               and shipper_pit_ambiguous = 0
+               and importer_historical_backcast = 0
+               and shipper_historical_backcast = 0
+               and (
+                   import_route in (
+                       'manufacturer_direct', 'distributor_intermediated'
+                   )
+                   or (
+                       description_candidate = 1
+                       and description_candidate_parent_id is not null
+                   )
+               ),
+               1,
+               0
+           ) as review_pending_technically_eligible,
+           iff(
+               hs_eligible = 1
+               and manufacturer_conflict = 0
                and description_candidate = 0
                and description_ambiguous = 0
                and importer_xref_ambiguous = 0
@@ -931,6 +1013,7 @@ def _aggregate_select() -> str:
         "relationship",
         "import_route",
         "supplier_relationship",
+        "review_pending_technically_eligible",
         "sensitivity_eligible",
         "estimation_eligible",
     )
@@ -978,6 +1061,7 @@ select manufacturer_parent_id,
        relationship,
        import_route,
        supplier_relationship,
+       review_pending_technically_eligible,
        sensitivity_eligible,
        estimation_eligible,
        count(distinct panjivaRecordId) as shipment_count_nonadditive,
@@ -996,6 +1080,30 @@ group by {group_by}
 """.strip()
 
 
+def _build_game_ctes(
+    game: str,
+    ids: tuple[int, int, int],
+    start: str,
+    end: str,
+    description: DescriptionIdentity | None,
+) -> str:
+    scope = (
+        _raw_scope_cte()
+        if game == "raw"
+        else _finished_scope_ctes(description)
+        if game == "finished"
+        else None
+    )
+    if scope is None:
+        raise ValueError("game must be raw or finished")
+    return (
+        "with "
+        + _base_ctes(ids, start, end, description)
+        + ",\n"
+        + scope.format(id_list=_id_list(ids))
+    )
+
+
 def build_raw_sql(
     parent_ids: Mapping[str, int],
     date_start: str,
@@ -1007,14 +1115,7 @@ def build_raw_sql(
     ids = _validate_parent_ids(parent_ids)
     start, end = _validate_dates(date_start, date_end)
     description = _validate_description_identity(description_column)
-    sql = (
-        "with "
-        + _base_ctes(ids, start, end, description)
-        + ",\n"
-        + _raw_scope_cte().format(id_list=_id_list(ids))
-        + "\n"
-        + _aggregate_select()
-    )
+    sql = _build_game_ctes("raw", ids, start, end, description) + "\n" + _aggregate_select()
     assert_read_only_query(sql)
     return sql
 
@@ -1030,13 +1131,35 @@ def build_finished_sql(
     ids = _validate_parent_ids(parent_ids)
     start, end = _validate_dates(date_start, date_end)
     description = _validate_description_identity(description_column)
+    sql = _build_game_ctes("finished", ids, start, end, description) + "\n" + _aggregate_select()
+    assert_read_only_query(sql)
+    return sql
+
+
+def build_validation_sql(
+    game: str,
+    parent_ids: Mapping[str, int],
+    date_start: str,
+    date_end: str,
+    description_column: DescriptionIdentity | None = None,
+) -> str:
+    """Build record-level G0 totals plus the separately labeled output row count."""
+
+    ids = _validate_parent_ids(parent_ids)
+    start, end = _validate_dates(date_start, date_end)
+    description = _validate_description_identity(description_column)
+    output_query = _aggregate_select()
     sql = (
-        "with "
-        + _base_ctes(ids, start, end, description)
-        + ",\n"
-        + _finished_scope_ctes(description).format(id_list=_id_list(ids))
-        + "\n"
-        + _aggregate_select()
+        _build_game_ctes(game, ids, start, end, description)
+        + "\nselect (\n"
+        + "           select count(*) from (\n"
+        + output_query
+        + "\n           ) output_rows\n"
+        + "       ) as output_row_count,\n"
+        + "       count(distinct panjivaRecordId) as unique_shipment_count,\n"
+        + "       coalesce(sum(value_usd * allocation_factor), 0) as value_usd,\n"
+        + "       coalesce(sum(allocation_factor), 0) as shipment_equivalent\n"
+        + "from finalized"
     )
     assert_read_only_query(sql)
     return sql
