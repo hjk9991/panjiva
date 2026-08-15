@@ -17,6 +17,7 @@ from scripts.tire_ab_entry.schema_probe import (
     build_parent_candidate_query,
     build_schema_query,
     choose_description_column,
+    compute_query_contract_hash,
     discover_parent_candidates,
     probe_schema,
     validate_candidate_frame,
@@ -55,7 +56,7 @@ class FakeCursor:
 
 
 class FakeConnection:
-    account = "test-account"
+    account = "VLC67107"
     warehouse = "XF_READER_KOREADEVELOPMENT_WH"
     database = "MI_XPRESSCLOUD"
     schema = "XPRESSFEED"
@@ -192,6 +193,15 @@ def test_connection_context_rejects_wrong_namespace_before_query():
     assert connection._cursor.calls == []
 
 
+@pytest.mark.parametrize("account", [None, "", "OTHER_ACCOUNT"])
+def test_connection_context_rejects_blank_or_wrong_account_before_query(account):
+    connection = FakeConnection(schema_frame("PANJIVARECORDID"))
+    connection.account = account
+    with pytest.raises(ValueError, match="account"):
+        validate_connection_context(connection)
+    assert connection._cursor.calls == []
+
+
 @pytest.mark.parametrize(
     "mutator",
     [
@@ -219,6 +229,21 @@ def test_schema_contract_returns_deterministic_full_identity():
     assert not validated.duplicated(
         ["table_catalog", "table_schema", "table_name", "column_name"]
     ).any()
+
+
+@pytest.mark.parametrize("ordinal", [0, -1, 1.5])
+def test_schema_contract_requires_positive_integral_ordinals(ordinal):
+    frame = schema_frame("PANJIVARECORDID")
+    frame["ORDINAL_POSITION"] = ordinal
+    with pytest.raises(ValueError, match="ordinal"):
+        validate_schema_frame(frame)
+
+
+def test_schema_contract_rejects_duplicate_ordinals_within_table():
+    frame = schema_frame("PANJIVARECORDID", "GOODSDESCRIPTION")
+    frame["ORDINAL_POSITION"] = [1, 1]
+    with pytest.raises(ValueError, match="ordinal"):
+        validate_schema_frame(frame)
 
 
 @pytest.mark.parametrize(
@@ -374,6 +399,19 @@ def test_parent_query_is_read_only_parameterized_and_deterministic():
     assert "order by target_search_term, company_name, company_id" in lowered
 
 
+def test_query_contract_hash_changes_with_ordered_parameters():
+    sql, parameters = build_parent_candidate_query()
+    baseline = compute_query_contract_hash(sql, parameters)
+    changed_value = compute_query_contract_hash(
+        sql, (*parameters[:-1], "%changed-target%")
+    )
+    changed_order = compute_query_contract_hash(
+        sql, (parameters[2], parameters[3], parameters[0], parameters[1], *parameters[4:])
+    )
+    assert baseline != changed_value
+    assert baseline != changed_order
+
+
 def test_discover_parent_candidates_preserves_candidate_schema_without_selection(
     tmp_path, monkeypatch
 ):
@@ -383,6 +421,16 @@ def test_discover_parent_candidates_preserves_candidate_schema_without_selection
     frame.loc[1, "INDUSTRY"] = None
     frame.loc[2, "COMPANY_NAME"] = "=Hankook Formula"
     connection = FakeConnection(frame)
+    publication_calls = []
+    real_publish = probe_module.artifacts.publish_candidate_artifact_set
+
+    def record_publish(*args, **kwargs):
+        publication_calls.append((args, kwargs))
+        return real_publish(*args, **kwargs)
+
+    monkeypatch.setattr(
+        probe_module.artifacts, "publish_candidate_artifact_set", record_publish
+    )
     monkeypatch.setattr(
         probe_module, "validate_output_path", lambda path: Path(path).resolve()
     )
@@ -399,6 +447,7 @@ def test_discover_parent_candidates_preserves_candidate_schema_without_selection
     metadata_path = tmp_path / "manufacturer_parent_candidates.metadata.json"
     canonical = pd.read_parquet(canonical_path)
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    assert len(publication_calls) == 1
     assert tuple(saved.columns[:8]) == CANDIDATE_COLUMNS[:8]
     assert "manufacturer_parent_id" not in saved.columns
     assert pd.isna(
@@ -418,6 +467,10 @@ def test_discover_parent_candidates_preserves_candidate_schema_without_selection
     assert result["canonical_path"] == str(canonical_path)
     assert result["metadata_path"] == str(metadata_path)
     assert metadata["sql_contract_version"] == "tire-parent-candidate-v2"
+    assert metadata["query_hash_contract_version"] == "sql-plus-ordered-parameters-v1"
+    assert metadata["query_contract_sha256"] == compute_query_contract_hash(
+        *build_parent_candidate_query()
+    )
     assert metadata["namespace"]["database"] == "MI_XPRESSCLOUD"
     assert metadata["namespace"]["schema"] == "XPRESSFEED"
     assert metadata["namespace"]["role"] == "XF_READER_KOREADEVELOPMENT"
@@ -444,3 +497,24 @@ def test_runtime_paths_are_exact_and_licensed():
     assert PARENT_CANDIDATE_METADATA_PATH == Path(
         r"C:\panjiva\data\staging\ab_entry_tire_v1\review\manufacturer_parent_candidates.metadata.json"
     )
+
+
+def test_probe_and_discovery_reject_wrong_suffix_before_query(tmp_path, monkeypatch):
+    connection = FakeConnection(schema_frame("PANJIVARECORDID"))
+    monkeypatch.setattr(
+        probe_module, "validate_output_path", lambda path: Path(path).resolve()
+    )
+    with pytest.raises(ValueError, match=r"\.parquet"):
+        probe_schema(connection, output_path=tmp_path / "schema.csv")
+    with pytest.raises(ValueError, match=r"\.csv"):
+        discover_parent_candidates(connection, output_path=tmp_path / "candidates.parquet")
+    assert connection._cursor.calls == []
+
+
+def test_candidate_artifact_paths_must_be_distinct_before_query(tmp_path, monkeypatch):
+    connection = FakeConnection(complete_candidate_frame())
+    collision = (tmp_path / "collision").resolve()
+    monkeypatch.setattr(probe_module, "validate_output_path", lambda path: collision)
+    with pytest.raises(ValueError, match="distinct"):
+        discover_parent_candidates(connection, output_path=tmp_path / "candidates.csv")
+    assert connection._cursor.calls == []

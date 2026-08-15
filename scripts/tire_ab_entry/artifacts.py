@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from copy import deepcopy
 from io import BytesIO
 import hashlib
 import json
@@ -9,6 +11,7 @@ import os
 from pathlib import Path
 import tempfile
 import threading
+import time
 from typing import Callable
 
 import pandas as pd
@@ -153,3 +156,80 @@ def sanitize_candidate_csv(frame: pd.DataFrame) -> pd.DataFrame:
             )
         )
     return sanitized
+
+
+@contextmanager
+def candidate_publication_lock(
+    lock_path: Path | str,
+    *,
+    timeout_seconds: float = 30.0,
+    poll_seconds: float = 0.05,
+):
+    """Acquire a bounded cross-process directory mutex for one publication set."""
+
+    if timeout_seconds <= 0 or poll_seconds <= 0:
+        raise ValueError("publication lock timing must be positive")
+    canonical = validate_output_path(lock_path)
+    canonical.parent.mkdir(parents=True, exist_ok=True)
+    canonical = validate_output_path(canonical)
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        try:
+            canonical.mkdir()
+            break
+        except FileExistsError:
+            if time.monotonic() >= deadline:
+                raise TimeoutError("candidate publication lock timed out")
+            time.sleep(poll_seconds)
+    try:
+        yield canonical
+    finally:
+        canonical.rmdir()
+
+
+def publish_candidate_artifact_set(
+    canonical_frame: pd.DataFrame,
+    sanitized_frame: pd.DataFrame,
+    metadata: dict,
+    *,
+    canonical_path: Path | str,
+    csv_path: Path | str,
+    metadata_path: Path | str,
+    lock_timeout_seconds: float = 30.0,
+) -> dict:
+    """Publish and verify one locked generation at fixed consumer paths."""
+
+    targets = tuple(
+        validate_output_path(path)
+        for path in (canonical_path, csv_path, metadata_path)
+    )
+    if len({os.path.normcase(str(path)) for path in targets}) != 3:
+        raise ValueError("candidate publication paths must be distinct")
+    canonical_target, csv_target, metadata_target = targets
+    lock_path = csv_target.parent / f".{csv_target.stem}.publication.lock"
+    with candidate_publication_lock(
+        lock_path,
+        timeout_seconds=lock_timeout_seconds,
+    ):
+        canonical_hash = atomic_write_parquet(canonical_frame, canonical_target)
+        csv_hash = atomic_write_csv(sanitized_frame, csv_target)
+        published_metadata = deepcopy(metadata)
+        published_metadata["artifact_sha256"] = {
+            "canonical_parquet": canonical_hash,
+            "sanitized_csv": csv_hash,
+        }
+        metadata_hash = atomic_write_json(published_metadata, metadata_target)
+
+        if _sha256_file(canonical_target) != canonical_hash:
+            raise RuntimeError("published canonical Parquet hash changed")
+        if _sha256_file(csv_target) != csv_hash:
+            raise RuntimeError("published sanitized CSV hash changed")
+        parsed_metadata = json.loads(metadata_target.read_text(encoding="utf-8"))
+        if parsed_metadata != published_metadata:
+            raise RuntimeError("published metadata changed during verification")
+        return {
+            "canonical_sha256": canonical_hash,
+            "csv_sha256": csv_hash,
+            "metadata_sha256": metadata_hash,
+            "metadata": published_metadata,
+        }

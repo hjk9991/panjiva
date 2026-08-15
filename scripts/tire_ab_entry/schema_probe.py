@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import hashlib
+import json
+import os
 from pathlib import Path
 import re
 from typing import Iterable
@@ -13,6 +15,7 @@ import numpy as np
 
 from . import artifacts
 from .config import (
+    APPROVED_ACCOUNT,
     APPROVED_DATABASE,
     APPROVED_ROLE,
     APPROVED_SCHEMA,
@@ -36,6 +39,7 @@ PARENT_CANDIDATE_METADATA_PATH = (
     OUTPUT_ROOT / "review" / "manufacturer_parent_candidates.metadata.json"
 )
 PARENT_QUERY_CONTRACT_VERSION = "tire-parent-candidate-v2"
+QUERY_HASH_CONTRACT_VERSION = "sql-plus-ordered-parameters-v1"
 DESCRIPTION_COLUMN_PREFERENCE = (
     "GOODSDESCRIPTION",
     "PRODUCTDESCRIPTION",
@@ -152,6 +156,22 @@ order by target_search_term, company_name, company_id
     return sql, tuple(parameters)
 
 
+def compute_query_contract_hash(sql: str, parameters: tuple[str, ...]) -> str:
+    """Hash SQL plus ordered bound values under a versioned contract."""
+
+    payload = json.dumps(
+        {
+            "contract_version": QUERY_HASH_CONTRACT_VERSION,
+            "sql": sql,
+            "ordered_parameters": list(parameters),
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
 def assert_read_only_query(sql: str) -> None:
     """Reject SQL that is not one comment-free SELECT/CTE statement."""
 
@@ -204,7 +224,12 @@ def validate_schema_frame(frame: pd.DataFrame) -> pd.DataFrame:
     if not normalized["table_name"].str.startswith("PANJIVAUSIMP").all():
         raise ValueError("schema metadata includes an unapproved table")
     ordinal = pd.to_numeric(normalized["ordinal_position"], errors="coerce")
-    if ordinal.isna().any() or not np.isfinite(ordinal).all() or (ordinal % 1).ne(0).any():
+    if (
+        ordinal.isna().any()
+        or not np.isfinite(ordinal).all()
+        or (ordinal % 1).ne(0).any()
+        or ordinal.le(0).any()
+    ):
         raise ValueError("schema metadata has invalid ordinal positions")
     normalized["ordinal_position"] = ordinal.astype("int64")
     for column in ("data_type", "is_nullable"):
@@ -215,6 +240,9 @@ def validate_schema_frame(frame: pd.DataFrame) -> pd.DataFrame:
     key = ["table_catalog", "table_schema", "table_name", "column_name"]
     if normalized.duplicated(key).any():
         raise ValueError("schema metadata has duplicate full column identities")
+    table_key = ["table_catalog", "table_schema", "table_name", "ordinal_position"]
+    if normalized.duplicated(table_key).any():
+        raise ValueError("schema metadata has duplicate ordinal positions within a table")
     return normalized.loc[:, SCHEMA_METADATA_COLUMNS].sort_values(
         ["table_catalog", "table_schema", "table_name", "ordinal_position"],
         kind="stable",
@@ -300,19 +328,17 @@ def validate_connection_context(connection) -> dict[str, str]:
         "query_role": getattr(connection, "role", None),
     }
     expected = {
+        "query_account": APPROVED_ACCOUNT,
         "query_warehouse": APPROVED_WAREHOUSE,
         "query_database": APPROVED_DATABASE,
         "query_schema": APPROVED_SCHEMA,
         "query_role": APPROVED_ROLE,
     }
-    if not str(values["query_account"] or "").strip():
-        raise ValueError("Snowflake account context is unavailable")
     for field, approved in expected.items():
         actual = str(values[field] or "").strip().upper()
         if actual != approved:
             raise ValueError(f"Snowflake {field.removeprefix('query_')} is not approved")
         values[field] = actual
-    values["query_account"] = str(values["query_account"]).strip()
     return values
 
 
@@ -343,7 +369,10 @@ def _connection_metadata(connection) -> dict[str, object]:
 def probe_schema(connection, *, output_path: Path | str = SCHEMA_OUTPUT_PATH) -> dict:
     """Query and atomically persist Panjiva import-column metadata."""
 
-    target = validate_output_path(output_path)
+    requested = Path(output_path)
+    if requested.suffix.lower() != ".parquet":
+        raise ValueError("schema output target must use the .parquet suffix")
+    target = validate_output_path(requested)
     context = validate_connection_context(connection)
     frame = validate_schema_frame(_fetch_frame(connection, build_schema_query()))
     frame["query_timestamp_utc"] = datetime.now(timezone.utc).isoformat()
@@ -386,9 +415,19 @@ def discover_parent_candidates(
 ) -> dict:
     """Persist reviewed-name CapIQ candidates without selecting a parent."""
 
-    target = validate_output_path(output_path)
+    requested = Path(output_path)
+    if requested.suffix.lower() != ".csv":
+        raise ValueError("parent review output target must use the .csv suffix")
+    target = validate_output_path(requested)
     canonical_target = validate_output_path(target.with_suffix(".parquet"))
     metadata_target = validate_output_path(target.with_suffix(".metadata.json"))
+    distinct_paths = {os.path.normcase(str(path)) for path in (
+        target,
+        canonical_target,
+        metadata_target,
+    )}
+    if len(distinct_paths) != 3:
+        raise ValueError("candidate artifact paths must resolve to distinct targets")
     context = validate_connection_context(connection)
     sql, parameters = build_parent_candidate_query()
     frame, warnings = validate_candidate_frame(_fetch_frame(connection, sql, parameters))
@@ -396,14 +435,13 @@ def discover_parent_candidates(
         search_term: int(frame["target_search_term"].eq(search_term).sum())
         for search_term in MANUFACTURER_PARENT_TARGETS
     }
-    canonical_hash = artifacts.atomic_write_parquet(frame, canonical_target)
     sanitized = artifacts.sanitize_candidate_csv(frame)
-    csv_hash = artifacts.atomic_write_csv(sanitized, target)
     timestamp = datetime.now(timezone.utc).isoformat()
     metadata = {
         "query_timestamp_utc": timestamp,
         "sql_contract_version": PARENT_QUERY_CONTRACT_VERSION,
-        "query_sha256": hashlib.sha256(sql.encode("utf-8")).hexdigest(),
+        "query_contract_sha256": compute_query_contract_hash(sql, parameters),
+        "query_hash_contract_version": QUERY_HASH_CONTRACT_VERSION,
         "namespace": {
             key.removeprefix("query_"): value for key, value in context.items()
         },
@@ -411,19 +449,22 @@ def discover_parent_candidates(
         "candidate_counts": counts,
         "row_count_warnings": list(warnings),
         "nullable_source_fields": ["country", "industry"],
-        "artifact_sha256": {
-            "canonical_parquet": canonical_hash,
-            "sanitized_csv": csv_hash,
-        },
     }
-    metadata_hash = artifacts.atomic_write_json(metadata, metadata_target)
+    publication = artifacts.publish_candidate_artifact_set(
+        frame,
+        sanitized,
+        metadata,
+        canonical_path=canonical_target,
+        csv_path=target,
+        metadata_path=metadata_target,
+    )
     return {
         "candidate_counts": counts,
         "candidate_count": int(len(frame)),
         "output_path": str(target),
         "canonical_path": str(canonical_target),
         "metadata_path": str(metadata_target),
-        "metadata_sha256": metadata_hash,
+        "metadata_sha256": publication["metadata_sha256"],
         "review_status": "human_selection_required",
         "row_count_warnings": warnings,
     }

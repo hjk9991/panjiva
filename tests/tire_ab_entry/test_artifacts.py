@@ -1,6 +1,10 @@
 from concurrent.futures import ThreadPoolExecutor
+import hashlib
+import json
+import multiprocessing
 from pathlib import Path
 import threading
+import time
 
 import pandas as pd
 import pytest
@@ -9,6 +13,8 @@ import scripts.tire_ab_entry.artifacts as artifacts_module
 from scripts.tire_ab_entry.artifacts import (
     atomic_write_bytes,
     atomic_write_parquet,
+    candidate_publication_lock,
+    publish_candidate_artifact_set,
     sanitize_candidate_csv,
 )
 
@@ -22,6 +28,36 @@ def allow_test_output_paths(monkeypatch):
 
 def _temporary_residue(folder):
     return tuple(folder.glob(".*.atomic-*.tmp"))
+
+
+def _publish_generation_worker(root_text, generation, start_event, queue):
+    from pathlib import Path
+    import pandas as pd
+    import scripts.tire_ab_entry.artifacts as worker_artifacts
+
+    worker_artifacts.validate_output_path = lambda path: Path(path).resolve()
+    root = Path(root_text)
+    frame = pd.DataFrame(
+        {
+            "generation": [generation] * 20_000,
+            "payload": [generation * 128] * 20_000,
+        }
+    )
+    start_event.wait(timeout=10)
+    try:
+        worker_artifacts.publish_candidate_artifact_set(
+            frame,
+            frame,
+            {"generation": generation},
+            canonical_path=root / "candidates.parquet",
+            csv_path=root / "candidates.csv",
+            metadata_path=root / "candidates.metadata.json",
+            lock_timeout_seconds=10,
+        )
+        queue.put(None)
+    except Exception as error:
+        queue.put(type(error).__name__)
+        raise
 
 
 def test_atomic_writer_uses_unique_temps_during_concurrent_writes(tmp_path):
@@ -129,3 +165,55 @@ def test_candidate_csv_sanitizer_neutralizes_formulas_without_mutating_canonical
     assert sanitized.loc[0, "country"] == "[MISSING: see country_missing]"
     assert sanitized.loc[0, "industry"] == "[MISSING: see industry_missing]"
     assert sanitized.loc[1, "country"] == "'-country"
+
+
+def test_publication_lock_has_bounded_wait_and_safe_release(tmp_path):
+    lock_path = tmp_path / ".candidates.publication.lock"
+    with candidate_publication_lock(lock_path, timeout_seconds=1):
+        with pytest.raises(TimeoutError, match="publication lock"):
+            with candidate_publication_lock(
+                lock_path, timeout_seconds=0.05, poll_seconds=0.01
+            ):
+                pass
+    assert not lock_path.exists()
+
+    with pytest.raises(RuntimeError, match="inside failure"):
+        with candidate_publication_lock(lock_path, timeout_seconds=1):
+            raise RuntimeError("inside failure")
+    assert not lock_path.exists()
+
+
+def test_multiprocess_publication_sidecar_matches_one_complete_generation(tmp_path):
+    context = multiprocessing.get_context("spawn")
+    start_event = context.Event()
+    queue = context.Queue()
+    processes = [
+        context.Process(
+            target=_publish_generation_worker,
+            args=(str(tmp_path), generation, start_event, queue),
+        )
+        for generation in ("A", "B")
+    ]
+    for process in processes:
+        process.start()
+    start_event.set()
+    for process in processes:
+        process.join(timeout=30)
+        assert process.exitcode == 0
+    assert [queue.get(timeout=2) for _ in processes] == [None, None]
+
+    canonical_path = tmp_path / "candidates.parquet"
+    csv_path = tmp_path / "candidates.csv"
+    metadata_path = tmp_path / "candidates.metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    canonical = pd.read_parquet(canonical_path)
+    review = pd.read_csv(csv_path)
+    sha256 = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
+    assert set(canonical["generation"]) == {metadata["generation"]}
+    assert set(review["generation"]) == {metadata["generation"]}
+    assert metadata["artifact_sha256"] == {
+        "canonical_parquet": sha256(canonical_path),
+        "sanitized_csv": sha256(csv_path),
+    }
+    assert not (tmp_path / ".candidates.publication.lock").exists()
+    assert _temporary_residue(tmp_path) == ()

@@ -4,6 +4,7 @@ import pytest
 
 import scripts.tire_ab_entry.config as config_module
 from scripts.tire_ab_entry.config import (
+    APPROVED_ACCOUNT,
     END_QUARTER,
     ENTRY_CORE_SHIPMENTS,
     ENTRY_CORE_VALUE_USD,
@@ -38,6 +39,7 @@ def test_output_boundary_rejects_sibling_prefix_and_alternate_root(tmp_path):
 
 
 def test_quarter_and_entry_threshold_constants_are_exact():
+    assert APPROVED_ACCOUNT == "VLC67107"
     assert START_QUARTER == "2014Q1"
     assert END_QUARTER == "2025Q4"
     assert ENTRY_VALUE_USD == 100_000
