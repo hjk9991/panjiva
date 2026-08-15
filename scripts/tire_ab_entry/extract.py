@@ -37,9 +37,9 @@ except ImportError:  # pragma: no cover - licensed writes are Windows-only
     msvcrt = None
 
 
-CONTRACT_VERSION = "tire-extraction-contract-v2"
+CONTRACT_VERSION = "tire-extraction-contract-v3"
 MANIFEST_VERSION = "tire-extraction-manifest-v1"
-CODE_VERSION = "tire-extraction-code-v2"
+CODE_VERSION = "tire-extraction-code-v3"
 PARENT_SEED_PATH = OUTPUT_ROOT / "review" / "manufacturer_parent_seed.csv"
 PARENT_CANDIDATE_POINTER_PATH = (
     OUTPUT_ROOT / "review" / "manufacturer_parent_candidates.current.json"
@@ -147,6 +147,7 @@ DIAGNOSTIC_MEASURES = tuple(
 )
 REQUIRED_OUTPUT_COLUMNS = (
     *OUTPUT_KEY_COLUMNS,
+    "unique_shipment_count_nonadditive",
     "shipment_count_nonadditive",
     "shipment_count_compatibility_nonadditive",
     *ADDITIVE_MEASURES,
@@ -380,6 +381,18 @@ def validate_output_frame(frame: pd.DataFrame, quarter: str) -> pd.DataFrame:
             raise ValueError(f"output numeric column {column} must be finite")
         if (non_null < 0).any():
             raise ValueError(f"output numeric column {column} must be nonnegative")
+    if not frame.empty:
+        unique = pd.to_numeric(
+            frame["unique_shipment_count_nonadditive"], errors="coerce"
+        )
+        if (
+            unique.isna().any()
+            or unique.nunique(dropna=False) != 1
+            or not float(unique.iat[0]).is_integer()
+        ):
+            raise ValueError(
+                "output chunk-global unique shipment diagnostic is invalid"
+            )
     if frame.duplicated(list(OUTPUT_KEY_COLUMNS)).any():
         raise ValueError("output has duplicate final keys")
     return frame
@@ -646,6 +659,7 @@ SUCCESS_ENTRY_FIELDS = {
     "row_count",
     "allocated_value_usd_sum",
     "shipment_equivalent_sum",
+    "unique_shipment_count_nonadditive",
     "nonadditive_count_sum",
     "sql_sha256",
     "parent_seed_sha256",
@@ -676,10 +690,16 @@ def _validate_manifest_contract(manifest: object) -> None:
 
 
 def _manifest_metrics(frame: pd.DataFrame) -> dict[str, int | float]:
+    unique = (
+        0
+        if frame.empty
+        else int(pd.to_numeric(frame["unique_shipment_count_nonadditive"]).iat[0])
+    )
     return {
         "row_count": int(len(frame)),
         "allocated_value_usd_sum": float(frame["value_usd"].sum()),
         "shipment_equivalent_sum": float(frame["shipment_equivalent"].sum()),
+        "unique_shipment_count_nonadditive": unique,
         "nonadditive_count_sum": float(frame["shipment_count_nonadditive"].sum()),
     }
 
@@ -852,6 +872,9 @@ def extract_chunk(
                 "row_count": int(len(frame)),
                 "allocated_value_usd_sum": float(frame["value_usd"].sum()),
                 "shipment_equivalent_sum": float(frame["shipment_equivalent"].sum()),
+                "unique_shipment_count_nonadditive": int(
+                    _manifest_metrics(frame)["unique_shipment_count_nonadditive"]
+                ),
                 "nonadditive_count_sum": float(frame["shipment_count_nonadditive"].sum()),
                 "sql_sha256": sql_hash,
                 "parent_seed_sha256": parent_seed_sha256,
@@ -875,6 +898,7 @@ def extract_chunk(
                 "row_count": 0,
                 "allocated_value_usd_sum": 0.0,
                 "shipment_equivalent_sum": 0.0,
+                "unique_shipment_count_nonadditive": 0,
                 "nonadditive_count_sum": 0.0,
                 "sql_sha256": sql_hash,
                 "parent_seed_sha256": parent_seed_sha256,

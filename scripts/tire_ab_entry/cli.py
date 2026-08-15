@@ -77,6 +77,7 @@ def main(argv: list[str] | None = None) -> int:
                 result = build_game_outputs(
                     game=args.game,
                     parent_seed_sha256=parent_seed_sha256,
+                    manufacturer_parent_ids=parent_ids.values(),
                 )
                 _print_json({"status": "ok", "command": args.command, **result})
                 return 0

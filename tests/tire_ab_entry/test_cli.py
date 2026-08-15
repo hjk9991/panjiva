@@ -275,10 +275,17 @@ def test_build_and_qa_refuse_missing_seed_before_any_artifact_read(monkeypatch, 
 
 def test_build_and_qa_are_offline_and_propagate_qa_exit(monkeypatch, capsys):
     seed = ParentSeedSnapshot({"MICHELIN": 1, "GOODYEAR": 2, "HANKOOK": 3}, "seed")
+    build_calls = []
     monkeypatch.setattr(cli_module, "load_parent_seed", lambda: seed)
     monkeypatch.setattr(cli_module, "load_description_identity", lambda: (_ for _ in ()).throw(AssertionError("offline command does not need schema")))
     monkeypatch.setattr(cli_module, "connect", lambda: (_ for _ in ()).throw(AssertionError("offline command")))
-    monkeypatch.setattr(cli_module, "build_game_outputs", lambda **kwargs: {"game": kwargs["game"], "status": "built"})
+    monkeypatch.setattr(
+        cli_module,
+        "build_game_outputs",
+        lambda **kwargs: build_calls.append(kwargs)
+        or {"game": kwargs["game"], "status": "built"},
+    )
     assert cli_module.main(["build", "--game", "finished"]) == 0
+    assert list(build_calls[0]["manufacturer_parent_ids"]) == [1, 2, 3]
     monkeypatch.setattr(cli_module, "run_runtime_qa", lambda **kwargs: {"exit_code": 1, "supplier_game_eligible": False})
     assert cli_module.main(["qa"]) == 1

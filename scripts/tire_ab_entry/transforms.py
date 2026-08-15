@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
 import hashlib
+from io import BytesIO
 import json
 import math
 from pathlib import Path
@@ -83,6 +84,65 @@ REVIEW_IDENTITY_COLUMNS = (
     "link_identity_value",
     "review_item_id",
 )
+MANUAL_REVIEW_COLUMNS = (
+    *REVIEW_IDENTITY_COLUMNS,
+    "review_status",
+    "source_note",
+)
+MANUAL_REVIEW_SNAPSHOT_VERSION = "manual-link-reviews-snapshot-v1"
+MANUAL_REVIEW_SCHEMA_VERSION = "manual-link-reviews-schema-v1"
+
+
+def read_manual_review_snapshot(
+    path: Path | str,
+) -> tuple[dict[str, object], pd.DataFrame | None]:
+    """Read one immutable byte snapshot and its exact review-table contract."""
+
+    canonical = Path(path).resolve(strict=False)
+    try:
+        before = canonical.stat()
+    except FileNotFoundError:
+        return (
+            {
+                "contract_version": MANUAL_REVIEW_SNAPSHOT_VERSION,
+                "schema_version": MANUAL_REVIEW_SCHEMA_VERSION,
+                "state": "missing",
+                "path": str(canonical),
+                "sha256": None,
+                "size_bytes": 0,
+                "columns": [],
+                "row_count": 0,
+            },
+            None,
+        )
+    if not canonical.is_file():
+        raise ValueError("manual review snapshot path is not a regular file")
+    try:
+        payload = canonical.read_bytes()
+        after = canonical.stat()
+    except OSError as error:
+        raise ValueError("manual review snapshot is unreadable") from error
+    identity_before = (before.st_size, before.st_mtime_ns, before.st_ino)
+    identity_after = (after.st_size, after.st_mtime_ns, after.st_ino)
+    if identity_before != identity_after or len(payload) != after.st_size:
+        raise ValueError("manual review snapshot changed while being read")
+    try:
+        frame = pd.read_csv(BytesIO(payload), dtype="string")
+    except Exception as error:
+        raise ValueError("manual review snapshot CSV is malformed") from error
+    if tuple(frame.columns) != MANUAL_REVIEW_COLUMNS:
+        raise ValueError("manual review snapshot has an invalid exact schema")
+    metadata = {
+        "contract_version": MANUAL_REVIEW_SNAPSHOT_VERSION,
+        "schema_version": MANUAL_REVIEW_SCHEMA_VERSION,
+        "state": "present",
+        "path": str(canonical),
+        "sha256": hashlib.sha256(payload).hexdigest(),
+        "size_bytes": len(payload),
+        "columns": list(frame.columns),
+        "row_count": int(len(frame)),
+    }
+    return metadata, frame
 
 
 def normalize_review_identity(frame: pd.DataFrame) -> pd.DataFrame:
@@ -522,7 +582,9 @@ def load_verified_game_chunks(
 
 
 def _annual_origin_source(
-    origin: pd.DataFrame, study_years: Iterable[int]
+    origin: pd.DataFrame,
+    study_years: Iterable[int],
+    manufacturer_parent_ids: Iterable[int] | None = None,
 ) -> pd.DataFrame:
     years = tuple(sorted({int(year) for year in study_years}))
     if not years:
@@ -548,7 +610,29 @@ def _annual_origin_source(
             "sum",
         ),
     )
-    identities = source[["manufacturer_parent_id", "link_id"]].drop_duplicates()
+    observed_manufacturers = set(
+        pd.to_numeric(source["manufacturer_parent_id"], errors="raise").astype(int)
+    )
+    manufacturers = sorted(
+        {
+            int(value)
+            for value in (
+                manufacturer_parent_ids
+                if manufacturer_parent_ids is not None
+                else observed_manufacturers
+            )
+        }
+    )
+    if not manufacturers or any(value <= 0 for value in manufacturers):
+        raise ValueError("annual origin grid requires positive seed manufacturer IDs")
+    if not observed_manufacturers.issubset(manufacturers):
+        raise ValueError("observed manufacturer is outside the seed manufacturer grid")
+    universe = sorted(source["link_id"].astype("string").dropna().unique())
+    if not universe:
+        raise ValueError("annual origin grid requires an observed game-wide universe")
+    identities = pd.DataFrame(
+        {"manufacturer_parent_id": manufacturers}
+    ).merge(pd.DataFrame({"link_id": universe}), how="cross")
     grid = identities.merge(pd.DataFrame({"year": years}), how="cross")
     annual = grid.merge(
         active,
@@ -562,6 +646,7 @@ def _annual_origin_source(
         "shipment_count_source_group_sum_nonadditive",
     ):
         annual[column] = annual[column].fillna(0.0)
+    annual["link_universe_basis"] = "game_wide_ever_observed_origin_links"
     annual["observed"] = 1
     return annual
 
@@ -571,11 +656,14 @@ def build_game_artifacts(
     *,
     game: str,
     study_years: Iterable[int] = range(2014, 2026),
+    manufacturer_parent_ids: Iterable[int] | None = None,
 ) -> dict[str, pd.DataFrame]:
     """Build quarterly extensions, balanced annual origin links, and diagnostics."""
 
     quarterly = build_quarterly_panels(frame, game=game)
-    annual_source = _annual_origin_source(quarterly["origin"], study_years)
+    annual_source = _annual_origin_source(
+        quarterly["origin"], study_years, manufacturer_parent_ids
+    )
     annual = build_annual_entries(annual_source, study_years=study_years)
     annual.insert(0, "game", game)
     dynamic = build_dynamic_link_moments(
@@ -584,7 +672,10 @@ def build_game_artifacts(
         end_year=2021,
     )
     dynamic.insert(0, "game", game)
-    dynamic["measurement_status"] = "untargeted_static_bne_diagnostic"
+    dynamic["measurement_status"] = (
+        "untargeted_static_bne_diagnostic;"
+        "origin_universe=game_wide_ever_observed_origin_links"
+    )
     return {
         "origin_quarterly": quarterly["origin"],
         "supplier_quarterly": quarterly["supplier"],
@@ -761,11 +852,29 @@ def build_game_outputs(
     *,
     game: str,
     parent_seed_sha256: str,
+    manufacturer_parent_ids: Iterable[int],
     output_root: Path | str = OUTPUT_ROOT,
 ) -> dict:
-    """Build and atomically publish one game's licensed Task 7 artifacts."""
+    """Serialize and atomically publish one game's licensed Task 7 artifacts."""
 
     root = validate_output_path(Path(output_root))
+    build_lock = root / "_manifests" / ".transform-build.lock"
+    with extraction.extraction_lock(build_lock):
+        return _build_game_outputs_locked(
+            game=game,
+            parent_seed_sha256=parent_seed_sha256,
+            manufacturer_parent_ids=manufacturer_parent_ids,
+            root=root,
+        )
+
+
+def _build_game_outputs_locked(
+    *,
+    game: str,
+    parent_seed_sha256: str,
+    manufacturer_parent_ids: Iterable[int],
+    root: Path,
+) -> dict:
     chunks = load_verified_game_chunks(
         game,
         parent_seed_sha256=parent_seed_sha256,
@@ -777,10 +886,14 @@ def build_game_outputs(
 
     review_items = build_review_items(chunks, game=game)
     review_path = root / "review" / "manual_link_reviews.csv"
-    reviews = pd.read_csv(review_path, dtype="string") if review_path.exists() else None
+    review_snapshot, reviews = read_manual_review_snapshot(review_path)
     review_queue = build_manual_review_queue(review_items, reviews)
     reviewed_chunks = apply_manual_reviews(chunks, game=game, reviews=reviews)
-    outputs = build_game_artifacts(reviewed_chunks, game=game)
+    outputs = build_game_artifacts(
+        reviewed_chunks,
+        game=game,
+        manufacturer_parent_ids=manufacturer_parent_ids,
+    )
     targets = {
         "origin_quarterly": root / f"panel_source_quarter_{game}.parquet",
         "supplier_quarterly": root / f"panel_supplier_quarter_{game}.parquet",
@@ -793,11 +906,12 @@ def build_game_outputs(
         validate_transform_artifact(name, game, frame)
         hashes[name] = artifact_io.atomic_write_parquet(frame, targets[name])
     manifest = {
-        "manifest_version": "tire-transform-manifest-v2",
+        "manifest_version": "tire-transform-manifest-v3",
         "game": game,
         "parent_seed_sha256": parent_seed_sha256,
         "source_manifest_sha256": source_manifest_sha256,
         "source_chunk_sha256": source_chunk_sha256,
+        "manual_review_snapshot": review_snapshot,
         "outputs": {
             name: {
                 "path": str(targets[name]),

@@ -46,6 +46,7 @@ def output_frame(quarter="2024Q1"):
             "year_quarter": pd.Series([quarter], dtype="string"),
             "hs6": pd.Series(["400100"], dtype="string"),
             "shipment_count_nonadditive": pd.Series([1], dtype="int64"),
+            "unique_shipment_count_nonadditive": pd.Series([1], dtype="int64"),
             "shipment_equivalent": pd.Series([1.0], dtype="float64"),
             "value_usd": pd.Series([12.0], dtype="float64"),
             "weight_kg": pd.Series([2.0], dtype="float64"),
@@ -113,6 +114,7 @@ def test_strict_pending_verifies_file_and_all_contract_hashes(tmp_path):
                 "row_count": 1,
             "allocated_value_usd_sum": float(frame["value_usd"].sum()),
             "shipment_equivalent_sum": float(frame["shipment_equivalent"].sum()),
+            "unique_shipment_count_nonadditive": 1,
                 "nonadditive_count_sum": float(frame["shipment_count_nonadditive"].sum()),
                 "started_at": "2026-08-15T00:00:00Z",
                 "finished_at": "2026-08-15T00:00:01Z",
@@ -139,6 +141,7 @@ def test_strict_pending_verifies_file_and_all_contract_hashes(tmp_path):
         ("row_count", 999),
         ("allocated_value_usd_sum", 999.0),
         ("shipment_equivalent_sum", 999.0),
+        ("unique_shipment_count_nonadditive", 999),
         ("nonadditive_count_sum", 999.0),
     ],
 )
@@ -242,6 +245,9 @@ def test_strict_resume_reloads_and_revalidates_exact_parquet_contract(
     entry["row_count"] = len(frame)
     entry["allocated_value_usd_sum"] = float(frame["value_usd"].sum())
     entry["shipment_equivalent_sum"] = float(frame["shipment_equivalent"].sum())
+    entry["unique_shipment_count_nonadditive"] = (
+        0 if frame.empty else int(frame["unique_shipment_count_nonadditive"].iat[0])
+    )
     entry["nonadditive_count_sum"] = float(frame["shipment_count_nonadditive"].sum())
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     calls = []
@@ -256,7 +262,11 @@ def test_strict_resume_reloads_and_revalidates_exact_parquet_contract(
 def test_validate_output_accepts_empty_schema_and_rejects_bad_values():
     valid = output_frame()
     extract_module.validate_output_frame(valid, "2024Q1")
-    extract_module.validate_output_frame(valid.iloc[0:0], "2024Q1")
+    empty = valid.iloc[0:0]
+    extract_module.validate_output_frame(empty, "2024Q1")
+    assert extract_module._manifest_metrics(empty)[
+        "unique_shipment_count_nonadditive"
+    ] == 0
 
     for column, value in (("value_usd", -1), ("shipment_equivalent", np.inf)):
         bad = valid.copy()
@@ -267,6 +277,18 @@ def test_validate_output_accepts_empty_schema_and_rejects_bad_values():
         extract_module.validate_output_frame(pd.concat([valid, valid]), "2024Q1")
     with pytest.raises(ValueError, match="quarter"):
         extract_module.validate_output_frame(valid.assign(year_quarter="2024Q2"), "2024Q1")
+    inconsistent_unique = pd.concat(
+        [
+            valid,
+            valid.assign(
+                hs_full_code="fixture-other",
+                unique_shipment_count_nonadditive=2,
+            ),
+        ],
+        ignore_index=True,
+    )
+    with pytest.raises(ValueError, match="chunk-global unique shipment"):
+        extract_module.validate_output_frame(inconsistent_unique, "2024Q1")
 
 
 def test_output_contract_requires_route_and_all_diagnostics():
@@ -616,6 +638,7 @@ def test_extract_chunk_writes_verified_file_and_complete_manifest(tmp_path, monk
     assert entry["row_count"] == 1
     assert entry["allocated_value_usd_sum"] == 12.0
     assert entry["shipment_equivalent_sum"] == 1.0
+    assert entry["unique_shipment_count_nonadditive"] == 1
     assert entry["nonadditive_count_sum"] == 1.0
     assert entry["file_sha256"] == extract_module.sha256_file(target)
     assert entry["parent_seed_sha256"] == "seedhash"

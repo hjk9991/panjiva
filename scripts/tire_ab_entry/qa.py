@@ -10,7 +10,13 @@ from pathlib import Path
 
 import pandas as pd
 
-from .config import MANUFACTURER_KEYS, OUTPUT_ROOT, validate_output_path
+from .config import (
+    MANUFACTURER_KEYS,
+    OUTPUT_ROOT,
+    RAW_GROUPS,
+    iter_quarters,
+    validate_output_path,
+)
 from . import artifacts as artifact_io
 from . import extract as extraction
 from .sql import build_validation_sql
@@ -20,6 +26,7 @@ from .transforms import (
     REVIEW_IDENTITY_COLUMNS,
     load_verified_game_chunks,
     normalize_review_identity,
+    read_manual_review_snapshot,
 )
 
 
@@ -35,6 +42,7 @@ G0_COLUMNS = (
     "direct_value_usd",
     "direct_shipment_equivalent",
     "isolated_row_count",
+    "isolated_unique_shipment_count",
     "isolated_value_usd",
     "isolated_shipment_equivalent",
     "reconciled",
@@ -96,7 +104,8 @@ def _artifact_columns(name: str, game: str) -> tuple[str, ...]:
         return (
             "game", "manufacturer_parent_id", "link_id", "year", "value_usd",
             "shipment_equivalent_sum",
-            "shipment_count_source_group_sum_nonadditive", "observed", "active",
+            "shipment_count_source_group_sum_nonadditive", "link_universe_basis",
+            "observed", "active",
             "entry_raw", "entry_value", "entry_core", "entry_core_censored",
             "entry_core_count_basis", "entry_core_measurement_status",
         )
@@ -140,6 +149,7 @@ def validate_transform_artifact(name: str, game: str, frame: pd.DataFrame) -> No
         "game", "link_level", "link_id", "origin_country", "year_quarter", "input_group",
         "finished_market", "import_route", "shipment_measurement_status",
         "entry_core_count_basis", "entry_core_measurement_status",
+        "link_universe_basis",
         "measurement_status", "review_group", "link_identity_type",
         "link_identity_value", "review_item_id", "review_status", "source_note",
     }
@@ -227,6 +237,8 @@ def build_manual_review_queue(
         )
     status = queue["review_status"].astype("string")
     notes = queue["source_note"].astype("string")
+    queue["review_status"] = status
+    queue["source_note"] = notes
     queue["review_complete"] = (
         status.isin(REVIEW_STATUSES) & notes.notna() & notes.str.strip().ne("")
     ).astype("int8")
@@ -272,25 +284,72 @@ def _g0(chunks: Mapping[str, pd.DataFrame], validation: pd.DataFrame) -> dict:
         checks.append(
             int(row["reconciled"]) == 1
             and int(row["direct_output_row_count"]) == int(row["isolated_row_count"])
-            and math.isclose(
-                float(row["direct_unique_shipment_count"]),
-                float(row["direct_shipment_equivalent"]),
-                rel_tol=1e-10,
-                abs_tol=1e-8,
-            )
+            and int(row["direct_unique_shipment_count"])
+            == int(row["isolated_unique_shipment_count"])
             and math.isclose(float(row["direct_value_usd"]), float(row["isolated_value_usd"]), rel_tol=1e-10, abs_tol=1e-6)
             and math.isclose(float(row["direct_shipment_equivalent"]), float(row["isolated_shipment_equivalent"]), rel_tol=1e-10, abs_tol=1e-8)
         )
     return _gate("G0", "pass" if all(checks) else "fail", int(sum(checks)), "2024Q1 direct SQL and isolated chunk metrics reconcile")
 
 
-def _g1(origin_panels: Mapping[str, pd.DataFrame]) -> dict:
-    valid = set(origin_panels) == {"raw", "finished"}
-    for frame in origin_panels.values():
-        keys = [column for column in ("manufacturer_parent_id", "origin_country", "import_route", "input_group", "finished_market", "year_quarter") if column in frame]
-        valid &= bool(keys) and not frame.duplicated(keys).any()
-        valid &= frame["year_quarter"].astype("string").str.fullmatch(r"[0-9]{4}Q[1-4]").all()
-        valid &= frame["origin_country"].notna().all() and frame["origin_country"].astype("string").str.strip().ne("").all()
+ORIGIN_VALIDATION_BASIS = (
+    "nonblank_trimmed_printable_source_token_or_LITERAL_UNKNOWN_max128"
+)
+FINISHED_MARKETS = {
+    "passenger_vehicle",
+    "light_truck_on_highway",
+    "broad_unreviewed",
+}
+RAW_ROUTES = {"manufacturer_direct", "unattributed"}
+FINISHED_ROUTES = {
+    "manufacturer_direct",
+    "distributor_intermediated",
+    "unattributed",
+    "conflict",
+}
+
+
+def _valid_origin_tokens(series: pd.Series) -> bool:
+    return bool(
+        series.notna().all()
+        and series.map(
+            lambda value: (
+                isinstance(value, str)
+                and value == value.strip()
+                and 1 <= len(value) <= 128
+                and value.isprintable()
+            )
+        ).all()
+    )
+
+
+def _g1(
+    origin_panels: Mapping[str, pd.DataFrame],
+    chunks: Mapping[str, pd.DataFrame],
+) -> dict:
+    valid = set(origin_panels) == {"raw", "finished"} and set(chunks) == {
+        "raw",
+        "finished",
+    }
+    approved_quarters = set(iter_quarters())
+    for game, frame in origin_panels.items():
+        if game not in {"raw", "finished"}:
+            valid = False
+            continue
+        market = "input_group" if game == "raw" else "finished_market"
+        keys = [
+            "manufacturer_parent_id",
+            "origin_country",
+            *(["import_route"] if game == "finished" else []),
+            market,
+            "year_quarter",
+        ]
+        if not set(keys).issubset(frame.columns):
+            valid = False
+            continue
+        valid &= not frame.duplicated(keys).any()
+        valid &= frame["year_quarter"].isin(approved_quarters).all()
+        valid &= _valid_origin_tokens(frame["origin_country"])
         manufacturer_ids = pd.to_numeric(
             frame["manufacturer_parent_id"], errors="coerce"
         )
@@ -299,17 +358,49 @@ def _g1(origin_panels: Mapping[str, pd.DataFrame]) -> dict:
             and manufacturer_ids.gt(0).all()
             and manufacturer_ids.map(lambda value: float(value).is_integer()).all()
         )
-        for code_column in ("input_group", "finished_market", "import_route"):
-            if code_column in frame:
-                valid &= (
-                    frame[code_column].notna().all()
-                    and frame[code_column].astype("string").str.strip().ne("").all()
-                )
+        if game == "raw":
+            valid &= frame[market].isin(set(RAW_GROUPS)).all()
+            valid &= "finished_market" not in frame or frame["finished_market"].isna().all()
+            valid &= "import_route" not in frame or frame["import_route"].isin(RAW_ROUTES).all()
+        else:
+            valid &= frame[market].isin(FINISHED_MARKETS).all()
+            valid &= frame["import_route"].isin(FINISHED_ROUTES).all()
+            valid &= "input_group" not in frame or frame["input_group"].isna().all()
         valid &= _finite_nonnegative(
             frame,
             [*ADDITIVE, "shipment_count_source_group_sum_nonadditive"],
         )
-    return _gate("G1", "pass" if valid else "fail", int(valid), "panel keys, codes, dates, and numeric measures are valid")
+    for game, frame in chunks.items():
+        if game not in {"raw", "finished"}:
+            valid = False
+            continue
+        required = {
+            "year_quarter",
+            "origin_country",
+            "input_group",
+            "finished_market",
+            "import_route",
+        }
+        valid &= required.issubset(frame.columns)
+        if not required.issubset(frame.columns):
+            continue
+        valid &= frame["year_quarter"].isin(approved_quarters).all()
+        valid &= _valid_origin_tokens(frame["origin_country"])
+        if game == "raw":
+            valid &= frame["input_group"].isin(set(RAW_GROUPS)).all()
+            valid &= frame["finished_market"].isna().all()
+            valid &= frame["import_route"].isin(RAW_ROUTES).all()
+        else:
+            valid &= frame["finished_market"].isin(FINISHED_MARKETS).all()
+            valid &= frame["input_group"].isna().all()
+            valid &= frame["import_route"].isin(FINISHED_ROUTES).all()
+    return _gate(
+        "G1",
+        "pass" if valid else "fail",
+        int(valid),
+        "panel/source keys, approved quarters and semantic domains are valid; "
+        f"origin_basis={ORIGIN_VALIDATION_BASIS}",
+    )
 
 
 def _g2(chunks: Mapping[str, pd.DataFrame], panels: Mapping[str, pd.DataFrame]) -> dict:
@@ -387,15 +478,23 @@ def _g6(raw: pd.DataFrame) -> dict:
 def _g7(queue: pd.DataFrame) -> dict:
     if queue.empty:
         return _gate("G7", "not_applicable", pd.NA, "manual review denominator is zero")
-    required = queue.loc[queue["required_top90"].eq(1)]
+    group_columns = ["game", "manufacturer_parent_id", "review_group"]
+    group_total = queue.groupby(group_columns, dropna=False)["value_usd"].transform("sum")
+    positive = queue.loc[group_total.gt(0)].copy()
+    if positive.empty or set(positive["game"]) != {"raw", "finished"}:
+        return _gate(
+            "G7",
+            "not_applicable",
+            pd.NA,
+            "a required game has no positive manual-review denominator",
+        )
+    required = positive.loc[positive["required_top90"].eq(1)]
     if required.empty:
         return _gate("G7", "not_applicable", pd.NA, "no positive-value top-90 review set")
-    group_columns = ["game", "manufacturer_parent_id", "review_group"]
-    groups = queue[group_columns].drop_duplicates()
+    groups = positive[group_columns].drop_duplicates()
     covered_groups = required.groupby(group_columns)["review_complete"].all()
     valid = (
-        set(queue["game"]) == {"raw", "finished"}
-        and len(covered_groups) == len(groups)
+        len(covered_groups) == len(groups)
         and bool(covered_groups.all())
     )
     return _gate("G7", "pass" if valid else "fail", int(valid), "top 90 percent cumulative value is manually reviewed in every game/group")
@@ -459,7 +558,7 @@ def evaluate_gates(
     gates = pd.DataFrame(
         [
             _g0(chunks, validation_metrics),
-            _g1(origin_panels),
+            _g1(origin_panels, chunks),
             _g2(chunks, origin_panels),
             _g3(chunks, parent_seed),
             _g4(chunks),
@@ -537,7 +636,8 @@ def capture_g0_validation(
             raise ValueError("G0 isolated validation chunk is stale or unverified")
         reconciled = (
             int(values[0]) == int(entry["row_count"])
-            and math.isclose(float(values[1]), float(values[3]), rel_tol=1e-10, abs_tol=1e-8)
+            and int(values[1])
+            == int(entry["unique_shipment_count_nonadditive"])
             and math.isclose(float(values[2]), float(entry["allocated_value_usd_sum"]), rel_tol=1e-10, abs_tol=1e-6)
             and math.isclose(float(values[3]), float(entry["shipment_equivalent_sum"]), rel_tol=1e-10, abs_tol=1e-8)
         )
@@ -550,6 +650,9 @@ def capture_g0_validation(
                 "direct_value_usd": float(values[2]),
                 "direct_shipment_equivalent": float(values[3]),
                 "isolated_row_count": int(entry["row_count"]),
+                "isolated_unique_shipment_count": int(
+                    entry["unique_shipment_count_nonadditive"]
+                ),
                 "isolated_value_usd": float(entry["allocated_value_usd_sum"]),
                 "isolated_shipment_equivalent": float(entry["shipment_equivalent_sum"]),
                 "reconciled": int(reconciled),
@@ -586,6 +689,7 @@ def _load_transform_outputs(
     *,
     source_manifest_sha256: str,
     source_chunk_sha256: Iterable[str],
+    manual_review_snapshot: Mapping[str, object],
 ) -> tuple[dict[str, pd.DataFrame], list[Path]]:
     manifest_path = root / "_manifests" / f"transform_{game}.json"
     try:
@@ -598,18 +702,20 @@ def _load_transform_outputs(
         "parent_seed_sha256",
         "source_manifest_sha256",
         "source_chunk_sha256",
+        "manual_review_snapshot",
         "outputs",
         "shipment_measurement_status",
     }
-    if set(manifest) != required or manifest.get("manifest_version") != "tire-transform-manifest-v2":
+    if set(manifest) != required or manifest.get("manifest_version") != "tire-transform-manifest-v3":
         raise ValueError("transform manifest has an invalid exact contract")
     if (
         manifest.get("game") != game
         or manifest.get("parent_seed_sha256") != parent_seed_sha256
         or manifest.get("source_manifest_sha256") != source_manifest_sha256
         or manifest.get("source_chunk_sha256") != list(source_chunk_sha256)
+        or manifest.get("manual_review_snapshot") != dict(manual_review_snapshot)
     ):
-        raise ValueError("transform manifest is stale")
+        raise ValueError("transform manifest or manual review snapshot is stale")
     expected_names = {
         "origin_quarterly",
         "supplier_quarterly",
@@ -698,6 +804,10 @@ def run_runtime_qa(
     }
     loaded = {}
     licensed_paths = [seed_path]
+    review_path = root / "review" / "manual_link_reviews.csv"
+    manual_review_snapshot, _ = read_manual_review_snapshot(review_path)
+    if manual_review_snapshot["state"] == "present":
+        licensed_paths.append(Path(str(manual_review_snapshot["path"])))
     for game in ("raw", "finished"):
         loaded[game], paths = _load_transform_outputs(
             game,
@@ -705,6 +815,7 @@ def run_runtime_qa(
             parent_seed_sha256,
             source_manifest_sha256=chunks[game].attrs["source_manifest_sha256"],
             source_chunk_sha256=chunks[game].attrs["source_chunk_sha256"],
+            manual_review_snapshot=manual_review_snapshot,
         )
         licensed_paths.extend(paths)
     validation, paths = _load_g0_metrics(root, parent_seed_sha256)

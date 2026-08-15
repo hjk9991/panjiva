@@ -243,9 +243,9 @@ def reference_review_pending_technical_eligibility(
 
 
 def reference_validation_identity(
-    rows: Iterable[tuple[str, float]], *, tolerance: float = 1e-9
+    rows: Iterable[tuple[str, float]],
 ) -> dict[str, int | float]:
-    """Reference record/allocation identity used by the G0 gate."""
+    """Return independent record-count and allocated-equivalent diagnostics."""
 
     materialized = [(str(record_id), float(weight)) for record_id, weight in rows]
     unique = len({record_id for record_id, _ in materialized})
@@ -253,9 +253,6 @@ def reference_validation_identity(
     return {
         "unique_shipment_count": unique,
         "shipment_equivalent": equivalent,
-        "allocation_identity_reconciled": int(
-            abs(float(unique) - equivalent) <= tolerance
-        ),
     }
 
 
@@ -1064,6 +1061,8 @@ select manufacturer_parent_id,
        review_pending_technically_eligible,
        sensitivity_eligible,
        estimation_eligible,
+       (select count(distinct panjivaRecordId) from finalized)
+           as unique_shipment_count_nonadditive,
        count(distinct panjivaRecordId) as shipment_count_nonadditive,
        count(distinct panjivaRecordId)
            as shipment_count_compatibility_nonadditive,

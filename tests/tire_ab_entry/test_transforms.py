@@ -148,6 +148,7 @@ def test_quarterly_panels_preserve_additive_totals_and_explicit_diagnostics(game
     assert origin["shipment_equivalent"].sum() == 2.0
     assert "shipment_count_source_group_sum_nonadditive" in origin
     assert "shipment_count" not in origin
+    assert "unique_shipment_count_nonadditive" not in origin
     assert origin["shipment_count_source_group_sum_nonadditive"].sum() == 3
     assert set(origin["shipment_measurement_status"]) == {
         "shipment_equivalent_additive;distinct_panel_count_unavailable"
@@ -354,3 +355,37 @@ def test_build_game_artifacts_annualizes_primary_origin_and_keeps_game_separate(
     assert annual["year"].min() == 2022 and annual["year"].max() == 2025
     assert annual["entry_core_count_basis"].eq("allocated_shipment_equivalent").all()
     assert artifacts["dynamic_moments"]["targeted"].eq(0).all()
+
+
+def test_annual_origin_grid_uses_game_wide_universe_for_every_manufacturer():
+    source = pd.concat(
+        [
+            _source_rows().iloc[[0]].assign(
+                manufacturer_parent_id=1, origin_country="KOR"
+            ),
+            _source_rows().iloc[[2]].assign(
+                manufacturer_parent_id=2, origin_country="JPN"
+            ),
+        ],
+        ignore_index=True,
+    )
+    artifacts = build_game_artifacts(
+        source,
+        game="raw",
+        study_years=[2024],
+        manufacturer_parent_ids=[1, 2],
+    )
+    annual = artifacts["annual"].set_index(
+        ["manufacturer_parent_id", "link_id", "year"]
+    )
+    assert len(annual) == 4
+    cross_zero = annual.loc[(2, "KOR", 2024)]
+    assert cross_zero["observed"] == 1
+    assert cross_zero["active"] == 0
+    assert cross_zero["value_usd"] == 0
+    assert annual["link_universe_basis"].eq(
+        "game_wide_ever_observed_origin_links"
+    ).all()
+    assert artifacts["dynamic_moments"]["measurement_status"].str.contains(
+        "game_wide_ever_observed_origin_links", regex=False
+    ).all()

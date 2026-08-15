@@ -1,15 +1,19 @@
 from pathlib import Path
+import json
 
 import pandas as pd
 import pytest
 
 import scripts.tire_ab_entry.extract as extract_module
 import scripts.tire_ab_entry.qa as qa_module
+import scripts.tire_ab_entry.transforms as transforms_module
 from tests.tire_ab_entry.test_extract import output_frame
 from scripts.tire_ab_entry.transforms import (
     apply_manual_reviews,
     build_game_artifacts,
+    build_game_outputs,
     build_review_items,
+    read_manual_review_snapshot,
 )
 from scripts.tire_ab_entry.qa import (
     build_manual_review_queue,
@@ -73,7 +77,7 @@ def test_g3_requires_approved_keys_and_g7_requires_both_games(tmp_path):
     )
     gates = result["gates"].set_index("gate")
     assert gates.loc["G3", "status"] == "fail"
-    assert gates.loc["G7", "status"] == "fail"
+    assert gates.loc["G7", "status"] == "not_applicable"
 
 
 def test_g6_uses_only_estimation_sample_value(tmp_path):
@@ -104,6 +108,37 @@ def test_g1_rejects_nonpositive_manufacturer_and_blank_market_code(tmp_path):
     assert result["gates"].set_index("gate").loc["G1", "status"] == "fail"
 
 
+@pytest.mark.parametrize(
+    ("game", "column", "value"),
+    [
+        ("raw", "year_quarter", "9999Q4"),
+        ("raw", "input_group", "UNKNOWN_RAW_GROUP"),
+        ("raw", "finished_market", "passenger_vehicle"),
+        ("raw", "import_route", "conflict"),
+        ("finished", "finished_market", "UNKNOWN_FINISHED_MARKET"),
+        ("finished", "input_group", "4001"),
+        ("finished", "import_route", "unknown_route"),
+        ("finished", "origin_country", " KOR"),
+        ("finished", "origin_country", "KOR\nJPN"),
+    ],
+)
+def test_g1_rejects_out_of_contract_source_domains(
+    tmp_path, game, column, value
+):
+    raw, finished, panels, seed, validation, queue, annual, inside = _qa_fixture(tmp_path)
+    chunks = {"raw": raw, "finished": finished}
+    chunks[game].loc[0, column] = value
+    result = evaluate_gates(
+        chunks=chunks, origin_panels=panels, parent_seed=seed,
+        validation_metrics=validation, review_queue=queue,
+        annual_origin=annual, licensed_paths=[inside],
+        licensed_root=tmp_path / "licensed",
+    )
+    row = result["gates"].set_index("gate").loc["G1"]
+    assert row["status"] == "fail"
+    assert "origin_basis=" in row["detail"]
+
+
 def _qa_fixture(tmp_path):
     raw = pd.DataFrame(
         {
@@ -111,6 +146,9 @@ def _qa_fixture(tmp_path):
             "shipper_up": [11, 12, 21, 22, 31, 32],
             "origin_country": ["KOR", "JPN"] * 3,
             "year_quarter": ["2024Q1"] * 6,
+            "input_group": ["4001"] * 6,
+            "finished_market": [pd.NA] * 6,
+            "import_route": ["manufacturer_direct"] * 6,
             "value_usd": [10.0] * 6,
             "weight_kg": [1.0] * 6,
             "teu": [0.1] * 6,
@@ -131,13 +169,22 @@ def _qa_fixture(tmp_path):
         }
     )
     finished = raw.drop(columns="shipper_up").assign(
-        import_route=["manufacturer_direct", "unattributed"] * 3
+        input_group=pd.NA,
+        finished_market=["passenger_vehicle", "light_truck_on_highway"] * 3,
+        import_route=["manufacturer_direct", "unattributed"] * 3,
     )
     origin_panels = {}
     for game, source in (("raw", raw), ("finished", finished)):
+        keys = ["manufacturer_parent_id", "origin_country"]
+        if game == "raw":
+            keys.append("input_group")
+        else:
+            keys.extend(["import_route", "finished_market"])
+        keys.append("year_quarter")
         panel = source.groupby(
-            ["manufacturer_parent_id", "origin_country", "year_quarter"],
+            keys,
             as_index=False,
+            dropna=False,
         ).agg(
             value_usd=("value_usd", "sum"),
             weight_kg=("weight_kg", "sum"),
@@ -145,6 +192,7 @@ def _qa_fixture(tmp_path):
             container_count=("container_count", "sum"),
             shipment_equivalent=("shipment_equivalent", "sum"),
         )
+        panel["shipment_count_source_group_sum_nonadditive"] = 1
         origin_panels[game] = panel
     seed = pd.DataFrame(
         {"manufacturer_key": ["MICHELIN", "GOODYEAR", "HANKOOK"],
@@ -155,7 +203,9 @@ def _qa_fixture(tmp_path):
          "direct_output_row_count": [6, 6], "direct_unique_shipment_count": [6, 6],
          "direct_value_usd": [60.0, 60.0],
          "direct_shipment_equivalent": [6.0, 6.0],
-         "isolated_row_count": [6, 6], "isolated_value_usd": [60.0, 60.0],
+         "isolated_row_count": [6, 6],
+         "isolated_unique_shipment_count": [6, 6],
+         "isolated_value_usd": [60.0, 60.0],
          "isolated_shipment_equivalent": [6.0, 6.0], "reconciled": [1, 1]}
     )
     queue = pd.concat(
@@ -261,6 +311,47 @@ def test_zero_denominators_are_explicit_not_applicable_and_do_not_pass(tmp_path)
     assert result["supplier_game_eligible"] is False
 
 
+def test_g7_ignores_zero_value_groups_when_positive_groups_are_covered(tmp_path):
+    raw, finished, panels, seed, validation, queue, annual, inside = _qa_fixture(tmp_path)
+    zero_group = queue.iloc[[0]].copy()
+    zero_group["manufacturer_parent_id"] = 2
+    zero_group["review_group"] = "zero-value-only"
+    zero_group["review_item_id"] = "HASH-ZERO"
+    zero_group["link_identity_value"] = "SYN-ZERO"
+    zero_group["value_usd"] = 0.0
+    zero_group["cumulative_value_share"] = 0.0
+    zero_group["required_top90"] = 0
+    zero_group["review_status"] = "unclear"
+    zero_group["source_note"] = "zero-value group evidence"
+    zero_group["review_complete"] = 1
+    zero_group["main_eligible"] = 0
+    zero_group["confirmed_eligible"] = 0
+    queue = pd.concat([queue, zero_group], ignore_index=True)
+    result = evaluate_gates(
+        chunks={"raw": raw, "finished": finished}, origin_panels=panels,
+        parent_seed=seed, validation_metrics=validation, review_queue=queue,
+        annual_origin=annual, licensed_paths=[inside],
+        licensed_root=tmp_path / "licensed",
+    )
+    assert result["gates"].set_index("gate").loc["G7", "status"] == "pass"
+
+
+def test_g7_is_not_applicable_when_a_required_game_has_no_positive_denominator(
+    tmp_path,
+):
+    raw, finished, panels, seed, validation, queue, annual, inside = _qa_fixture(tmp_path)
+    queue.loc[queue["game"].eq("finished"), "value_usd"] = 0.0
+    queue.loc[queue["game"].eq("finished"), "required_top90"] = 0
+    result = evaluate_gates(
+        chunks={"raw": raw, "finished": finished}, origin_panels=panels,
+        parent_seed=seed, validation_metrics=validation, review_queue=queue,
+        annual_origin=annual, licensed_paths=[inside],
+        licensed_root=tmp_path / "licensed",
+    )
+    assert result["gates"].set_index("gate").loc["G7", "status"] == "not_applicable"
+    assert result["exit_code"] != 0
+
+
 def test_g3_fails_on_zero_value_pit_overlap_occurrence(tmp_path):
     raw, finished, panels, seed, validation, queue, annual, inside = _qa_fixture(tmp_path)
     raw.loc[0, "importer_pit_same_parent_overlap"] = 1
@@ -291,16 +382,18 @@ def test_capture_g0_validation_writes_only_inside_validation_run(tmp_path, monke
     monkeypatch.setattr(qa_module, "validate_output_path", lambda path: Path(path).resolve())
     validation_root = tmp_path / "_validation" / "run1"
     for game in ("raw", "finished"):
+        isolated = output_frame()
+        isolated["shipment_equivalent"] = 0.5
         extract_module.extract_chunk(
             object(), game, "2024Q1",
             {"MICHELIN": 1, "GOODYEAR": 2, "HANKOOK": 3},
             parent_seed_sha256="seed", output_root=validation_root,
-            query_fn=lambda connection, sql: output_frame(),
+            query_fn=lambda connection, sql, frame=isolated: frame.copy(),
         )
     calls = []
     metrics = [
-        pd.DataFrame({"OUTPUT_ROW_COUNT": [1], "UNIQUE_SHIPMENT_COUNT": [1], "VALUE_USD": [12.0], "SHIPMENT_EQUIVALENT": [1.0]}),
-        pd.DataFrame({"OUTPUT_ROW_COUNT": [1], "UNIQUE_SHIPMENT_COUNT": [1], "VALUE_USD": [12.0], "SHIPMENT_EQUIVALENT": [1.0]}),
+        pd.DataFrame({"OUTPUT_ROW_COUNT": [1], "UNIQUE_SHIPMENT_COUNT": [1], "VALUE_USD": [12.0], "SHIPMENT_EQUIVALENT": [0.5]}),
+        pd.DataFrame({"OUTPUT_ROW_COUNT": [1], "UNIQUE_SHIPMENT_COUNT": [1], "VALUE_USD": [12.0], "SHIPMENT_EQUIVALENT": [0.5]}),
     ]
     result = capture_g0_validation(
         object(), "2024Q1", parent_ids={"MICHELIN": 1, "GOODYEAR": 2, "HANKOOK": 3},
@@ -312,6 +405,8 @@ def test_capture_g0_validation_writes_only_inside_validation_run(tmp_path, monke
     saved = pd.read_parquet(result["metrics_path"])
     assert list(saved["game"]) == ["raw", "finished"]
     assert saved["reconciled"].eq(1).all()
+    assert saved["isolated_unique_shipment_count"].eq(1).all()
+    assert saved["direct_shipment_equivalent"].eq(0.5).all()
     assert result["reconciled"] is True
     assert not (tmp_path / "panel_source_quarter_raw.parquet").exists()
 
@@ -362,3 +457,82 @@ def test_all_named_transform_artifacts_satisfy_runtime_contract(game):
     )
     for name, frame in artifacts.items():
         validate_transform_artifact(name, game, frame)
+
+
+@pytest.mark.parametrize("mutation", ["modified", "deleted", "created"])
+def test_transform_manifests_pin_one_manual_review_byte_snapshot(
+    tmp_path, monkeypatch, mutation
+):
+    monkeypatch.setattr(
+        transforms_module, "validate_output_path", lambda path: Path(path).resolve()
+    )
+    monkeypatch.setattr(
+        transforms_module.artifact_io,
+        "validate_output_path",
+        lambda path: Path(path).resolve(),
+    )
+    source = output_frame().assign(
+        shipper_up=10,
+        shipper_companyid=11,
+        shipper_panjiva_id=12,
+        input_group="4001",
+        finished_market="passenger_vehicle",
+        origin_country="KOR",
+    )
+
+    def synthetic_chunks(game, **kwargs):
+        frame = source.copy()
+        frame.attrs["source_manifest_sha256"] = f"manifest-{game}"
+        frame.attrs["source_chunk_sha256"] = (f"chunk-{game}",)
+        return frame
+
+    monkeypatch.setattr(
+        transforms_module, "load_verified_game_chunks", synthetic_chunks
+    )
+    review_path = tmp_path / "review" / "manual_link_reviews.csv"
+    review_path.parent.mkdir(parents=True)
+    reviews = pd.concat(
+        [
+            build_review_items(source, game=game).drop(columns="value_usd").assign(
+                review_status="confirmed", source_note="synthetic human evidence"
+            )
+            for game in ("raw", "finished")
+        ],
+        ignore_index=True,
+    )
+    if mutation != "created":
+        reviews.to_csv(review_path, index=False)
+    for game in ("raw", "finished"):
+        build_game_outputs(
+            game=game,
+            parent_seed_sha256="seed",
+            manufacturer_parent_ids=[101],
+            output_root=tmp_path,
+        )
+    manifests = [
+        json.loads(
+            (tmp_path / "_manifests" / f"transform_{game}.json").read_text()
+        )
+        for game in ("raw", "finished")
+    ]
+    assert manifests[0]["manual_review_snapshot"] == manifests[1][
+        "manual_review_snapshot"
+    ]
+    if mutation == "modified":
+        reviews.assign(source_note="changed after build").to_csv(
+            review_path, index=False
+        )
+    elif mutation == "deleted":
+        review_path.unlink()
+    else:
+        reviews.to_csv(review_path, index=False)
+    current_snapshot, _ = read_manual_review_snapshot(review_path)
+    with pytest.raises(ValueError, match="manual review snapshot"):
+        qa_module._load_transform_outputs(
+            "raw",
+            tmp_path,
+            "seed",
+            source_manifest_sha256="manifest-raw",
+            source_chunk_sha256=["chunk-raw"],
+            manual_review_snapshot=current_snapshot,
+        )

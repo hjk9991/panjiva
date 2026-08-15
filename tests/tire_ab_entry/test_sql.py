@@ -156,6 +156,10 @@ def test_validation_sql_counts_record_level_unique_shipments_and_output_rows(gam
     assert "as output_row_count" in sql
     assert "from finalized" in sql
     assert "count(*) as unique_shipment_count" not in sql
+    assert (
+        "(select count(distinct panjivarecordid) from finalized) "
+        "as unique_shipment_count_nonadditive"
+    ) in sql
 
 
 def test_multi_hs_one_record_allocation_reconciles_to_one_unique_shipment():
@@ -165,7 +169,14 @@ def test_multi_hs_one_record_allocation_reconciles_to_one_unique_shipment():
     assert metrics == {
         "unique_shipment_count": 1,
         "shipment_equivalent": 1.0,
-        "allocation_identity_reconciled": 1,
+    }
+
+
+def test_unique_shipments_and_allocated_equivalents_are_distinct_diagnostics():
+    metrics = reference_validation_identity([("SYN-1", 0.5)])
+    assert metrics == {
+        "unique_shipment_count": 1,
+        "shipment_equivalent": 0.5,
     }
 
 
@@ -279,7 +290,7 @@ def test_supplier_preserving_group_contract_and_diagnostics_are_selected():
     )
     for builder in (build_raw_sql, build_finished_sql):
         sql = normalized(builder(PARENT_IDS, "2024-01-01", "2024-04-01"))
-        final = sql.rsplit("select ", 1)[1]
+        final = sql[sql.rfind("select manufacturer_parent_id") :]
         for column in required + diagnostics:
             assert column in final
         assert "group by manufacturer_parent_id" in final
