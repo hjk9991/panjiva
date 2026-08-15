@@ -2,17 +2,17 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import date
 from numbers import Integral
 import re
-from typing import Iterable
 
 from .config import (
     APPROVED_DATABASE,
     APPROVED_SCHEMA,
-    MANUFACTURER_PARENT_TARGETS,
+    MANUFACTURER_DESCRIPTION_ALIASES,
+    MANUFACTURER_KEYS,
     RAW_GROUPS,
     REVIEWED_ESTIMATION_CODES,
 )
@@ -32,15 +32,13 @@ class DescriptionIdentity:
     column: str
 
 
-def _validate_parent_ids(parent_ids: Iterable[int]) -> tuple[int, int, int]:
-    if not isinstance(parent_ids, Sequence) or isinstance(
-        parent_ids, (str, bytes, bytearray)
-    ):
+def _validate_parent_ids(parent_ids: Mapping[str, int]) -> tuple[int, int, int]:
+    if not isinstance(parent_ids, Mapping) or set(parent_ids) != set(MANUFACTURER_KEYS):
         raise ValueError(
-            "parent_ids must be an ordered sequence of exactly three unique "
-            "positive integral values"
+            "parent_ids must be an exact keyed parent mapping for "
+            "MICHELIN, GOODYEAR, and HANKOOK"
         )
-    values = tuple(parent_ids)
+    values = tuple(parent_ids[key] for key in MANUFACTURER_KEYS)
     valid = (
         len(values) == 3
         and all(
@@ -52,7 +50,7 @@ def _validate_parent_ids(parent_ids: Iterable[int]) -> tuple[int, int, int]:
     )
     if not valid:
         raise ValueError(
-            "parent_ids must contain exactly three unique positive integral values"
+            "keyed parent mapping values must be three unique positive integral IDs"
         )
     return tuple(int(value) for value in values)  # type: ignore[return-value]
 
@@ -101,12 +99,100 @@ def _id_list(parent_ids: tuple[int, int, int]) -> str:
 
 def _reviewed_manufacturer_cte(parent_ids: tuple[int, int, int]) -> str:
     rows = []
-    for order, (parent_id, target) in enumerate(
-        zip(parent_ids, MANUFACTURER_PARENT_TARGETS, strict=True)
+    for order, (key, parent_id) in enumerate(
+        zip(MANUFACTURER_KEYS, parent_ids, strict=True)
     ):
-        pattern = target.lower().replace("'", "''")
-        rows.append(f"({order}, {parent_id}, '%{pattern}%')")
+        for alias in MANUFACTURER_DESCRIPTION_ALIASES[key]:
+            escaped = alias.replace("'", "''")
+            rows.append(f"({order}, {parent_id}, '{escaped}')")
     return ",\n        ".join(rows)
+
+
+def resolve_distinct_candidate(candidates: Iterable[int | None]) -> dict[str, int | None]:
+    """Reference contract for fail-closed xref/PIT candidate resolution."""
+
+    distinct = sorted({int(value) for value in candidates if value is not None})
+    return {
+        "candidate": distinct[0] if len(distinct) == 1 else None,
+        "distinct_candidate_count": len(distinct),
+        "ambiguous": int(len(distinct) > 1),
+    }
+
+
+def resolve_ownership_sides(
+    *,
+    importer_parent_candidates: Iterable[int | None],
+    shipper_parent_candidates: Iterable[int | None],
+) -> dict[str, dict[str, int | None]]:
+    """Resolve side-specific PIT candidates without cross-product coupling."""
+
+    return {
+        "importer": resolve_distinct_candidate(importer_parent_candidates),
+        "shipper": resolve_distinct_candidate(shipper_parent_candidates),
+    }
+
+
+def reference_hs6_allocation(
+    full_codes: Iterable[str], *, value_usd: float
+) -> dict[str, dict[str, float | int]]:
+    """Reference the distinct-HS6 allocation and finished-code review contract."""
+
+    by_hs6: dict[str, set[str]] = {}
+    for code in full_codes:
+        normalized = str(code).replace(".", "")
+        if len(normalized) >= 6:
+            by_hs6.setdefault(normalized[:6], set()).add(normalized)
+    if not by_hs6:
+        return {}
+    allocation = 1.0 / len(by_hs6)
+    reviewed = set(REVIEWED_ESTIMATION_CODES)
+    output: dict[str, dict[str, float | int]] = {}
+    for hs6 in sorted(by_hs6):
+        codes = by_hs6[hs6]
+        reviewed_count = len(codes & reviewed)
+        unreviewed_count = len(codes) - reviewed_count
+        output[hs6] = {
+            "distinct_full_code_count": len(codes),
+            "reviewed_full_code_count": reviewed_count,
+            "unreviewed_full_code_count": unreviewed_count,
+            "mixed_review": int(reviewed_count > 0 and unreviewed_count > 0),
+            "allocation_factor": allocation,
+            "allocated_value_usd": value_usd * allocation,
+            "hs_eligible": int(reviewed_count == len(codes) and reviewed_count > 0),
+        }
+    return output
+
+
+def reference_raw_route(
+    *,
+    importer_is_reviewed: bool,
+    importer_up: int | None,
+    shipper_up: int | None,
+    relationship: str,
+    identity_ambiguous: bool,
+    historical_backcast: bool,
+    hs_eligible: bool,
+) -> dict[str, str | int]:
+    """Reference raw-route and main-versus-sensitivity eligibility semantics."""
+
+    route = "manufacturer_direct" if importer_is_reviewed else "unattributed"
+    if shipper_up is None:
+        supplier = "unknown_supplier"
+    elif importer_up == shipper_up and relationship in {"self", "parent_sub", "sibling"}:
+        supplier = "intragroup_supplier"
+    elif relationship == "arms_length" and importer_up != shipper_up:
+        supplier = "external_supplier"
+    else:
+        supplier = "unknown_supplier"
+    sensitivity = int(
+        importer_is_reviewed and hs_eligible and not identity_ambiguous
+    )
+    return {
+        "import_route": route,
+        "supplier_relationship": supplier,
+        "estimation_eligible": int(sensitivity == 1 and not historical_backcast),
+        "sensitivity_eligible": sensitivity,
+    }
 
 
 def _base_ctes(
@@ -122,7 +208,7 @@ def _base_ctes(
     reviewed_codes = ", ".join(repr(code) for code in REVIEWED_ESTIMATION_CODES)
     return f"""
 reviewed_manufacturers(
-    manufacturer_order, manufacturer_parent_id, brand_pattern
+    manufacturer_order, manufacturer_parent_id, description_alias
 ) as (
     select column1, column2, column3
     from values {_reviewed_manufacturer_cte(parent_ids)}
@@ -186,8 +272,11 @@ hs6_codes as (
            hs6,
            listagg(distinct hs_full_code, '|')
                within group (order by hs_full_code) as hs_full_code,
-           max(iff(hs_full_code in ({reviewed_codes}), 1, 0))
-               as reviewed_code_match
+           count(*) as distinct_full_code_count,
+           sum(iff(hs_full_code in ({reviewed_codes}), 1, 0))
+               as reviewed_full_code_count,
+           sum(iff(hs_full_code not in ({reviewed_codes}), 1, 0))
+               as unreviewed_full_code_count
     from hs_codes
     group by panjivaRecordId, hs6
 ),
@@ -195,74 +284,133 @@ hs_with_counts as (
     select panjivaRecordId,
            hs_full_code,
            hs6,
-           reviewed_code_match,
+           distinct_full_code_count,
+           reviewed_full_code_count,
+           unreviewed_full_code_count,
+           iff(
+               reviewed_full_code_count > 0
+               and unreviewed_full_code_count > 0,
+               1,
+               0
+           ) as mixed_review,
            count(*) over (partition by panjivaRecordId) as n_hs6
     from hs6_codes
 ),
-xref_ranked as (
-    select identifierValue,
-           companyId,
-           count(*) over (partition by identifierValue) as xref_match_count,
-           row_number() over (
-               partition by identifierValue order by companyId
-           ) as xref_rank
+xref_distinct as (
+    select distinct identifierValue, companyId
     from {_qualified('panjivaCompanyCrossRef')}
-    where activeFlag = 1 and identifierValue is not null
+    where activeFlag = 1
+      and identifierValue is not null
+      and companyId is not null
 ),
-xref as (
-    select identifierValue, companyId, xref_match_count
-    from xref_ranked
-    where xref_rank = 1
+xref_resolved as (
+    select identifierValue,
+           iff(count(*) = 1, min(companyId), null) as companyId,
+           count(*) as distinct_company_candidate_count,
+           iff(count(*) > 1, 1, 0) as xref_ambiguous
+    from xref_distinct
+    group by identifierValue
 ),
-pit_window as (
-    select companyId, ultimateParentCompanyId, startDate, endDate
-    from {_qualified('ciqCompanyUltimateParentPIT')}
-    where startDate < '{end}' and endDate >= '{start}'
-),
-ownership_candidates as (
+identified as (
     select b.*,
            xc.companyId as importer_companyid,
            xs.companyId as shipper_companyid,
-           xc.xref_match_count as importer_xref_match_count,
-           xs.xref_match_count as shipper_xref_match_count,
-           pc.ultimateParentCompanyId as importer_up_pit,
-           ps.ultimateParentCompanyId as shipper_up_pit,
+           coalesce(xc.distinct_company_candidate_count, 0)
+               as importer_xref_distinct_candidate_count,
+           coalesce(xs.distinct_company_candidate_count, 0)
+               as shipper_xref_distinct_candidate_count,
+           coalesce(xc.xref_ambiguous, 0) as importer_xref_ambiguous,
+           coalesce(xs.xref_ambiguous, 0) as shipper_xref_ambiguous
+    from base b
+    left join xref_resolved xc on xc.identifierValue = b.conPanjivaId
+    left join xref_resolved xs on xs.identifierValue = b.shpPanjivaId
+),
+importer_pit_distinct as (
+    select distinct i.panjivaRecordId, p.ultimateParentCompanyId
+    from identified i
+    join {_qualified('ciqCompanyUltimateParentPIT')} p
+      on p.companyId = i.importer_companyid
+     and i.arrivalDate >= p.startDate
+     and i.arrivalDate <= p.endDate
+    where p.ultimateParentCompanyId is not null
+),
+importer_pit_resolved as (
+    select panjivaRecordId,
+           iff(count(*) = 1, min(ultimateParentCompanyId), null)
+               as importer_up_pit,
+           count(*) as importer_pit_distinct_parent_candidate_count,
+           iff(count(*) > 1, 1, 0) as importer_pit_ambiguous
+    from importer_pit_distinct
+    group by panjivaRecordId
+),
+shipper_pit_distinct as (
+    select distinct i.panjivaRecordId, p.ultimateParentCompanyId
+    from identified i
+    join {_qualified('ciqCompanyUltimateParentPIT')} p
+      on p.companyId = i.shipper_companyid
+     and i.arrivalDate >= p.startDate
+     and i.arrivalDate <= p.endDate
+    where p.ultimateParentCompanyId is not null
+),
+shipper_pit_resolved as (
+    select panjivaRecordId,
+           iff(count(*) = 1, min(ultimateParentCompanyId), null)
+               as shipper_up_pit,
+           count(*) as shipper_pit_distinct_parent_candidate_count,
+           iff(count(*) > 1, 1, 0) as shipper_pit_ambiguous
+    from shipper_pit_distinct
+    group by panjivaRecordId
+),
+ownership_inputs as (
+    select i.*,
+           ip.importer_up_pit,
+           sp.shipper_up_pit,
+           coalesce(ip.importer_pit_distinct_parent_candidate_count, 0)
+               as importer_pit_distinct_parent_candidate_count,
+           coalesce(sp.shipper_pit_distinct_parent_candidate_count, 0)
+               as shipper_pit_distinct_parent_candidate_count,
+           coalesce(ip.importer_pit_ambiguous, 0) as importer_pit_ambiguous,
+           coalesce(sp.shipper_pit_ambiguous, 0) as shipper_pit_ambiguous,
            cc.ultimateParentCompanyId as importer_up_current,
            cs.ultimateParentCompanyId as shipper_up_current
-    from base b
-    left join xref xc on xc.identifierValue = b.conPanjivaId
-    left join xref xs on xs.identifierValue = b.shpPanjivaId
-    left join pit_window pc
-      on pc.companyId = xc.companyId
-     and b.arrivalDate >= pc.startDate
-     and b.arrivalDate <= pc.endDate
-    left join pit_window ps
-      on ps.companyId = xs.companyId
-     and b.arrivalDate >= ps.startDate
-     and b.arrivalDate <= ps.endDate
+    from identified i
+    left join importer_pit_resolved ip
+      on ip.panjivaRecordId = i.panjivaRecordId
+    left join shipper_pit_resolved sp
+      on sp.panjivaRecordId = i.panjivaRecordId
     left join {_qualified('ciqCompanyUltimateParent')} cc
-      on cc.companyId = xc.companyId
+      on cc.companyId = i.importer_companyid
     left join {_qualified('ciqCompanyUltimateParent')} cs
-      on cs.companyId = xs.companyId
+      on cs.companyId = i.shipper_companyid
 ),
-ownership_ranked as (
+ownership_mapped as (
     select o.*,
-           count(*) over (partition by panjivaRecordId) as ownership_join_rows,
-           row_number() over (
-               partition by panjivaRecordId
-               order by importer_up_pit,
-                        shipper_up_pit,
-                        importer_up_current,
-                        shipper_up_current
-           ) as ownership_rank
-    from ownership_candidates o
-),
-ownership as (
-    select o.*,
-           coalesce(importer_up_pit, importer_up_current, importer_companyid)
-               as importer_up,
-           coalesce(shipper_up_pit, shipper_up_current, shipper_companyid)
-               as shipper_up,
+           iff(
+               importer_xref_ambiguous = 1 or importer_pit_ambiguous = 1,
+               null,
+               coalesce(importer_up_pit, importer_up_current, importer_companyid)
+           ) as importer_up,
+           iff(
+               shipper_xref_ambiguous = 1 or shipper_pit_ambiguous = 1,
+               null,
+               coalesce(shipper_up_pit, shipper_up_current, shipper_companyid)
+           ) as shipper_up,
+           case
+               when importer_xref_ambiguous = 1 or importer_pit_ambiguous = 1
+                   then 'unresolved'
+               when importer_up_pit is not null then 'pit'
+               when importer_up_current is not null then 'current_parent_fallback'
+               when importer_companyid is not null then 'self_fallback'
+               else 'unresolved'
+           end as importer_ownership_source,
+           case
+               when shipper_xref_ambiguous = 1 or shipper_pit_ambiguous = 1
+                   then 'unresolved'
+               when shipper_up_pit is not null then 'pit'
+               when shipper_up_current is not null then 'current_parent_fallback'
+               when shipper_companyid is not null then 'self_fallback'
+               else 'unresolved'
+           end as shipper_ownership_source,
            iff(importer_up_pit is null and importer_up_current is not null, 1, 0)
                as importer_current_parent_fallback_flag,
            iff(shipper_up_pit is null and shipper_up_current is not null, 1, 0)
@@ -273,6 +421,22 @@ ownership as (
            iff(shipper_up_pit is null and shipper_up_current is null
                and shipper_companyid is not null, 1, 0)
                as shipper_self_fallback_flag,
+           iff(
+               importer_up_pit is null
+               and (importer_up_current is not null or importer_companyid is not null),
+               1,
+               0
+           ) as importer_historical_backcast,
+           iff(
+               shipper_up_pit is null
+               and (shipper_up_current is not null or shipper_companyid is not null),
+               1,
+               0
+           ) as shipper_historical_backcast
+    from ownership_inputs o
+),
+ownership as (
+    select o.*,
            case
                when shipper_companyid is null and importer_companyid is null
                    then 'unmatched_both'
@@ -289,8 +453,7 @@ ownership as (
                     ) then 'sibling'
                else 'arms_length'
            end as relationship
-    from ownership_ranked o
-    where ownership_rank = 1
+    from ownership_mapped o
 )""".strip()
 
 
@@ -309,11 +472,26 @@ def _raw_scope_cte() -> str:
         )
     return f"""
 hs_scope as (
-    select h.*,
+    select h.panjivaRecordId,
+           h.hs_full_code,
+           h.hs6,
+           h.distinct_full_code_count,
+           h.n_hs6,
            case {' '.join(group_cases)} end as input_group,
            null as finished_market,
            case {' '.join(review_cases)} end as hs_review_status,
-           case {' '.join(eligible_cases)} else 0 end as hs_eligible
+           case {' '.join(eligible_cases)} else 0 end as hs_eligible,
+           iff(
+               case {' '.join(eligible_cases)} else 0 end = 1,
+               h.distinct_full_code_count,
+               0
+           ) as reviewed_full_code_count,
+           iff(
+               case {' '.join(eligible_cases)} else 0 end = 0,
+               h.distinct_full_code_count,
+               0
+           ) as unreviewed_full_code_count,
+           0 as mixed_review
     from hs_with_counts h
     where {' or '.join(predicates)}
 ),
@@ -326,6 +504,10 @@ allocated as (
            h.finished_market,
            h.hs_review_status,
            h.hs_eligible,
+           h.distinct_full_code_count,
+           h.reviewed_full_code_count,
+           h.unreviewed_full_code_count,
+           h.mixed_review,
            1.0::double / n_hs6 as allocation_factor
     from ownership o
     join hs_scope h on h.panjivaRecordId = o.panjivaRecordId
@@ -341,24 +523,60 @@ attributed as (
            null as description_candidate_parent_id,
            0 as description_match_count,
            0 as description_ambiguous,
-           'importer_parent' as attribution_source
+           null as description_matched_alias,
+           0 as description_alias_count,
+           iff(
+               importer_up in ({{id_list}}),
+               'importer_parent',
+               'unresolved_review'
+           ) as attribution_source
     from allocated a
     where importer_up in ({{id_list}})
+       or importer_xref_ambiguous = 1
+       or importer_pit_ambiguous = 1
 ),
 routed as (
     select a.*,
            case
-               when importer_up = shipper_up
-                and relationship in ('self', 'parent_sub', 'sibling')
+               when manufacturer_parent_id is not null
                    then 'manufacturer_direct'
                else 'unattributed'
-           end as import_route
+           end as import_route,
+           case
+               when shipper_up is null then 'unknown_supplier'
+               when importer_up = shipper_up
+                and relationship in ('self', 'parent_sub', 'sibling')
+                   then 'intragroup_supplier'
+               when importer_up <> shipper_up and relationship = 'arms_length'
+                   then 'external_supplier'
+               else 'unknown_supplier'
+           end as supplier_relationship
     from attributed a
 ),
 finalized as (
     select r.*,
-           iff(hs_eligible = 1 and import_route = 'manufacturer_direct', 1, 0)
-               as estimation_eligible
+           iff(
+               hs_eligible = 1
+               and import_route = 'manufacturer_direct'
+               and importer_xref_ambiguous = 0
+               and shipper_xref_ambiguous = 0
+               and importer_pit_ambiguous = 0
+               and shipper_pit_ambiguous = 0,
+               1,
+               0
+           ) as sensitivity_eligible,
+           iff(
+               hs_eligible = 1
+               and import_route = 'manufacturer_direct'
+               and importer_xref_ambiguous = 0
+               and shipper_xref_ambiguous = 0
+               and importer_pit_ambiguous = 0
+               and shipper_pit_ambiguous = 0
+               and importer_historical_backcast = 0
+               and shipper_historical_backcast = 0,
+               1,
+               0
+           ) as estimation_eligible
     from routed r
 )""".strip()
 
@@ -373,24 +591,39 @@ description_enriched as (
            0 as description_candidate,
            null as description_candidate_parent_id,
            0 as description_match_count,
-           0 as description_ambiguous
+           0 as description_ambiguous,
+           null as description_matched_alias,
+           0 as description_alias_count
     from allocated a
 )""".strip()
     else:
         description_ctes = """
-description_matches as (
-    select o.panjivaRecordId,
-           iff(
-               count(distinct rm.manufacturer_parent_id) = 1,
-               min(rm.manufacturer_parent_id),
-               null
-           ) as description_candidate_parent_id,
-           count(distinct rm.manufacturer_parent_id) as description_match_count
+description_match_rows as (
+    select distinct o.panjivaRecordId,
+           rm.manufacturer_parent_id,
+           rm.description_alias
     from allocated o
     join reviewed_manufacturers rm
       on coalesce(o.importer_up, -1) not in ({id_list})
      and coalesce(o.shipper_up, -1) not in ({id_list})
-     and lower(o.shipment_description) like rm.brand_pattern
+     and lower(o.shipment_description) like
+         '%' || rm.description_alias || '%'
+),
+description_matches as (
+    select o.panjivaRecordId,
+           iff(
+               count(distinct o.manufacturer_parent_id) = 1,
+               min(o.manufacturer_parent_id),
+               null
+           ) as description_candidate_parent_id,
+           count(distinct o.manufacturer_parent_id) as description_match_count,
+           iff(
+               count(distinct o.description_alias) = 1,
+               min(o.description_alias),
+               null
+           ) as description_matched_alias,
+           count(distinct o.description_alias) as description_alias_count
+    from description_match_rows o
     group by o.panjivaRecordId
 ),
 description_enriched as (
@@ -398,7 +631,13 @@ description_enriched as (
            iff(dm.description_match_count > 0, 1, 0) as description_candidate,
            dm.description_candidate_parent_id,
            coalesce(dm.description_match_count, 0) as description_match_count,
-           iff(dm.description_match_count > 1, 1, 0) as description_ambiguous
+           iff(
+               dm.description_match_count > 1 or dm.description_alias_count > 1,
+               1,
+               0
+           ) as description_ambiguous,
+           dm.description_matched_alias,
+           coalesce(dm.description_alias_count, 0) as description_alias_count
     from allocated a
     left join description_matches dm
       on dm.panjivaRecordId = a.panjivaRecordId
@@ -408,18 +647,27 @@ hs_scope as (
     select h.*,
            null as input_group,
            case
-               when reviewed_code_match = 1 and h.hs6 = '401110'
+               when reviewed_full_code_count = distinct_full_code_count
+                and h.hs6 = '401110'
                    then 'passenger_vehicle'
-               when reviewed_code_match = 1 and h.hs6 = '401120'
+               when reviewed_full_code_count = distinct_full_code_count
+                and h.hs6 = '401120'
                    then 'light_truck_on_highway'
                else 'broad_unreviewed'
            end as finished_market,
+           case
+               when reviewed_full_code_count > 0
+                and unreviewed_full_code_count > 0 then 'mixed_review'
+               when reviewed_full_code_count = distinct_full_code_count
+                and distinct_full_code_count > 0 then 'reviewed_estimation'
+               else 'broad_unreviewed'
+           end as hs_review_status,
            iff(
-               reviewed_code_match = 1,
-               'reviewed_estimation',
-               'broad_unreviewed'
-           ) as hs_review_status,
-           reviewed_code_match as hs_eligible
+               reviewed_full_code_count = distinct_full_code_count
+               and distinct_full_code_count > 0,
+               1,
+               0
+           ) as hs_eligible
     from hs_with_counts h
     where h.hs6 in ('401110', '401120')
 ),
@@ -432,6 +680,10 @@ allocated as (
            h.finished_market,
            h.hs_review_status,
            h.hs_eligible,
+           h.distinct_full_code_count,
+           h.reviewed_full_code_count,
+           h.unreviewed_full_code_count,
+           h.mixed_review,
            1.0::double / n_hs6 as allocation_factor
     from ownership o
     join hs_scope h on h.panjivaRecordId = o.panjivaRecordId
@@ -482,6 +734,15 @@ routed as (
                    then 'distributor_intermediated'
                else 'unattributed'
            end as import_route
+           ,case
+               when shipper_up is null then 'unknown_supplier'
+               when importer_up = shipper_up
+                and relationship in ('self', 'parent_sub', 'sibling')
+                   then 'intragroup_supplier'
+               when importer_up <> shipper_up and relationship = 'arms_length'
+                   then 'external_supplier'
+               else 'unknown_supplier'
+           end as supplier_relationship
     from attributed a
 ),
 finalized as (
@@ -490,6 +751,28 @@ finalized as (
                hs_eligible = 1
                and manufacturer_conflict = 0
                and description_candidate = 0
+               and description_ambiguous = 0
+               and importer_xref_ambiguous = 0
+               and shipper_xref_ambiguous = 0
+               and importer_pit_ambiguous = 0
+               and shipper_pit_ambiguous = 0
+               and import_route in (
+                   'manufacturer_direct', 'distributor_intermediated'
+               ),
+               1,
+               0
+           ) as sensitivity_eligible,
+           iff(
+               hs_eligible = 1
+               and manufacturer_conflict = 0
+               and description_candidate = 0
+               and description_ambiguous = 0
+               and importer_xref_ambiguous = 0
+               and shipper_xref_ambiguous = 0
+               and importer_pit_ambiguous = 0
+               and shipper_pit_ambiguous = 0
+               and importer_historical_backcast = 0
+               and shipper_historical_backcast = 0
                and import_route in (
                    'manufacturer_direct', 'distributor_intermediated'
                ),
@@ -498,6 +781,46 @@ finalized as (
            ) as estimation_eligible
     from routed r
 )""".strip()
+
+
+def _diagnostic_aggregates() -> str:
+    conditions = {
+        "manufacturer_conflict": "manufacturer_conflict = 1",
+        "importer_xref_unmatched": "importer_xref_distinct_candidate_count = 0",
+        "shipper_xref_unmatched": "shipper_xref_distinct_candidate_count = 0",
+        "importer_xref_ambiguous": "importer_xref_ambiguous = 1",
+        "shipper_xref_ambiguous": "shipper_xref_ambiguous = 1",
+        "importer_pit_ambiguous": "importer_pit_ambiguous = 1",
+        "shipper_pit_ambiguous": "shipper_pit_ambiguous = 1",
+        "importer_current_parent_fallback": (
+            "importer_current_parent_fallback_flag = 1"
+        ),
+        "shipper_current_parent_fallback": (
+            "shipper_current_parent_fallback_flag = 1"
+        ),
+        "importer_self_fallback": "importer_self_fallback_flag = 1",
+        "shipper_self_fallback": "shipper_self_fallback_flag = 1",
+        "importer_historical_backcast": "importer_historical_backcast = 1",
+        "shipper_historical_backcast": "shipper_historical_backcast = 1",
+        "description_candidate": "description_candidate = 1",
+        "description_ambiguous": "description_ambiguous = 1",
+        "unattributed": "import_route = 'unattributed'",
+        "hs_review": "hs_eligible = 0",
+        "main_ineligible": "estimation_eligible = 0",
+    }
+    expressions = []
+    for name, condition in conditions.items():
+        expressions.extend(
+            (
+                f"count(distinct iff({condition}, panjivaRecordId, null))\n"
+                f"           as {name}_shipment_count_nonadditive",
+                f"sum(iff({condition}, allocation_factor, 0))\n"
+                f"           as {name}_shipment_equivalent",
+                f"sum(iff({condition}, value_usd * allocation_factor, 0))\n"
+                f"           as {name}_value_usd",
+            )
+        )
+    return ",\n       ".join(expressions)
 
 
 def _aggregate_select() -> str:
@@ -516,11 +839,31 @@ def _aggregate_select() -> str:
         "finished_market",
         "hs_review_status",
         "hs_eligible",
+        "distinct_full_code_count",
+        "reviewed_full_code_count",
+        "unreviewed_full_code_count",
+        "mixed_review",
         "description_candidate_parent_id",
         "description_match_count",
         "description_ambiguous",
+        "description_matched_alias",
+        "description_alias_count",
+        "importer_xref_distinct_candidate_count",
+        "shipper_xref_distinct_candidate_count",
+        "importer_xref_ambiguous",
+        "shipper_xref_ambiguous",
+        "importer_pit_distinct_parent_candidate_count",
+        "shipper_pit_distinct_parent_candidate_count",
+        "importer_pit_ambiguous",
+        "shipper_pit_ambiguous",
+        "importer_ownership_source",
+        "shipper_ownership_source",
+        "importer_historical_backcast",
+        "shipper_historical_backcast",
         "relationship",
         "import_route",
+        "supplier_relationship",
+        "sensitivity_eligible",
         "estimation_eligible",
     )
     group_by = ",\n         ".join(group_columns)
@@ -539,87 +882,50 @@ select manufacturer_parent_id,
        finished_market,
        hs_review_status,
        hs_eligible,
+       distinct_full_code_count,
+       reviewed_full_code_count,
+       unreviewed_full_code_count,
+       mixed_review,
        description_candidate_parent_id,
        description_match_count,
        description_ambiguous,
+       description_matched_alias,
+       description_alias_count,
+       importer_xref_distinct_candidate_count,
+       shipper_xref_distinct_candidate_count,
+       importer_xref_ambiguous,
+       shipper_xref_ambiguous,
+       importer_pit_distinct_parent_candidate_count,
+       shipper_pit_distinct_parent_candidate_count,
+       importer_pit_ambiguous,
+       shipper_pit_ambiguous,
+       importer_ownership_source,
+       shipper_ownership_source,
+       importer_historical_backcast,
+       shipper_historical_backcast,
        relationship,
        import_route,
+       supplier_relationship,
+       sensitivity_eligible,
        estimation_eligible,
-       count(distinct panjivaRecordId) as shipment_count,
+       count(distinct panjivaRecordId) as shipment_count_nonadditive,
+       count(distinct panjivaRecordId)
+           as shipment_count_compatibility_nonadditive,
        sum(allocation_factor) as shipment_equivalent,
        sum(value_usd * allocation_factor) as value_usd,
        sum(weight_kg * allocation_factor) as weight_kg,
        sum(teu * allocation_factor) as teu,
        sum(container_count * allocation_factor) as container_count,
        max(manufacturer_conflict) as manufacturer_conflict,
-       count(distinct iff(manufacturer_conflict = 1, panjivaRecordId, null))
-           as manufacturer_conflict_shipment_count,
-       sum(iff(manufacturer_conflict = 1, value_usd * allocation_factor, 0))
-           as manufacturer_conflict_value_usd,
-       count(distinct iff(importer_xref_match_count > 1, panjivaRecordId, null))
-           as importer_xref_conflict_shipment_count,
-       sum(iff(importer_xref_match_count > 1, value_usd * allocation_factor, 0))
-           as importer_xref_conflict_value_usd,
-       count(distinct iff(shipper_xref_match_count > 1, panjivaRecordId, null))
-           as shipper_xref_conflict_shipment_count,
-       sum(iff(shipper_xref_match_count > 1, value_usd * allocation_factor, 0))
-           as shipper_xref_conflict_value_usd,
-       count(distinct iff(importer_companyid is null, panjivaRecordId, null))
-           as importer_xref_unmatched_shipment_count,
-       sum(iff(importer_companyid is null, value_usd * allocation_factor, 0))
-           as importer_xref_unmatched_value_usd,
-       count(distinct iff(shipper_companyid is null, panjivaRecordId, null))
-           as shipper_xref_unmatched_shipment_count,
-       sum(iff(shipper_companyid is null, value_usd * allocation_factor, 0))
-           as shipper_xref_unmatched_value_usd,
-       count(distinct iff(ownership_join_rows > 1, panjivaRecordId, null))
-           as pit_overlap_shipment_count,
-       sum(iff(ownership_join_rows > 1, value_usd * allocation_factor, 0))
-           as pit_overlap_value_usd,
-       count(distinct iff(
-           importer_current_parent_fallback_flag = 1, panjivaRecordId, null
-       )) as importer_current_parent_fallback_shipment_count,
-       sum(iff(
-           importer_current_parent_fallback_flag = 1,
-           value_usd * allocation_factor,
-           0
-       )) as importer_current_parent_fallback_value_usd,
-       count(distinct iff(
-           shipper_current_parent_fallback_flag = 1, panjivaRecordId, null
-       )) as shipper_current_parent_fallback_shipment_count,
-       sum(iff(
-           shipper_current_parent_fallback_flag = 1,
-           value_usd * allocation_factor,
-           0
-       )) as shipper_current_parent_fallback_value_usd,
-       count(distinct iff(
-           importer_self_fallback_flag = 1, panjivaRecordId, null
-       )) as importer_self_fallback_shipment_count,
-       sum(iff(
-           importer_self_fallback_flag = 1, value_usd * allocation_factor, 0
-       )) as importer_self_fallback_value_usd,
-       count(distinct iff(
-           shipper_self_fallback_flag = 1, panjivaRecordId, null
-       )) as shipper_self_fallback_shipment_count,
-       sum(iff(
-           shipper_self_fallback_flag = 1, value_usd * allocation_factor, 0
-       )) as shipper_self_fallback_value_usd,
        max(description_candidate) as description_candidate,
-       count(distinct iff(description_candidate = 1, panjivaRecordId, null))
-           as description_review_shipment_count,
-       sum(iff(description_candidate = 1, value_usd * allocation_factor, 0))
-           as description_review_value_usd,
-       count(distinct iff(import_route = 'unattributed', panjivaRecordId, null))
-           as unattributed_shipment_count,
-       sum(iff(import_route = 'unattributed', value_usd * allocation_factor, 0))
-           as unattributed_value_usd
+       {_diagnostic_aggregates()}
 from finalized
 group by {group_by}
 """.strip()
 
 
 def build_raw_sql(
-    parent_ids: Iterable[int],
+    parent_ids: Mapping[str, int],
     date_start: str,
     date_end: str,
     description_column: DescriptionIdentity | None = None,
@@ -642,7 +948,7 @@ def build_raw_sql(
 
 
 def build_finished_sql(
-    parent_ids: Iterable[int],
+    parent_ids: Mapping[str, int],
     date_start: str,
     date_end: str,
     description_column: DescriptionIdentity | None = None,

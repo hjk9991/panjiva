@@ -60,6 +60,14 @@ MANUFACTURER_PARENT_TARGETS = (
     "Goodyear",
     "Hankook Tire & Technology",
 )
+MANUFACTURER_KEYS = ("MICHELIN", "GOODYEAR", "HANKOOK")
+MANUFACTURER_DESCRIPTION_ALIASES = MappingProxyType(
+    {
+        "MICHELIN": ("michelin", "bf goodrich", "bfgoodrich"),
+        "GOODYEAR": ("goodyear", "dunlop", "cooper tire"),
+        "HANKOOK": ("hankook", "laufenn"),
+    }
+)
 
 
 def _quarter_index(label: str) -> int:
