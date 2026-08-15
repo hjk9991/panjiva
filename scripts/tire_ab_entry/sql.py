@@ -132,6 +132,24 @@ def resolve_ownership_sides(
     }
 
 
+def resolve_pit_intervals(
+    intervals: Iterable[tuple[int, str, str]],
+) -> dict[str, int | None]:
+    """Resolve distinct PIT intervals while retaining same-parent overlaps."""
+
+    distinct_intervals = set(intervals)
+    parents = {parent_id for parent_id, _, _ in distinct_intervals}
+    parent_count = len(parents)
+    interval_count = len(distinct_intervals)
+    return {
+        "candidate": min(parents) if parent_count == 1 else None,
+        "distinct_interval_match_count": interval_count,
+        "distinct_parent_candidate_count": parent_count,
+        "ambiguous": int(parent_count > 1),
+        "same_parent_overlap": int(interval_count > 1 and parent_count == 1),
+    }
+
+
 def reference_hs6_allocation(
     full_codes: Iterable[str], *, value_usd: float
 ) -> dict[str, dict[str, float | int]]:
@@ -325,8 +343,11 @@ identified as (
     left join xref_resolved xc on xc.identifierValue = b.conPanjivaId
     left join xref_resolved xs on xs.identifierValue = b.shpPanjivaId
 ),
-importer_pit_distinct as (
-    select distinct i.panjivaRecordId, p.ultimateParentCompanyId
+importer_pit_interval_matches as (
+    select distinct i.panjivaRecordId,
+           p.ultimateParentCompanyId,
+           p.startDate,
+           p.endDate
     from identified i
     join {_qualified('ciqCompanyUltimateParentPIT')} p
       on p.companyId = i.importer_companyid
@@ -336,15 +357,31 @@ importer_pit_distinct as (
 ),
 importer_pit_resolved as (
     select panjivaRecordId,
-           iff(count(*) = 1, min(ultimateParentCompanyId), null)
+           iff(
+               count(distinct ultimateParentCompanyId) = 1,
+               min(ultimateParentCompanyId),
+               null
+           )
                as importer_up_pit,
-           count(*) as importer_pit_distinct_parent_candidate_count,
-           iff(count(*) > 1, 1, 0) as importer_pit_ambiguous
-    from importer_pit_distinct
+           count(*) as importer_pit_distinct_interval_match_count,
+           count(distinct ultimateParentCompanyId)
+               as importer_pit_distinct_parent_candidate_count,
+           iff(count(distinct ultimateParentCompanyId) > 1, 1, 0)
+               as importer_pit_ambiguous,
+           iff(
+               count(*) > 1
+               and count(distinct ultimateParentCompanyId) = 1,
+               1,
+               0
+           ) as importer_pit_same_parent_overlap
+    from importer_pit_interval_matches
     group by panjivaRecordId
 ),
-shipper_pit_distinct as (
-    select distinct i.panjivaRecordId, p.ultimateParentCompanyId
+shipper_pit_interval_matches as (
+    select distinct i.panjivaRecordId,
+           p.ultimateParentCompanyId,
+           p.startDate,
+           p.endDate
     from identified i
     join {_qualified('ciqCompanyUltimateParentPIT')} p
       on p.companyId = i.shipper_companyid
@@ -354,23 +391,44 @@ shipper_pit_distinct as (
 ),
 shipper_pit_resolved as (
     select panjivaRecordId,
-           iff(count(*) = 1, min(ultimateParentCompanyId), null)
+           iff(
+               count(distinct ultimateParentCompanyId) = 1,
+               min(ultimateParentCompanyId),
+               null
+           )
                as shipper_up_pit,
-           count(*) as shipper_pit_distinct_parent_candidate_count,
-           iff(count(*) > 1, 1, 0) as shipper_pit_ambiguous
-    from shipper_pit_distinct
+           count(*) as shipper_pit_distinct_interval_match_count,
+           count(distinct ultimateParentCompanyId)
+               as shipper_pit_distinct_parent_candidate_count,
+           iff(count(distinct ultimateParentCompanyId) > 1, 1, 0)
+               as shipper_pit_ambiguous,
+           iff(
+               count(*) > 1
+               and count(distinct ultimateParentCompanyId) = 1,
+               1,
+               0
+           ) as shipper_pit_same_parent_overlap
+    from shipper_pit_interval_matches
     group by panjivaRecordId
 ),
 ownership_inputs as (
     select i.*,
            ip.importer_up_pit,
            sp.shipper_up_pit,
+           coalesce(ip.importer_pit_distinct_interval_match_count, 0)
+               as importer_pit_distinct_interval_match_count,
+           coalesce(sp.shipper_pit_distinct_interval_match_count, 0)
+               as shipper_pit_distinct_interval_match_count,
            coalesce(ip.importer_pit_distinct_parent_candidate_count, 0)
                as importer_pit_distinct_parent_candidate_count,
            coalesce(sp.shipper_pit_distinct_parent_candidate_count, 0)
                as shipper_pit_distinct_parent_candidate_count,
            coalesce(ip.importer_pit_ambiguous, 0) as importer_pit_ambiguous,
            coalesce(sp.shipper_pit_ambiguous, 0) as shipper_pit_ambiguous,
+           coalesce(ip.importer_pit_same_parent_overlap, 0)
+               as importer_pit_same_parent_overlap,
+           coalesce(sp.shipper_pit_same_parent_overlap, 0)
+               as shipper_pit_same_parent_overlap,
            cc.ultimateParentCompanyId as importer_up_current,
            cs.ultimateParentCompanyId as shipper_up_current
     from identified i
@@ -792,6 +850,12 @@ def _diagnostic_aggregates() -> str:
         "shipper_xref_ambiguous": "shipper_xref_ambiguous = 1",
         "importer_pit_ambiguous": "importer_pit_ambiguous = 1",
         "shipper_pit_ambiguous": "shipper_pit_ambiguous = 1",
+        "importer_pit_same_parent_overlap": (
+            "importer_pit_same_parent_overlap = 1"
+        ),
+        "shipper_pit_same_parent_overlap": (
+            "shipper_pit_same_parent_overlap = 1"
+        ),
         "importer_current_parent_fallback": (
             "importer_current_parent_fallback_flag = 1"
         ),
@@ -854,8 +918,12 @@ def _aggregate_select() -> str:
         "shipper_xref_ambiguous",
         "importer_pit_distinct_parent_candidate_count",
         "shipper_pit_distinct_parent_candidate_count",
+        "importer_pit_distinct_interval_match_count",
+        "shipper_pit_distinct_interval_match_count",
         "importer_pit_ambiguous",
         "shipper_pit_ambiguous",
+        "importer_pit_same_parent_overlap",
+        "shipper_pit_same_parent_overlap",
         "importer_ownership_source",
         "shipper_ownership_source",
         "importer_historical_backcast",
@@ -897,8 +965,12 @@ select manufacturer_parent_id,
        shipper_xref_ambiguous,
        importer_pit_distinct_parent_candidate_count,
        shipper_pit_distinct_parent_candidate_count,
+       importer_pit_distinct_interval_match_count,
+       shipper_pit_distinct_interval_match_count,
        importer_pit_ambiguous,
        shipper_pit_ambiguous,
+       importer_pit_same_parent_overlap,
+       shipper_pit_same_parent_overlap,
        importer_ownership_source,
        shipper_ownership_source,
        importer_historical_backcast,

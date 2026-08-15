@@ -441,6 +441,37 @@ def test_importer_and_shipper_pit_candidates_resolve_independently():
         "distinct_candidate_count": 2,
         "ambiguous": 1,
     }
+
+
+def test_pit_interval_reference_distinguishes_duplicates_from_same_parent_overlap():
+    exact_duplicate = sql_module.resolve_pit_intervals(
+        [(701, "2020-01-01", "2020-12-31"), (701, "2020-01-01", "2020-12-31")]
+    )
+    assert exact_duplicate == {
+        "candidate": 701,
+        "distinct_interval_match_count": 1,
+        "distinct_parent_candidate_count": 1,
+        "ambiguous": 0,
+        "same_parent_overlap": 0,
+    }
+
+    same_parent_overlap = sql_module.resolve_pit_intervals(
+        [(701, "2020-01-01", "2020-12-31"), (701, "2020-06-01", "2021-05-31")]
+    )
+    assert same_parent_overlap == {
+        "candidate": 701,
+        "distinct_interval_match_count": 2,
+        "distinct_parent_candidate_count": 1,
+        "ambiguous": 0,
+        "same_parent_overlap": 1,
+    }
+
+    distinct_parent_conflict = sql_module.resolve_pit_intervals(
+        [(701, "2020-01-01", "2020-12-31"), (702, "2020-06-01", "2021-05-31")]
+    )
+    assert distinct_parent_conflict["candidate"] is None
+    assert distinct_parent_conflict["ambiguous"] == 1
+    assert distinct_parent_conflict["same_parent_overlap"] == 0
     assert sql_module.resolve_distinct_candidate([901, 902, 901]) == {
         "candidate": None,
         "distinct_candidate_count": 2,
@@ -534,13 +565,28 @@ def test_xref_and_pit_resolution_use_distinct_candidates_without_arbitrary_choic
     assert "select distinct identifiervalue, companyid" in sql
     assert "xref_resolved as" in sql
     assert "count(*) as distinct_company_candidate_count" in sql
-    assert "importer_pit_distinct as" in sql
-    assert "shipper_pit_distinct as" in sql
+    assert "importer_pit_interval_matches as" in sql
+    assert "shipper_pit_interval_matches as" in sql
     assert "importer_pit_resolved as" in sql
     assert "shipper_pit_resolved as" in sql
     assert "distinct_parent_candidate_count" in sql
     assert "ownership_join_rows" not in sql
     assert "row_number() over ( partition by identifiervalue" not in sql
+
+
+def test_pit_same_parent_interval_overlap_is_preserved_without_exclusion():
+    sql = normalized(build_finished_sql(PARENT_IDS, "2024-01-01", "2024-04-01"))
+    assert "importer_pit_interval_matches as" in sql
+    assert "shipper_pit_interval_matches as" in sql
+    assert "select distinct i.panjivarecordid, p.ultimateparentcompanyid, p.startdate, p.enddate" in sql
+    for side in ("importer", "shipper"):
+        assert f"{side}_pit_distinct_interval_match_count" in sql
+        assert f"{side}_pit_same_parent_overlap" in sql
+        assert f"{side}_pit_same_parent_overlap_shipment_equivalent" in sql.rsplit(
+            "select ", 1
+        )[1]
+    finalized = sql.split("finalized as (", 1)[1].split(") select", 1)[0]
+    assert "pit_same_parent_overlap = 0" not in finalized
 
 
 def test_identity_ambiguities_and_backcasts_are_explicit_and_fail_main_eligibility():
