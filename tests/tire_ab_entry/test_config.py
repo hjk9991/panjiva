@@ -2,6 +2,7 @@ from pathlib import Path
 
 import pytest
 
+import scripts.tire_ab_entry.config as config_module
 from scripts.tire_ab_entry.config import (
     END_QUARTER,
     ENTRY_CORE_SHIPMENTS,
@@ -25,7 +26,8 @@ def test_tire_panjiva_scope():
     assert quarters[0] == "2014Q1"
     assert quarters[-1] == "2025Q4"
     assert len(quarters) == 48
-    assert validate_output_path(OUTPUT_ROOT / "_chunks" / "raw" / "2014Q1.parquet")
+    target = OUTPUT_ROOT / "_chunks" / "raw" / "2014Q1.parquet"
+    assert validate_output_path(target) == target.resolve(strict=False)
 
 
 def test_output_boundary_rejects_sibling_prefix_and_alternate_root(tmp_path):
@@ -93,3 +95,32 @@ def test_parent_targets_are_exact_and_immutable():
         "Goodyear",
         "Hankook Tire & Technology",
     )
+
+
+def test_quarter_iterator_uses_configured_boundaries(monkeypatch):
+    monkeypatch.setattr(config_module, "START_QUARTER", "2020Q4")
+    monkeypatch.setattr(config_module, "END_QUARTER", "2021Q2")
+    assert tuple(config_module.iter_quarters()) == ("2020Q4", "2021Q1", "2021Q2")
+
+
+@pytest.mark.parametrize(
+    ("start", "end", "message"),
+    [
+        ("2020Q0", "2021Q1", "quarter syntax"),
+        ("20Q1", "2021Q1", "quarter syntax"),
+        ("2021Q2", "2021Q1", "before or equal"),
+    ],
+)
+def test_quarter_iterator_rejects_invalid_or_reversed_ranges(
+    monkeypatch, start, end, message
+):
+    monkeypatch.setattr(config_module, "START_QUARTER", start)
+    monkeypatch.setattr(config_module, "END_QUARTER", end)
+    with pytest.raises(ValueError, match=message):
+        tuple(config_module.iter_quarters())
+
+
+def test_output_validation_rejects_non_windows_runtime(monkeypatch):
+    monkeypatch.setattr(config_module, "_runtime_platform", lambda: "Linux", raising=False)
+    with pytest.raises(RuntimeError, match="Windows"):
+        validate_output_path(OUTPUT_ROOT / "result.parquet")

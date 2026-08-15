@@ -2,10 +2,16 @@
 
 from dataclasses import dataclass
 from pathlib import Path
+import platform
+import re
 from types import MappingProxyType
 
 
 OUTPUT_ROOT = Path(r"C:\panjiva\data\staging\ab_entry_tire_v1")
+APPROVED_DATABASE = "MI_XPRESSCLOUD"
+APPROVED_SCHEMA = "XPRESSFEED"
+APPROVED_WAREHOUSE = "XF_READER_KOREADEVELOPMENT_WH"
+APPROVED_ROLE = "XF_READER_KOREADEVELOPMENT"
 START_QUARTER = "2014Q1"
 END_QUARTER = "2025Q4"
 
@@ -13,6 +19,8 @@ ENTRY_VALUE_USD = 100_000
 ENTRY_CORE_VALUE_USD = 1_000_000
 ENTRY_CORE_SHIPMENTS = 3
 PRE_ENTRY_YEARS = 2
+PARENT_CANDIDATE_WARN_ROWS_PER_TARGET = 250
+PARENT_CANDIDATE_MAX_ROWS_PER_TARGET = 2_000
 
 
 @dataclass(frozen=True)
@@ -53,21 +61,36 @@ MANUFACTURER_PARENT_TARGETS = (
 )
 
 
+def _quarter_index(label: str) -> int:
+    match = re.fullmatch(r"([0-9]{4})Q([1-4])", label)
+    if match is None:
+        raise ValueError(f"invalid quarter syntax: {label!r}")
+    return int(match.group(1)) * 4 + int(match.group(2)) - 1
+
+
 def iter_quarters():
     """Yield the approved quarterly extraction window in chronological order."""
 
-    return (
-        f"{year}Q{quarter}"
-        for year in range(2014, 2026)
-        for quarter in range(1, 5)
-    )
+    start = _quarter_index(START_QUARTER)
+    end = _quarter_index(END_QUARTER)
+    if start > end:
+        raise ValueError("START_QUARTER must be before or equal to END_QUARTER")
+    for index in range(start, end + 1):
+        year, zero_based_quarter = divmod(index, 4)
+        yield f"{year}Q{zero_based_quarter + 1}"
 
 
-def validate_output_path(path: Path | str) -> bool:
+def _runtime_platform() -> str:
+    return platform.system()
+
+
+def validate_output_path(path: Path | str) -> Path:
     """Accept a path only when it resolves inside the licensed output root."""
 
+    if _runtime_platform() != "Windows":
+        raise RuntimeError("licensed runtime writes require Windows")
     target = Path(path).resolve(strict=False)
     root = OUTPUT_ROOT.resolve(strict=False)
     if not target.is_relative_to(root):
         raise ValueError(f"path is outside licensed output root: {target}")
-    return True
+    return target

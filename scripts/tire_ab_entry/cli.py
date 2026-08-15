@@ -24,27 +24,49 @@ def _print_json(payload: dict) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    connection = None
     try:
         connection = connect()
-        if args.command == "probe-schema":
-            result = probe_schema(connection)
-        else:
-            result = discover_parent_candidates(connection)
-        _print_json({"status": "ok", "command": args.command, **result})
-        return 0
-    except Exception as error:
+    except Exception:
         _print_json(
             {
                 "status": "error",
                 "command": args.command,
-                "error_type": type(error).__name__,
+                "error_category": "connection_open_failed",
             }
         )
         return 1
-    finally:
-        if connection is not None:
-            connection.close()
+
+    result = None
+    primary_failed = False
+    try:
+        if args.command == "probe-schema":
+            result = probe_schema(connection)
+        else:
+            result = discover_parent_candidates(connection)
+    except Exception:
+        primary_failed = True
+
+    close_failed = False
+    try:
+        connection.close()
+    except Exception:
+        close_failed = True
+
+    if primary_failed or close_failed:
+        payload = {
+            "status": "error",
+            "command": args.command,
+            "error_category": (
+                "operation_failed" if primary_failed else "connection_close_failed"
+            ),
+        }
+        if primary_failed and close_failed:
+            payload["connection_close_failed"] = True
+        _print_json(payload)
+        return 1
+
+    _print_json({"status": "ok", "command": args.command, **result})
+    return 0
 
 
 if __name__ == "__main__":
