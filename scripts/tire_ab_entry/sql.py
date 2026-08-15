@@ -340,6 +340,7 @@ attributed as (
            0 as description_candidate,
            null as description_candidate_parent_id,
            0 as description_match_count,
+           0 as description_ambiguous,
            'importer_parent' as attribution_source
     from allocated a
     where importer_up in ({{id_list}})
@@ -371,14 +372,19 @@ description_enriched as (
     select a.*,
            0 as description_candidate,
            null as description_candidate_parent_id,
-           0 as description_match_count
+           0 as description_match_count,
+           0 as description_ambiguous
     from allocated a
 )""".strip()
     else:
         description_ctes = """
 description_matches as (
     select o.panjivaRecordId,
-           min(rm.manufacturer_parent_id) as description_candidate_parent_id,
+           iff(
+               count(distinct rm.manufacturer_parent_id) = 1,
+               min(rm.manufacturer_parent_id),
+               null
+           ) as description_candidate_parent_id,
            count(distinct rm.manufacturer_parent_id) as description_match_count
     from allocated o
     join reviewed_manufacturers rm
@@ -391,7 +397,8 @@ description_enriched as (
     select a.*,
            iff(dm.description_match_count > 0, 1, 0) as description_candidate,
            dm.description_candidate_parent_id,
-           coalesce(dm.description_match_count, 0) as description_match_count
+           coalesce(dm.description_match_count, 0) as description_match_count,
+           iff(dm.description_match_count > 1, 1, 0) as description_ambiguous
     from allocated a
     left join description_matches dm
       on dm.panjivaRecordId = a.panjivaRecordId
@@ -468,8 +475,10 @@ routed as (
                    then 'manufacturer_direct'
                when attribution_source = 'shipper_parent'
                 and relationship = 'arms_length'
-                and shipper_country is not null
-                and shipper_country <> 'United States'
+                and nullif(trim(shipper_country), '') is not null
+                and upper(trim(shipper_country)) not in (
+                    'UNITED STATES', 'US', 'USA'
+                )
                    then 'distributor_intermediated'
                else 'unattributed'
            end as import_route
@@ -507,6 +516,9 @@ def _aggregate_select() -> str:
         "finished_market",
         "hs_review_status",
         "hs_eligible",
+        "description_candidate_parent_id",
+        "description_match_count",
+        "description_ambiguous",
         "relationship",
         "import_route",
         "estimation_eligible",
@@ -527,6 +539,9 @@ select manufacturer_parent_id,
        finished_market,
        hs_review_status,
        hs_eligible,
+       description_candidate_parent_id,
+       description_match_count,
+       description_ambiguous,
        relationship,
        import_route,
        estimation_eligible,

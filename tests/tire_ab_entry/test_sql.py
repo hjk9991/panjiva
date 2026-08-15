@@ -1,4 +1,5 @@
 import re
+import sqlite3
 
 import pytest
 
@@ -221,9 +222,65 @@ def test_finished_attribution_precedence_routes_and_exclusions_are_explicit():
     assert " like " not in sql
     assert "relationship in ('self', 'parent_sub', 'sibling')" in sql
     assert "relationship = 'arms_length'" in sql
-    assert "shipper_country <> 'united states'" in sql
+    assert re.search(
+        r"upper\(trim\(shipper_country\)\) not in "
+        r"\( ?'united states', 'us', 'usa' ?\)",
+        sql,
+    )
     assert "origin_country <> 'united states'" not in sql
     assert "as estimation_eligible" in sql
+
+
+def _distributor_route_condition(sql):
+    compact = re.sub(r"\s+", " ", sql).strip()
+    routed = compact.split("routed as (", 1)[1].split("), finalized as", 1)[0]
+    match = re.search(
+        r"when (attribution_source = 'shipper_parent'.*?) "
+        r"then 'distributor_intermediated'",
+        routed,
+    )
+    assert match is not None
+    return match.group(1)
+
+
+@pytest.mark.parametrize("country_literal", ["null", "''", "'   '"])
+def test_distributor_route_rejects_null_blank_and_whitespace_shipper_country(
+    country_literal,
+):
+    condition = _distributor_route_condition(
+        build_finished_sql(PARENT_IDS, "2024-01-01", "2024-04-01")
+    )
+    assert "nullif(trim(shipper_country), '') is not null" in condition
+    executable = (
+        condition.replace("attribution_source", "'shipper_parent'")
+        .replace("relationship", "'arms_length'")
+        .replace("shipper_country", country_literal)
+    )
+    result = sqlite3.connect(":memory:").execute(
+        f"select case when {executable} then 1 else 0 end"
+    ).fetchone()[0]
+    assert result == 0
+
+
+@pytest.mark.parametrize(
+    ("country_literal", "expected"),
+    [("'United States'", 0), ("' Mexico '", 1)],
+)
+def test_distributor_route_requires_known_non_us_shipper_country(
+    country_literal, expected
+):
+    condition = _distributor_route_condition(
+        build_finished_sql(PARENT_IDS, "2024-01-01", "2024-04-01")
+    )
+    executable = (
+        condition.replace("attribution_source", "'shipper_parent'")
+        .replace("relationship", "'arms_length'")
+        .replace("shipper_country", country_literal)
+    )
+    result = sqlite3.connect(":memory:").execute(
+        f"select case when {executable} then 1 else 0 end"
+    ).fetchone()[0]
+    assert result == expected
 
 
 def test_description_identity_must_be_structured_and_match_probe_contract():
@@ -246,6 +303,13 @@ def test_description_identity_must_be_structured_and_match_probe_contract():
     assert "coalesce(o.importer_up, -1) not in (101, 202, 303)" in sql
     assert "coalesce(o.shipper_up, -1) not in (101, 202, 303)" in sql
     assert "as description_candidate" in sql
+    assert re.search(
+        r"iff\( ?count\(distinct rm\.manufacturer_parent_id\) = 1, "
+        r"min\(rm\.manufacturer_parent_id\), null ?\) "
+        r"as description_candidate_parent_id",
+        sql,
+    )
+    assert "iff(dm.description_match_count > 1, 1, 0) as description_ambiguous" in sql
 
     invalid = (
         "GOODSDESCRIPTION",
@@ -289,3 +353,35 @@ def test_description_unavailable_never_text_matches_and_emits_null():
     assert "description_matches as" not in sql
     assert "lower(" not in sql
     assert " like " not in sql
+    assert "null as description_candidate_parent_id" in sql
+    assert "0 as description_match_count" in sql
+    assert "0 as description_ambiguous" in sql
+
+
+def test_description_diagnostics_are_preserved_as_final_group_keys():
+    for description in (
+        None,
+        DescriptionIdentity(
+            APPROVED_DATABASE,
+            APPROVED_SCHEMA,
+            "PANJIVAUSIMPORT",
+            "GOODSDESCRIPTION",
+        ),
+    ):
+        sql = normalized(
+            build_finished_sql(
+                PARENT_IDS,
+                "2024-01-01",
+                "2024-04-01",
+                description_column=description,
+            )
+        )
+        final = sql.rsplit("select ", 1)[1]
+        group_by = final.split("group by ", 1)[1]
+        for column in (
+            "description_candidate_parent_id",
+            "description_match_count",
+            "description_ambiguous",
+        ):
+            assert column in final
+            assert column in group_by
