@@ -287,8 +287,12 @@ def load_parent_seed(
     if not strict_utc.all() or parsed.isna().any():
         raise ValueError("parent seed reviewed_at_utc must be a valid UTC timestamp")
     try:
-        generation = artifacts.resolve_current_candidate_generation(pointer_path)
-        pointer_hash = sha256_file(pointer_path)
+        pointer_bytes = pointer_path.read_bytes()
+        pointer_hash = hashlib.sha256(pointer_bytes).hexdigest()
+        loaded_pointer = json.loads(pointer_bytes.decode("utf-8"))
+        generation = artifacts.resolve_candidate_generation_manifest(
+            pointer_path, loaded_pointer
+        )
     except Exception as error:
         raise ValueError("parent seed candidate provenance is unreadable") from error
     provenance = {
@@ -388,30 +392,94 @@ def sql_contract_sha256(
 def classify_error(error: Exception) -> str:
     message = str(error).casefold()
     name = type(error).__name__.casefold()
-    if isinstance(error, (ValueError, TypeError)) or "programmingerror" in name:
-        return "contract"
-    if any(
-        token in message
-        for token in (
-            "authentication failed",
-            "incorrect password",
-            "invalid credential",
-            "not authorized",
-        )
+    sqlstate = str(getattr(error, "sqlstate", "") or "").strip().upper()
+    raw_errno = getattr(error, "errno", None)
+    try:
+        errno = int(raw_errno) if raw_errno is not None else None
+    except (TypeError, ValueError):
+        errno = None
+
+    authentication_markers = (
+        "authentication failed",
+        "incorrect username",
+        "incorrect password",
+        "login failed",
+        "invalid credential",
+        "invalid username or password",
+    )
+    authentication_errnos = {390100, 390101}
+    if (
+        sqlstate.startswith("28")
+        or errno in authentication_errnos
+        or any(token in message for token in authentication_markers)
     ):
         return "authentication"
-    sqlstate = str(getattr(error, "sqlstate", "") or "")
-    if isinstance(error, (ConnectionError, TimeoutError)) or sqlstate.startswith("08"):
-        return "transient"
-    if any(token in name for token in ("operationalerror", "network", "timeout")):
-        return "transient"
-    if any(
-        token in message
-        for token in ("connection reset", "connection aborted", "timed out", "service unavailable")
+    authorization_markers = (
+        "insufficient privilege",
+        "permission denied",
+        "access denied",
+        "not authorized",
+        "not permitted",
+        "unauthorized role",
+    )
+    if sqlstate == "42501" or any(
+        token in message for token in authorization_markers
+    ):
+        return "authorization"
+    contract_markers = (
+        "syntax error",
+        "sql compilation",
+        "invalid identifier",
+        "schema mismatch",
+        "invalid sql",
+        "bind variable",
+    )
+    if (
+        isinstance(error, (ValueError, TypeError))
+        or "programmingerror" in name
+        or (sqlstate.startswith(("22", "23", "42")) and sqlstate != "42501")
+        or errno == 1003
+        or any(token in message for token in contract_markers)
+    ):
+        return "contract"
+    transient_sqlstates = {
+        "08000",
+        "08001",
+        "08003",
+        "08004",
+        "08006",
+        "08S01",
+        "57P03",
+    }
+    transient_errnos = {250002, 250003, 250005, 250006, 250007, 250010}
+    transient_markers = (
+        "connection reset",
+        "connection aborted",
+        "network socket",
+        "network error",
+        "timed out",
+        "timeout",
+        "service temporarily unavailable",
+        "temporary service failure",
+        "session temporarily unavailable",
+        "session renewal failed",
+        "warehouse is restarting",
+        "warehouse is resuming",
+        "warehouse temporarily unavailable",
+    )
+    explicit_transient_class = isinstance(
+        error, (ConnectionError, TimeoutError)
+    ) or any(
+        token in name
+        for token in ("networkerror", "timeouterror", "connectionerror")
+    )
+    if (
+        sqlstate in transient_sqlstates
+        or errno in transient_errnos
+        or explicit_transient_class
+        or any(token in message for token in transient_markers)
     ):
         return "transient"
-    if any(token in message for token in ("syntax error", "sql compilation", "schema mismatch")):
-        return "contract"
     return "operation"
 
 

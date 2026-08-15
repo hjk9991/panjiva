@@ -144,6 +144,13 @@ class TransientNetworkError(ConnectionError):
     pass
 
 
+class WrappedOperationalError(Exception):
+    def __init__(self, message, *, sqlstate=None, errno=None):
+        super().__init__(message)
+        self.sqlstate = sqlstate
+        self.errno = errno
+
+
 def test_query_with_retry_uses_three_total_attempts_and_exponential_waits():
     calls = []
     waits = []
@@ -170,6 +177,69 @@ def test_query_with_retry_never_retries_contract_or_auth_failures():
                 sleep_fn=lambda seconds: pytest.fail("must not sleep"),
             )
         assert calls == [1]
+
+
+@pytest.mark.parametrize(
+    ("error", "category"),
+    [
+        (WrappedOperationalError("SQL compilation error near secret_table"), "contract"),
+        (WrappedOperationalError("invalid identifier 'SECRET_COLUMN'"), "contract"),
+        (
+            WrappedOperationalError(
+                "incorrect username or password=do-not-print", sqlstate="08001"
+            ),
+            "authentication",
+        ),
+        (
+            WrappedOperationalError(
+                "insufficient privileges for role SECRET_ROLE", sqlstate="42501"
+            ),
+            "authorization",
+        ),
+        (WrappedOperationalError("masked auth failure", sqlstate="28000"), "authentication"),
+        (WrappedOperationalError("masked login failure", errno="390100"), "authentication"),
+        (WrappedOperationalError("masked compiler failure", errno="1003"), "contract"),
+        (WrappedOperationalError("unclassified operational failure"), "operation"),
+    ],
+)
+def test_wrapped_operational_contract_and_access_errors_never_retry(
+    error, category, capsys
+):
+    calls = []
+    waits = []
+    with pytest.raises(WrappedOperationalError):
+        extract_module.query_with_retry(
+            lambda: calls.append(1) or (_ for _ in ()).throw(error),
+            sleep_fn=waits.append,
+        )
+    assert extract_module.classify_error(error) == category
+    assert calls == [1]
+    assert waits == []
+    assert "SECRET" not in capsys.readouterr().out
+    assert "do-not-print" not in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        WrappedOperationalError("network socket read timed out", sqlstate="08006"),
+        WrappedOperationalError("connection reset by peer", errno=250003),
+        WrappedOperationalError("masked network request failure", errno="250003"),
+    ],
+)
+def test_explicit_wrapped_network_failures_retry(error):
+    calls = []
+    waits = []
+
+    def query():
+        calls.append(1)
+        if len(calls) < 3:
+            raise error
+        return output_frame()
+
+    _, attempts = extract_module.query_with_retry(query, sleep_fn=waits.append)
+    assert attempts == 3
+    assert waits == [1.0, 2.0]
 
 
 def test_sql_hash_binds_keyed_mapping_dates_and_description_identity():
@@ -284,6 +354,60 @@ def test_parent_seed_gate_rejects_id_not_in_keyed_source_candidates(tmp_path, mo
     frame.to_csv(seed_path, index=False)
     with pytest.raises(ValueError, match="candidate"):
         extract_module.load_parent_seed(seed_path, candidate_pointer_path=pointer)
+
+
+def test_parent_seed_uses_one_stable_loaded_pointer_snapshot_during_publication_race(
+    tmp_path, monkeypatch
+):
+    seed_path, pointer_path = reviewed_seed_fixture(tmp_path, monkeypatch)
+    old_pointer_hash = extract_module.sha256_file(pointer_path)
+    real_resolver = artifacts_module.resolve_candidate_generation_manifest
+    real_read_bytes = Path.read_bytes
+    pointer_reads = []
+    switched = False
+
+    def counted_read_bytes(path):
+        if Path(path).resolve() == pointer_path.resolve():
+            pointer_reads.append(1)
+        return real_read_bytes(path)
+
+    def race_after_loaded_resolution(path, loaded_pointer):
+        nonlocal switched
+        resolved = real_resolver(path, loaded_pointer)
+        if not switched:
+            switched = True
+            replacement = pd.DataFrame(
+                {
+                    "target_search_term": [
+                        "Michelin",
+                        "Goodyear",
+                        "Hankook Tire & Technology",
+                    ],
+                    "current_ultimate_parent_id": [111, 222, 333],
+                }
+            )
+            artifacts_module.publish_candidate_artifact_set(
+                replacement,
+                replacement,
+                {"candidate_counts": {"Michelin": 1}},
+                canonical_path=tmp_path / "manufacturer_parent_candidates.parquet",
+                csv_path=tmp_path / "manufacturer_parent_candidates.csv",
+                metadata_path=tmp_path / "manufacturer_parent_candidates.metadata.json",
+            )
+        return resolved
+
+    monkeypatch.setattr(Path, "read_bytes", counted_read_bytes)
+    monkeypatch.setattr(
+        artifacts_module,
+        "resolve_candidate_generation_manifest",
+        race_after_loaded_resolution,
+    )
+
+    assert extract_module.load_parent_seed(
+        seed_path, candidate_pointer_path=pointer_path
+    ) == {"MICHELIN": 101, "GOODYEAR": 202, "HANKOOK": 303}
+    assert pointer_reads == [1]
+    assert extract_module.sha256_file(pointer_path) != old_pointer_hash
 
 
 def test_runtime_seed_and_chunk_paths_are_canonical():
