@@ -5,12 +5,14 @@ import pytest
 
 from scripts.tire_ab_entry.transforms import (
     apply_manual_reviews,
+    apply_ownership_continuity,
     build_annual_entries,
     build_dynamic_link_moments,
     build_game_artifacts,
     build_quarterly_panels,
     build_review_items,
     load_verified_game_chunks,
+    read_ownership_continuity_snapshot,
 )
 import scripts.tire_ab_entry.extract as extract_module
 import scripts.tire_ab_entry.transforms as transforms_module
@@ -244,6 +246,97 @@ def test_finished_candidate_without_foreign_shipper_identity_is_unreviewable():
     source[["shipper_up", "shipper_companyid", "shipper_panjiva_id"]] = pd.NA
     with pytest.raises(ValueError, match="stable supplier/plant identity"):
         build_review_items(source, game="finished")
+
+
+def _continuity_rows():
+    return pd.DataFrame(
+        {
+            "importer_companyid": [77],
+            "manufacturer_parent_id": [1],
+            "valid_from_quarter": ["2020Q1"],
+            "valid_to_quarter": ["2024Q4"],
+            "review_status": ["reviewed"],
+            "reviewer": ["tester"],
+            "reviewed_at_utc": ["2026-08-16T00:00:00Z"],
+            "source_note": ["public ownership record"],
+        }
+    )
+
+
+def test_ownership_continuity_snapshot_contract(tmp_path):
+    path = tmp_path / "importer_ownership_continuity.csv"
+    metadata, frame = read_ownership_continuity_snapshot(path)
+    assert metadata["state"] == "missing"
+    assert frame is None
+
+    valid = _continuity_rows()
+    valid.to_csv(path, index=False)
+    metadata, frame = read_ownership_continuity_snapshot(path)
+    assert metadata["state"] == "present"
+    assert metadata["row_count"] == 1
+    assert len(frame) == 1
+
+    breakages = [
+        valid.assign(valid_from_quarter="2014"),
+        valid.assign(valid_from_quarter="2025Q1", valid_to_quarter="2014Q1"),
+        valid.assign(review_status="auto"),
+        valid.assign(reviewer=" "),
+        valid.assign(source_note=""),
+        valid.assign(reviewed_at_utc="yesterday"),
+        valid.assign(importer_companyid=-1),
+        pd.concat([valid, valid], ignore_index=True),
+        valid.rename(columns={"reviewer": "person"}),
+    ]
+    for broken in breakages:
+        broken.to_csv(path, index=False)
+        with pytest.raises(ValueError):
+            read_ownership_continuity_snapshot(path)
+
+
+def test_apply_ownership_continuity_releases_only_reviewed_scope():
+    base = _source_rows().iloc[[0]].copy()
+    base["importer_companyid"] = 77
+    base["importer_historical_backcast"] = 1
+    base["shipper_historical_backcast"] = 0
+    base["importer_ownership_source"] = "current_parent_fallback"
+    base["importer_historical_backcast_value_usd"] = base["value_usd"]
+    base["importer_historical_backcast_shipment_equivalent"] = base[
+        "shipment_equivalent"
+    ]
+    base["importer_historical_backcast_shipment_count_nonadditive"] = 1
+    base["review_pending_technically_eligible"] = 0
+    base["estimation_eligible"] = 0
+    base["sensitivity_eligible"] = 1
+    matched = base.copy()
+    wrong_importer = base.copy()
+    wrong_importer["importer_companyid"] = 88
+    wrong_manufacturer = base.copy()
+    wrong_manufacturer["manufacturer_parent_id"] = 2
+    outside_window = base.copy()
+    outside_window["year_quarter"] = "2019Q4"
+    shipper_side = base.copy()
+    shipper_side["shipper_historical_backcast"] = 1
+    source = pd.concat(
+        [matched, wrong_importer, wrong_manufacturer, outside_window, shipper_side],
+        ignore_index=True,
+    )
+    released, stats = apply_ownership_continuity(source, _continuity_rows())
+    assert list(released["importer_historical_backcast"]) == [0, 1, 1, 1, 0]
+    assert released["importer_ownership_source"].iat[0] == "reviewed_continuity"
+    assert released["importer_ownership_source"].iat[1] == "current_parent_fallback"
+    assert released["importer_historical_backcast_value_usd"].iat[0] == 0.0
+    assert released["importer_historical_backcast_value_usd"].iat[1] == 60.0
+    assert released["review_pending_technically_eligible"].iat[0] == 1
+    assert released["estimation_eligible"].iat[0] == 1
+    # Shipper-side backcast survives the importer-side release untouched.
+    assert released["review_pending_technically_eligible"].iat[4] == 0
+    assert released["estimation_eligible"].iat[4] == 0
+    assert stats["released_rows"] == 2
+    assert stats["released_value_usd"] == 120.0
+
+    untouched, stats = apply_ownership_continuity(source, None)
+    assert stats["released_rows"] == 0
+    assert list(untouched["importer_historical_backcast"]) == [1, 1, 1, 1, 1]
 
 
 def test_unattributed_rows_without_candidate_flow_through_without_review():

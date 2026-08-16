@@ -96,6 +96,42 @@ def test_g6_uses_only_estimation_sample_value(tmp_path):
     assert result["gates"].set_index("gate").loc["G6", "status"] == "pass"
 
 
+def test_g1_allows_na_manufacturer_only_for_finished_unattributed_rows(tmp_path):
+    raw, finished, panels, seed, validation, queue, annual, inside = _qa_fixture(tmp_path)
+    extra = panels["finished"].iloc[[0]].copy()
+    extra["manufacturer_parent_id"] = pd.NA
+    extra["import_route"] = "unattributed"
+    extra["origin_country"] = "MEX"
+    panels["finished"] = pd.concat([panels["finished"], extra], ignore_index=True)
+    result = evaluate_gates(
+        chunks={"raw": raw, "finished": finished}, origin_panels=panels,
+        parent_seed=seed, validation_metrics=validation, review_queue=queue,
+        annual_origin=annual, licensed_paths=[inside], licensed_root=tmp_path / "licensed",
+    )
+    assert result["gates"].set_index("gate").loc["G1", "status"] == "pass"
+
+    attributed_na = {key: value.copy() for key, value in panels.items()}
+    attributed_na["finished"].loc[
+        attributed_na["finished"].index[-1], "import_route"
+    ] = "manufacturer_direct"
+    result = evaluate_gates(
+        chunks={"raw": raw, "finished": finished}, origin_panels=attributed_na,
+        parent_seed=seed, validation_metrics=validation, review_queue=queue,
+        annual_origin=annual, licensed_paths=[inside], licensed_root=tmp_path / "licensed",
+    )
+    assert result["gates"].set_index("gate").loc["G1", "status"] == "fail"
+
+    raw_na = {key: value.copy() for key, value in panels.items()}
+    raw_na["finished"] = raw_na["finished"].iloc[:-1]
+    raw_na["raw"].loc[0, "manufacturer_parent_id"] = pd.NA
+    result = evaluate_gates(
+        chunks={"raw": raw, "finished": finished}, origin_panels=raw_na,
+        parent_seed=seed, validation_metrics=validation, review_queue=queue,
+        annual_origin=annual, licensed_paths=[inside], licensed_root=tmp_path / "licensed",
+    )
+    assert result["gates"].set_index("gate").loc["G1", "status"] == "fail"
+
+
 def test_g1_rejects_nonpositive_manufacturer_and_blank_market_code(tmp_path):
     raw, finished, panels, seed, validation, queue, annual, inside = _qa_fixture(tmp_path)
     panels["raw"].loc[0, "manufacturer_parent_id"] = 0
@@ -279,7 +315,6 @@ def test_required_gate_failure_is_nonzero(tmp_path, gate):
             ~(
                 (annual["finished"]["manufacturer_parent_id"] == 1)
                 & (annual["finished"]["link_id"] == "JPN")
-                & (annual["finished"]["year"] == 2024)
             )
         ]
         kwargs["annual_origin"] = annual
@@ -362,6 +397,28 @@ def test_g3_fails_on_zero_value_pit_overlap_occurrence(tmp_path):
         annual_origin=annual, licensed_paths=[inside], licensed_root=tmp_path / "licensed",
     )
     assert result["gates"].set_index("gate").loc["G3", "status"] == "fail"
+
+
+def test_g8_counts_distinct_active_links_across_the_2022_2024_window(tmp_path):
+    raw, finished, panels, seed, validation, queue, annual, inside = _qa_fixture(tmp_path)
+    # Manufacturer 1 keeps KOR only in 2022 and JPN only in 2023: two distinct
+    # links across the window although every single year has just one.
+    frame = annual["finished"]
+    annual["finished"] = frame.loc[
+        ~(
+            (frame["manufacturer_parent_id"] == 1)
+            & (
+                ((frame["link_id"] == "KOR") & (frame["year"] != 2022))
+                | ((frame["link_id"] == "JPN") & (frame["year"] != 2023))
+            )
+        )
+    ]
+    result = evaluate_gates(
+        chunks={"raw": raw, "finished": finished}, origin_panels=panels,
+        parent_seed=seed, validation_metrics=validation, review_queue=queue,
+        annual_origin=annual, licensed_paths=[inside], licensed_root=tmp_path / "licensed",
+    )
+    assert result["gates"].set_index("gate").loc["G8", "status"] == "pass"
 
 
 def test_g8_reports_each_game_and_does_not_pool_origin_coverage(tmp_path):
@@ -527,7 +584,10 @@ def test_transform_manifests_pin_one_manual_review_byte_snapshot(
     else:
         reviews.to_csv(review_path, index=False)
     current_snapshot, _ = read_manual_review_snapshot(review_path)
-    with pytest.raises(ValueError, match="manual review snapshot"):
+    continuity_snapshot, _ = transforms_module.read_ownership_continuity_snapshot(
+        tmp_path / "review" / "importer_ownership_continuity.csv"
+    )
+    with pytest.raises(ValueError, match="review snapshot"):
         qa_module._load_transform_outputs(
             "raw",
             tmp_path,
@@ -535,4 +595,5 @@ def test_transform_manifests_pin_one_manual_review_byte_snapshot(
             source_manifest_sha256="manifest-raw",
             source_chunk_sha256=["chunk-raw"],
             manual_review_snapshot=current_snapshot,
+            ownership_continuity_snapshot=continuity_snapshot,
         )

@@ -24,9 +24,11 @@ from .transforms import (
     ADDITIVE_COLUMNS,
     DIAGNOSTIC_VALUE_COLUMNS,
     REVIEW_IDENTITY_COLUMNS,
+    apply_ownership_continuity,
     load_verified_game_chunks,
     normalize_review_identity,
     read_manual_review_snapshot,
+    read_ownership_continuity_snapshot,
 )
 
 
@@ -353,11 +355,22 @@ def _g1(
         manufacturer_ids = pd.to_numeric(
             frame["manufacturer_parent_id"], errors="coerce"
         )
-        valid &= (
-            manufacturer_ids.notna().all()
-            and manufacturer_ids.gt(0).all()
-            and manufacturer_ids.map(lambda value: float(value).is_integer()).all()
+        positive_integer = (
+            manufacturer_ids.notna()
+            & manufacturer_ids.gt(0)
+            & manufacturer_ids.map(
+                lambda value: pd.notna(value) and float(value).is_integer()
+            )
         )
+        if game == "finished":
+            # Unattributed finished groups legitimately carry no manufacturer;
+            # every attributed-route row still requires a positive integer ID.
+            unattributed_na = manufacturer_ids.isna() & frame["import_route"].astype(
+                "string"
+            ).eq("unattributed")
+            valid &= bool((positive_integer | unattributed_na).all())
+        else:
+            valid &= bool(positive_integer.all())
         if game == "raw":
             valid &= frame[market].isin(set(RAW_GROUPS)).all()
             valid &= "finished_market" not in frame or frame["finished_market"].isna().all()
@@ -504,12 +517,14 @@ def _g8(annual: Mapping[str, pd.DataFrame], seed: pd.DataFrame) -> dict:
     required = {"manufacturer_parent_id", "link_id", "year", "active"}
     if set(annual) != {"raw", "finished"}:
         return _gate("G8", "fail", 0, "raw and finished annual games are required")
-    expected = pd.MultiIndex.from_product(
-        [sorted(seed["manufacturer_parent_id"].unique()), [2022, 2023, 2024]],
-        names=["manufacturer_parent_id", "year"],
+    # The design gate reads "at least two active origin links during
+    # 2022--2024", so links are counted distinct across the whole window.
+    expected = pd.Index(
+        sorted(seed["manufacturer_parent_id"].unique()),
+        name="manufacturer_parent_id",
     )
     minima = {}
-    valid = len(expected) == 9
+    valid = len(expected) == 3
     for game in ("raw", "finished"):
         frame = annual[game]
         if not required.issubset(frame.columns):
@@ -519,7 +534,7 @@ def _g8(annual: Mapping[str, pd.DataFrame], seed: pd.DataFrame) -> dict:
         scope = frame.loc[
             frame["year"].isin((2022, 2023, 2024)) & frame["active"].eq(1)
         ]
-        counts = scope.groupby(["manufacturer_parent_id", "year"])["link_id"].nunique()
+        counts = scope.groupby("manufacturer_parent_id")["link_id"].nunique()
         counts = counts.reindex(expected, fill_value=0)
         minima[game] = int(counts.min()) if len(counts) else 0
         valid &= counts.ge(2).all()
@@ -690,6 +705,7 @@ def _load_transform_outputs(
     source_manifest_sha256: str,
     source_chunk_sha256: Iterable[str],
     manual_review_snapshot: Mapping[str, object],
+    ownership_continuity_snapshot: Mapping[str, object],
 ) -> tuple[dict[str, pd.DataFrame], list[Path]]:
     manifest_path = root / "_manifests" / f"transform_{game}.json"
     try:
@@ -703,10 +719,11 @@ def _load_transform_outputs(
         "source_manifest_sha256",
         "source_chunk_sha256",
         "manual_review_snapshot",
+        "ownership_continuity_snapshot",
         "outputs",
         "shipment_measurement_status",
     }
-    if set(manifest) != required or manifest.get("manifest_version") != "tire-transform-manifest-v3":
+    if set(manifest) != required or manifest.get("manifest_version") != "tire-transform-manifest-v4":
         raise ValueError("transform manifest has an invalid exact contract")
     if (
         manifest.get("game") != game
@@ -714,8 +731,10 @@ def _load_transform_outputs(
         or manifest.get("source_manifest_sha256") != source_manifest_sha256
         or manifest.get("source_chunk_sha256") != list(source_chunk_sha256)
         or manifest.get("manual_review_snapshot") != dict(manual_review_snapshot)
+        or manifest.get("ownership_continuity_snapshot")
+        != dict(ownership_continuity_snapshot)
     ):
-        raise ValueError("transform manifest or manual review snapshot is stale")
+        raise ValueError("transform manifest or review snapshot is stale")
     expected_names = {
         "origin_quarterly",
         "supplier_quarterly",
@@ -808,14 +827,25 @@ def run_runtime_qa(
     manual_review_snapshot, _ = read_manual_review_snapshot(review_path)
     if manual_review_snapshot["state"] == "present":
         licensed_paths.append(Path(str(manual_review_snapshot["path"])))
+    continuity_path = root / "review" / "importer_ownership_continuity.csv"
+    continuity_snapshot, continuity = read_ownership_continuity_snapshot(
+        continuity_path
+    )
+    if continuity_snapshot["state"] == "present":
+        licensed_paths.append(Path(str(continuity_snapshot["path"])))
     for game in ("raw", "finished"):
+        source_attrs = dict(chunks[game].attrs)
+        chunks[game], _released = apply_ownership_continuity(
+            chunks[game], continuity
+        )
         loaded[game], paths = _load_transform_outputs(
             game,
             root,
             parent_seed_sha256,
-            source_manifest_sha256=chunks[game].attrs["source_manifest_sha256"],
-            source_chunk_sha256=chunks[game].attrs["source_chunk_sha256"],
+            source_manifest_sha256=source_attrs["source_manifest_sha256"],
+            source_chunk_sha256=source_attrs["source_chunk_sha256"],
             manual_review_snapshot=manual_review_snapshot,
+            ownership_continuity_snapshot=continuity_snapshot,
         )
         licensed_paths.extend(paths)
     validation, paths = _load_g0_metrics(root, parent_seed_sha256)

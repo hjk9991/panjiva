@@ -27,6 +27,7 @@ from .config import (
     validate_output_path,
 )
 from .extract import REQUIRED_OUTPUT_COLUMNS
+from .sql import reference_review_pending_technical_eligibility
 from . import artifacts as artifact_io
 from . import extract as extraction
 
@@ -91,21 +92,37 @@ MANUAL_REVIEW_COLUMNS = (
 )
 MANUAL_REVIEW_SNAPSHOT_VERSION = "manual-link-reviews-snapshot-v1"
 MANUAL_REVIEW_SCHEMA_VERSION = "manual-link-reviews-schema-v1"
+OWNERSHIP_CONTINUITY_SNAPSHOT_VERSION = "importer-ownership-continuity-snapshot-v1"
+OWNERSHIP_CONTINUITY_SCHEMA_VERSION = "importer-ownership-continuity-schema-v1"
+OWNERSHIP_CONTINUITY_COLUMNS = (
+    "importer_companyid",
+    "manufacturer_parent_id",
+    "valid_from_quarter",
+    "valid_to_quarter",
+    "review_status",
+    "reviewer",
+    "reviewed_at_utc",
+    "source_note",
+)
+_QUARTER_PATTERN = r"[0-9]{4}Q[1-4]"
+_UTC_PATTERN = r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?Z"
 
 
-def read_manual_review_snapshot(
+def _read_immutable_csv_snapshot(
     path: Path | str,
+    expected_columns: tuple[str, ...],
+    snapshot_version: str,
+    schema_version: str,
+    label: str,
 ) -> tuple[dict[str, object], pd.DataFrame | None]:
-    """Read one immutable byte snapshot and its exact review-table contract."""
-
     canonical = Path(path).resolve(strict=False)
     try:
         before = canonical.stat()
     except FileNotFoundError:
         return (
             {
-                "contract_version": MANUAL_REVIEW_SNAPSHOT_VERSION,
-                "schema_version": MANUAL_REVIEW_SCHEMA_VERSION,
+                "contract_version": snapshot_version,
+                "schema_version": schema_version,
                 "state": "missing",
                 "path": str(canonical),
                 "sha256": None,
@@ -116,25 +133,25 @@ def read_manual_review_snapshot(
             None,
         )
     if not canonical.is_file():
-        raise ValueError("manual review snapshot path is not a regular file")
+        raise ValueError(f"{label} path is not a regular file")
     try:
         payload = canonical.read_bytes()
         after = canonical.stat()
     except OSError as error:
-        raise ValueError("manual review snapshot is unreadable") from error
+        raise ValueError(f"{label} is unreadable") from error
     identity_before = (before.st_size, before.st_mtime_ns, before.st_ino)
     identity_after = (after.st_size, after.st_mtime_ns, after.st_ino)
     if identity_before != identity_after or len(payload) != after.st_size:
-        raise ValueError("manual review snapshot changed while being read")
+        raise ValueError(f"{label} changed while being read")
     try:
         frame = pd.read_csv(BytesIO(payload), dtype="string")
     except Exception as error:
-        raise ValueError("manual review snapshot CSV is malformed") from error
-    if tuple(frame.columns) != MANUAL_REVIEW_COLUMNS:
-        raise ValueError("manual review snapshot has an invalid exact schema")
+        raise ValueError(f"{label} CSV is malformed") from error
+    if tuple(frame.columns) != expected_columns:
+        raise ValueError(f"{label} has an invalid exact schema")
     metadata = {
-        "contract_version": MANUAL_REVIEW_SNAPSHOT_VERSION,
-        "schema_version": MANUAL_REVIEW_SCHEMA_VERSION,
+        "contract_version": snapshot_version,
+        "schema_version": schema_version,
         "state": "present",
         "path": str(canonical),
         "sha256": hashlib.sha256(payload).hexdigest(),
@@ -143,6 +160,141 @@ def read_manual_review_snapshot(
         "row_count": int(len(frame)),
     }
     return metadata, frame
+
+
+def read_manual_review_snapshot(
+    path: Path | str,
+) -> tuple[dict[str, object], pd.DataFrame | None]:
+    """Read one immutable byte snapshot and its exact review-table contract."""
+
+    return _read_immutable_csv_snapshot(
+        path,
+        MANUAL_REVIEW_COLUMNS,
+        MANUAL_REVIEW_SNAPSHOT_VERSION,
+        MANUAL_REVIEW_SCHEMA_VERSION,
+        "manual review snapshot",
+    )
+
+
+def read_ownership_continuity_snapshot(
+    path: Path | str,
+) -> tuple[dict[str, object], pd.DataFrame | None]:
+    """Read the reviewed importer-ownership-continuity assertions, fail closed."""
+
+    metadata, frame = _read_immutable_csv_snapshot(
+        path,
+        OWNERSHIP_CONTINUITY_COLUMNS,
+        OWNERSHIP_CONTINUITY_SNAPSHOT_VERSION,
+        OWNERSHIP_CONTINUITY_SCHEMA_VERSION,
+        "ownership continuity snapshot",
+    )
+    if frame is None:
+        return metadata, None
+    validated = frame.copy()
+    for column in ("importer_companyid", "manufacturer_parent_id"):
+        values = pd.to_numeric(validated[column], errors="coerce")
+        if (
+            values.isna().any()
+            or values.le(0).any()
+            or not values.map(lambda value: float(value).is_integer()).all()
+        ):
+            raise ValueError("ownership continuity requires positive integral IDs")
+        validated[column] = values.astype("int64")
+    if validated["importer_companyid"].duplicated().any():
+        raise ValueError("ownership continuity has duplicate importer rows")
+    for column in ("valid_from_quarter", "valid_to_quarter"):
+        values = validated[column].astype("string")
+        if not values.str.fullmatch(_QUARTER_PATTERN).fillna(False).all():
+            raise ValueError("ownership continuity quarter syntax is invalid")
+    if (
+        validated["valid_from_quarter"].astype("string")
+        > validated["valid_to_quarter"].astype("string")
+    ).any():
+        raise ValueError("ownership continuity interval is reversed")
+    if not validated["review_status"].astype("string").eq("reviewed").fillna(False).all():
+        raise ValueError("ownership continuity rows must have reviewed status")
+    for column in ("reviewer", "source_note"):
+        values = validated[column].astype("string")
+        if values.isna().any() or values.str.strip().eq("").any():
+            raise ValueError(f"ownership continuity {column} is required")
+    timestamps = validated["reviewed_at_utc"].astype("string")
+    parsed = pd.to_datetime(timestamps, utc=True, errors="coerce")
+    if not timestamps.str.fullmatch(_UTC_PATTERN).fillna(False).all() or parsed.isna().any():
+        raise ValueError(
+            "ownership continuity reviewed_at_utc must be a valid UTC timestamp"
+        )
+    return metadata, validated
+
+
+def apply_ownership_continuity(
+    frame: pd.DataFrame,
+    continuity: pd.DataFrame | None,
+) -> tuple[pd.DataFrame, dict[str, object]]:
+    """Release importer-side backcast rows covered by reviewed ownership intervals.
+
+    Only the importer-side flag is released: a reviewed continuity interval
+    asserts who owned the importing entity, nothing about the shipper side, so
+    every other hard technical gate is recomputed through the audited SQL
+    reference predicate rather than being overridden.
+    """
+
+    stats = {"released_rows": 0, "released_value_usd": 0.0}
+    if continuity is None or len(continuity) == 0:
+        return frame, stats
+    result = frame.copy()
+    result.attrs = dict(frame.attrs)
+    importer = pd.to_numeric(result["importer_companyid"], errors="coerce")
+    manufacturer = pd.to_numeric(result["manufacturer_parent_id"], errors="coerce")
+    quarter = result["year_quarter"].astype("string")
+    backcast = pd.to_numeric(
+        result["importer_historical_backcast"], errors="coerce"
+    ).eq(1)
+    released = pd.Series(False, index=result.index)
+    for row in continuity.itertuples(index=False):
+        released |= (
+            backcast
+            & importer.eq(int(row.importer_companyid)).fillna(False)
+            & manufacturer.eq(int(row.manufacturer_parent_id)).fillna(False)
+            & quarter.ge(str(row.valid_from_quarter)).fillna(False)
+            & quarter.le(str(row.valid_to_quarter)).fillna(False)
+        )
+    if not released.any():
+        return result, stats
+    result.loc[released, "importer_historical_backcast"] = 0
+    result.loc[released, "importer_ownership_source"] = "reviewed_continuity"
+    for suffix in ("value_usd", "shipment_equivalent", "shipment_count_nonadditive"):
+        column = f"importer_historical_backcast_{suffix}"
+        if column in result.columns:
+            result.loc[released, column] = 0.0
+    recomputed = [
+        reference_review_pending_technical_eligibility(
+            hs_eligible=int(row.hs_eligible),
+            manufacturer_conflict=int(row.manufacturer_conflict),
+            description_ambiguous=int(row.description_ambiguous),
+            importer_xref_ambiguous=int(row.importer_xref_ambiguous),
+            shipper_xref_ambiguous=int(row.shipper_xref_ambiguous),
+            importer_pit_ambiguous=int(row.importer_pit_ambiguous),
+            shipper_pit_ambiguous=int(row.shipper_pit_ambiguous),
+            importer_historical_backcast=0,
+            shipper_historical_backcast=int(row.shipper_historical_backcast),
+            import_route=str(row.import_route),
+        )
+        for row in result.loc[released].itertuples(index=False)
+    ]
+    result.loc[released, "review_pending_technically_eligible"] = recomputed
+    sensitivity = pd.to_numeric(result["sensitivity_eligible"], errors="coerce").eq(1)
+    shipper_backcast = pd.to_numeric(
+        result["shipper_historical_backcast"], errors="coerce"
+    ).eq(1)
+    result.loc[released, "estimation_eligible"] = (
+        (sensitivity & ~shipper_backcast).loc[released].astype("int64")
+    )
+    return result, {
+        "released_rows": int(released.sum()),
+        "released_value_usd": float(
+            pd.to_numeric(result.loc[released, "value_usd"], errors="coerce").sum()
+        ),
+    }
 
 
 def normalize_review_identity(frame: pd.DataFrame) -> pd.DataFrame:
@@ -930,6 +1082,10 @@ def _build_game_outputs_locked(
     )
     source_manifest_sha256 = chunks.attrs["source_manifest_sha256"]
     source_chunk_sha256 = list(chunks.attrs["source_chunk_sha256"])
+    continuity_snapshot, continuity = read_ownership_continuity_snapshot(
+        root / "review" / "importer_ownership_continuity.csv"
+    )
+    chunks, continuity_stats = apply_ownership_continuity(chunks, continuity)
     from .qa import build_manual_review_queue, validate_transform_artifact
 
     review_items = build_review_items(chunks, game=game)
@@ -954,12 +1110,13 @@ def _build_game_outputs_locked(
         validate_transform_artifact(name, game, frame)
         hashes[name] = artifact_io.atomic_write_parquet(frame, targets[name])
     manifest = {
-        "manifest_version": "tire-transform-manifest-v3",
+        "manifest_version": "tire-transform-manifest-v4",
         "game": game,
         "parent_seed_sha256": parent_seed_sha256,
         "source_manifest_sha256": source_manifest_sha256,
         "source_chunk_sha256": source_chunk_sha256,
         "manual_review_snapshot": review_snapshot,
+        "ownership_continuity_snapshot": continuity_snapshot,
         "outputs": {
             name: {
                 "path": str(targets[name]),
@@ -980,4 +1137,6 @@ def _build_game_outputs_locked(
         "game": game,
         "manifest_path": str(manifest_path),
         "outputs": {name: str(path) for name, path in targets.items()},
+        "ownership_released_rows": continuity_stats["released_rows"],
+        "ownership_released_value_usd": continuity_stats["released_value_usd"],
     }
