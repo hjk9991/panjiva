@@ -621,7 +621,7 @@ attributed as (
            end as manufacturer_parent_id,
            0 as manufacturer_conflict,
            0 as description_candidate,
-           null as description_candidate_parent_id,
+           cast(null as number(38,0)) as description_candidate_parent_id,
            0 as description_match_count,
            0 as description_ambiguous,
            null as description_matched_alias,
@@ -704,7 +704,7 @@ def _finished_scope_ctes(
 description_enriched as (
     select a.*,
            0 as description_candidate,
-           null as description_candidate_parent_id,
+           cast(null as number(38,0)) as description_candidate_parent_id,
            0 as description_match_count,
            0 as description_ambiguous,
            null as description_matched_alias,

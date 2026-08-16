@@ -450,9 +450,42 @@ def test_description_unavailable_never_text_matches_and_emits_null():
     assert "description_matches as" not in sql
     assert "lower(" not in sql
     assert " like " not in sql
-    assert "null as description_candidate_parent_id" in sql
+    assert "cast(null as number(38,0)) as description_candidate_parent_id" in sql
     assert "0 as description_match_count" in sql
     assert "0 as description_ambiguous" in sql
+
+
+def test_required_numeric_columns_are_never_emitted_as_untyped_null():
+    from scripts.tire_ab_entry.extract import (
+        REQUIRED_OUTPUT_COLUMNS,
+        TEXT_OUTPUT_COLUMNS,
+    )
+
+    required_numeric = set(REQUIRED_OUTPUT_COLUMNS).difference(TEXT_OUTPUT_COLUMNS)
+    variants = (
+        build_raw_sql(PARENT_IDS, "2024-01-01", "2024-04-01"),
+        build_finished_sql(
+            PARENT_IDS, "2024-01-01", "2024-04-01", description_column=None
+        ),
+        build_finished_sql(
+            PARENT_IDS,
+            "2024-01-01",
+            "2024-04-01",
+            description_column=DescriptionIdentity(
+                APPROVED_DATABASE,
+                APPROVED_SCHEMA,
+                "PANJIVAUSIMPORT",
+                "GOODSDESCRIPTION",
+            ),
+        ),
+    )
+    for sql in variants:
+        for column in re.findall(r"\bnull as ([a-z_][a-z0-9_]*)", normalized(sql)):
+            assert column not in required_numeric, (
+                f"untyped null feeds required numeric output column {column}; "
+                "Snowflake returns untyped null literals as text, which breaks "
+                "the numeric output contract"
+            )
 
 
 def test_description_diagnostics_are_preserved_as_final_group_keys():
