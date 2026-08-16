@@ -132,6 +132,27 @@ def test_g1_allows_na_manufacturer_only_for_finished_unattributed_rows(tmp_path)
     assert result["gates"].set_index("gate").loc["G1", "status"] == "fail"
 
 
+def test_g1_allows_unreported_measures_but_rejects_negative_values(tmp_path):
+    raw, finished, panels, seed, validation, queue, annual, inside = _qa_fixture(tmp_path)
+    # Panjiva reports no TEU for air and LCL shipments; the source contract
+    # keeps those measures null, so an all-null group is a valid panel value.
+    panels["raw"].loc[0, "teu"] = pd.NA
+    result = evaluate_gates(
+        chunks={"raw": raw, "finished": finished}, origin_panels=panels,
+        parent_seed=seed, validation_metrics=validation, review_queue=queue,
+        annual_origin=annual, licensed_paths=[inside], licensed_root=tmp_path / "licensed",
+    )
+    assert result["gates"].set_index("gate").loc["G1", "status"] == "pass"
+
+    panels["raw"].loc[0, "teu"] = -1.0
+    result = evaluate_gates(
+        chunks={"raw": raw, "finished": finished}, origin_panels=panels,
+        parent_seed=seed, validation_metrics=validation, review_queue=queue,
+        annual_origin=annual, licensed_paths=[inside], licensed_root=tmp_path / "licensed",
+    )
+    assert result["gates"].set_index("gate").loc["G1", "status"] == "fail"
+
+
 def test_g1_rejects_nonpositive_manufacturer_and_blank_market_code(tmp_path):
     raw, finished, panels, seed, validation, queue, annual, inside = _qa_fixture(tmp_path)
     panels["raw"].loc[0, "manufacturer_parent_id"] = 0

@@ -281,13 +281,17 @@ def apply_ownership_continuity(
         )
         for row in result.loc[released].itertuples(index=False)
     ]
-    result.loc[released, "review_pending_technically_eligible"] = recomputed
+    result.loc[released, "review_pending_technically_eligible"] = pd.array(
+        recomputed, dtype=result["review_pending_technically_eligible"].dtype
+    )
     sensitivity = pd.to_numeric(result["sensitivity_eligible"], errors="coerce").eq(1)
     shipper_backcast = pd.to_numeric(
         result["shipper_historical_backcast"], errors="coerce"
     ).eq(1)
     result.loc[released, "estimation_eligible"] = (
-        (sensitivity & ~shipper_backcast).loc[released].astype("int64")
+        (sensitivity & ~shipper_backcast)
+        .loc[released]
+        .astype(result["estimation_eligible"].dtype)
     )
     return result, {
         "released_rows": int(released.sum()),

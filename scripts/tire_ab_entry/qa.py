@@ -256,11 +256,14 @@ def _gate(gate: str, status: str, metric: object, detail: str) -> dict:
 
 
 def _finite_nonnegative(frame: pd.DataFrame, columns: Iterable[str]) -> bool:
+    # Mirrors the extraction output contract: physical measures may be
+    # unreported (null) in Panjiva, but every reported value must be a finite
+    # nonnegative number.
     for column in columns:
         if column not in frame:
             continue
-        values = pd.to_numeric(frame[column], errors="coerce")
-        if values.isna().any() or (values < 0).any():
+        values = pd.to_numeric(frame[column], errors="coerce").dropna()
+        if (values < 0).any():
             return False
         if not values.map(lambda value: math.isfinite(float(value))).all():
             return False
