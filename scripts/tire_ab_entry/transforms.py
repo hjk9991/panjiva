@@ -206,7 +206,16 @@ def _validate_source(frame: pd.DataFrame) -> pd.DataFrame:
     effective = result["manufacturer_parent_id"].fillna(
         pd.to_numeric(result["description_candidate_parent_id"], errors="coerce")
     )
-    if effective.isna().any() or effective.le(0).any():
+    if (effective.notna() & effective.le(0)).any():
+        raise ValueError("source manufacturer identity must be positive")
+    # Only explicitly unattributed rows may lack both identities: the finished
+    # SQL retains them so attribution coverage (G5) keeps an honest denominator.
+    attributed_route = (
+        result["import_route"]
+        .astype("string")
+        .isin(("manufacturer_direct", "distributor_intermediated"))
+    )
+    if (attributed_route & effective.isna()).any():
         raise ValueError(
             "source requires manufacturer_parent_id or description candidate parent"
         )
@@ -688,6 +697,7 @@ def build_review_items(frame: pd.DataFrame, *, game: str) -> pd.DataFrame:
     """Create value-ranked human-review units without assigning a status."""
 
     source = _validate_source(frame)
+    source = source.loc[source["manufacturer_parent_id"].notna()]
     source = _with_review_keys(source, game)
     return (
         source.groupby(
@@ -777,7 +787,11 @@ def apply_manual_reviews(
 ) -> pd.DataFrame:
     """Apply explicit human decisions; never infer or auto-approve a status."""
 
-    source = _with_review_keys(_validate_source(frame), game)
+    validated = _validate_source(frame).reset_index(drop=True)
+    validated["_source_row_order"] = range(len(validated))
+    keyable_mask = validated["manufacturer_parent_id"].notna()
+    unkeyable = validated.loc[~keyable_mask].copy()
+    source = _with_review_keys(validated.loc[keyable_mask], game)
     review_columns = [*REVIEW_IDENTITY_COLUMNS, "review_status", "source_note"]
     if reviews is None:
         source["manual_review_status"] = pd.NA
@@ -845,7 +859,7 @@ def apply_manual_reviews(
         & source["import_route"].eq("unattributed")
     )
     source.loc[released_description, "import_route"] = "distributor_intermediated"
-    return source.drop(
+    processed = source.drop(
         columns=[
             "game",
             "review_group",
@@ -853,6 +867,28 @@ def apply_manual_reviews(
             "link_identity_value",
             "review_item_id",
         ]
+    )
+    if not unkeyable.empty:
+        unkeyable["manual_review_status"] = pd.Series(
+            pd.NA, index=unkeyable.index, dtype="string"
+        )
+        unkeyable["manual_review_source_note"] = pd.Series(
+            pd.NA, index=unkeyable.index, dtype="string"
+        )
+        unkeyable["manual_main_eligible"] = pd.Series(
+            0, index=unkeyable.index, dtype="int8"
+        )
+        unkeyable["manual_confirmed_eligible"] = pd.Series(
+            0, index=unkeyable.index, dtype="int8"
+        )
+        processed = pd.concat(
+            [processed, unkeyable.loc[:, list(processed.columns)]],
+            ignore_index=True,
+        )
+    return (
+        processed.sort_values("_source_row_order", kind="stable")
+        .drop(columns="_source_row_order")
+        .reset_index(drop=True)
     )
 
 

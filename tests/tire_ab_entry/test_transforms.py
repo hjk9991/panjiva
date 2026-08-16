@@ -246,6 +246,41 @@ def test_finished_candidate_without_foreign_shipper_identity_is_unreviewable():
         build_review_items(source, game="finished")
 
 
+def test_unattributed_rows_without_candidate_flow_through_without_review():
+    attributed = _source_rows().iloc[[0]]
+    unattributed = _source_rows().iloc[[0]].copy()
+    unattributed["manufacturer_parent_id"] = pd.NA
+    unattributed["description_candidate_parent_id"] = pd.NA
+    unattributed["description_candidate"] = 0
+    unattributed["import_route"] = "unattributed"
+    unattributed["review_pending_technically_eligible"] = 0
+    unattributed["sensitivity_eligible"] = 0
+    unattributed["estimation_eligible"] = 0
+    source = pd.concat([attributed, unattributed], ignore_index=True)
+    items = build_review_items(source, game="finished")
+    assert len(items) == 1
+    reviews = items.drop(columns="value_usd").assign(
+        review_status="confirmed", source_note="human evidence"
+    )
+    reviewed = apply_manual_reviews(source, game="finished", reviews=reviews)
+    assert len(reviewed) == 2
+    assert list(reviewed["manual_main_eligible"]) == [1, 0]
+    assert list(reviewed["manual_confirmed_eligible"]) == [1, 0]
+    assert reviewed["import_route"].iat[1] == "unattributed"
+    assert pd.isna(reviewed["manufacturer_parent_id"].iat[1])
+    panel = build_quarterly_panels(reviewed, game="finished")["origin"]
+    assert panel["value_usd"].sum() == 120.0
+    assert panel["unattributed_value_usd"].sum() == 60.0
+
+
+def test_attributed_route_rows_still_require_manufacturer():
+    source = _source_rows().iloc[[0]].copy()
+    source["manufacturer_parent_id"] = pd.NA
+    source["description_candidate_parent_id"] = pd.NA
+    with pytest.raises(ValueError, match="manufacturer_parent_id or description"):
+        build_review_items(source, game="raw")
+
+
 def test_importer_attributed_rows_without_supplier_identity_form_unknown_bucket():
     source = pd.concat(
         [
