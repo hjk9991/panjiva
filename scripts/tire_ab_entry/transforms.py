@@ -727,8 +727,16 @@ def _with_review_keys(frame: pd.DataFrame, game: str) -> pd.DataFrame:
         mask = identity_value.isna() & values.notna() & values.gt(0)
         identity_type.loc[mask] = label
         identity_value.loc[mask] = values.loc[mask].astype("int64").astype("string")
-    if identity_value.isna().any():
+    # Rows attributed only through a supplier-side description candidate have no
+    # reviewable entity without a supplier identity; importer-attributed rows keep
+    # an explicit unknown-supplier bucket so their value stays in review coverage.
+    # A present description candidate implies candidate-only attribution because
+    # the SQL emits candidates only where importer and shipper parents missed.
+    missing_identity = identity_value.isna()
+    if (missing_identity & candidate_manufacturer.notna()).any():
         raise ValueError("review item lacks a stable supplier/plant identity")
+    identity_type.loc[missing_identity] = "unknown_supplier"
+    identity_value.loc[missing_identity] = "none"
     source["link_identity_type"] = identity_type
     source["link_identity_value"] = identity_value
     if game == "raw":

@@ -240,9 +240,32 @@ def test_finished_candidate_reviews_are_isolated_by_foreign_shipper():
 
 def test_finished_candidate_without_foreign_shipper_identity_is_unreviewable():
     source = _source_rows().iloc[[2]].copy()
+    source["manufacturer_parent_id"] = pd.NA
     source[["shipper_up", "shipper_companyid", "shipper_panjiva_id"]] = pd.NA
     with pytest.raises(ValueError, match="stable supplier/plant identity"):
         build_review_items(source, game="finished")
+
+
+def test_importer_attributed_rows_without_supplier_identity_form_unknown_bucket():
+    source = pd.concat(
+        [
+            _source_rows().iloc[[0]],
+            _source_rows().iloc[[0]].assign(origin_country="JPN"),
+        ],
+        ignore_index=True,
+    )
+    source[["shipper_up", "shipper_companyid", "shipper_panjiva_id"]] = pd.NA
+    items = build_review_items(source, game="raw")
+    assert len(items) == 2
+    assert set(items["link_identity_type"]) == {"unknown_supplier"}
+    assert set(items["link_identity_value"]) == {"none"}
+    assert set(items["origin_country"]) == {"KOR", "JPN"}
+    reviews = items.drop(columns="value_usd").assign(
+        review_status="probable", source_note="tire-input HS imported by manufacturer"
+    )
+    reviewed = apply_manual_reviews(source, game="raw", reviews=reviews)
+    assert list(reviewed["manual_main_eligible"]) == [1, 1]
+    assert list(reviewed["manual_confirmed_eligible"]) == [0, 0]
 
 
 @pytest.mark.parametrize(
