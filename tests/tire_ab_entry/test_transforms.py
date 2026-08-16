@@ -253,6 +253,7 @@ def test_unattributed_rows_without_candidate_flow_through_without_review():
     unattributed["description_candidate_parent_id"] = pd.NA
     unattributed["description_candidate"] = 0
     unattributed["import_route"] = "unattributed"
+    unattributed["origin_country"] = "MEX"
     unattributed["review_pending_technically_eligible"] = 0
     unattributed["sensitivity_eligible"] = 0
     unattributed["estimation_eligible"] = 0
@@ -271,6 +272,12 @@ def test_unattributed_rows_without_candidate_flow_through_without_review():
     panel = build_quarterly_panels(reviewed, game="finished")["origin"]
     assert panel["value_usd"].sum() == 120.0
     assert panel["unattributed_value_usd"].sum() == 60.0
+    artifacts = build_game_artifacts(
+        reviewed, game="finished", manufacturer_parent_ids=[1]
+    )
+    annual = artifacts["annual"]
+    assert set(annual["link_id"]) == {"KOR"}
+    assert set(annual["manufacturer_parent_id"].astype(int)) == {1}
 
 
 def test_attributed_route_rows_still_require_manufacturer():

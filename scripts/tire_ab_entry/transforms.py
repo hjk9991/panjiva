@@ -599,6 +599,10 @@ def _annual_origin_source(
     if not years:
         raise ValueError("study years cannot be empty")
     source = origin.assign(year=origin["year_quarter"].str.slice(0, 4).astype(int))
+    # Unattributed groups carry no manufacturer, so they are not sourcing links;
+    # both the activity aggregation and the ever-observed origin universe use
+    # attributed flows only.
+    source = source.loc[source["manufacturer_parent_id"].notna()]
     value_column = (
         "manual_main_eligible_value_usd"
         if "manual_main_eligible_value_usd" in source
