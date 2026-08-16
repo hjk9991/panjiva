@@ -58,6 +58,7 @@ def test_finished_sql_uses_sports_families_and_athletic_markets():
         build_finished_sql(PARENT_IDS, "2024-01-01", "2024-04-01")
     )
     assert "athletic_sports" in sql
+    assert "athletic_escalated_general" in sql
     assert "general_footwear_unreviewed" in sql
     for family in SPORTS_FAMILIES:
         assert repr(family).lower() in sql or f"'{family}'" in sql
@@ -90,18 +91,24 @@ def test_single_game_guards():
         extract_module._build_sql("raw", PARENT_IDS, "2024-01-01", "2024-04-01", None)
 
 
-def test_hs6_allocation_reviews_by_sports_family_prefix():
+def test_hs6_allocation_reviews_by_eligible_family_prefix():
     output = reference_hs6_allocation(
-        ["6404110090", "6404199020", "640219"], value_usd=90.0
+        ["6404110090", "6404199020", "640219", "6402120000"], value_usd=120.0
     )
     assert output["640411"]["hs_eligible"] == 1
-    assert output["640419"]["hs_eligible"] == 0
+    # 640419 joined the estimation market via the 2026-08-17 escalation.
+    assert output["640419"]["hs_eligible"] == 1
     assert output["640219"]["hs_eligible"] == 1
+    assert output["640212"]["hs_eligible"] == 0
     assert output["640411"]["allocated_value_usd"] == pytest.approx(30.0)
 
 
 def test_athletic_market_domains_and_output_contract():
-    assert FINISHED_MARKETS == {"athletic_sports", "general_footwear_unreviewed"}
+    assert FINISHED_MARKETS == {
+        "athletic_sports",
+        "athletic_escalated_general",
+        "general_footwear_unreviewed",
+    }
     assert "finished_market" in REQUIRED_OUTPUT_COLUMNS
     assert "finished_market" in TEXT_OUTPUT_COLUMNS
 

@@ -36,23 +36,48 @@ class HsFamily:
 
 
 # Athletic status is decidable at six digits (sports-footwear subheadings),
-# unlike the tire pilot where statistical depth was required.  Escalation
-# families are probed but stay out of the estimation market unless the
-# pre-registered brand-attributed boundary review admits them.
+# unlike the tire pilot where statistical depth was required.  The
+# pre-registered boundary escalation fired on 2026-08-17: sports codes
+# captured only 35.1% of strategic importer value, so the brand-attributed
+# general families were reviewed into the estimation market under a separate
+# label (athletic_escalated_general).  The Deckers UGG contamination in the
+# escalated label is a documented measurement caveat with a sports-only
+# robustness cut.
 HS_FAMILIES = MappingProxyType(
     {
         "640219": HsFamily("640219", "included"),
         "640319": HsFamily("640319", "included"),
         "640411": HsFamily("640411", "included"),
-        "640419": HsFamily("640419", "escalation_candidate"),
-        "640299": HsFamily("640299", "escalation_candidate"),
-        "640399": HsFamily("640399", "escalation_candidate"),
+        "640419": HsFamily("640419", "included_escalated"),
+        "640299": HsFamily("640299", "included_escalated"),
+        "640399": HsFamily("640399", "included_escalated"),
     }
 )
 SPORTS_FAMILIES = tuple(
     family for family, spec in HS_FAMILIES.items() if spec.status == "included"
 )
+ESCALATED_FAMILIES = tuple(
+    family
+    for family, spec in HS_FAMILIES.items()
+    if spec.status == "included_escalated"
+)
+ELIGIBLE_FAMILIES = (*SPORTS_FAMILIES, *ESCALATED_FAMILIES)
 PROBE_FAMILIES = tuple(HS_FAMILIES)
+
+# G10: Panjiva athletic origin value shares against 10-K disclosed
+# production-country pairs shares, for firms that disclose them.  Shipment
+# origins re-invoiced through Hong Kong/Taiwan are aggregated into Greater
+# China (approved 2026-08-17); the value-versus-pairs basis difference is a
+# documented tolerance component.
+GREATER_CHINA_ORIGINS = ("China", "Hong Kong", "Taiwan", "Macau")
+G10_DISCLOSED_SHARES = MappingProxyType(
+    {
+        "NIKE": MappingProxyType(
+            {"Vietnam": 0.50, "Indonesia": 0.27, "GREATER_CHINA": 0.18}
+        ),
+    }
+)
+G10_TOLERANCE = 0.10
 
 # "Nike, Inc" is deliberately specific: a bare "nike" substring floods the
 # candidate safeguard with unrelated company names.

@@ -11,6 +11,8 @@ import re
 from .config import (
     APPROVED_DATABASE,
     APPROVED_SCHEMA,
+    ELIGIBLE_FAMILIES,
+    ESCALATED_FAMILIES,
     MANUFACTURER_DESCRIPTION_ALIASES,
     MANUFACTURER_KEYS,
     PROBE_FAMILIES,
@@ -168,8 +170,12 @@ def reference_hs6_allocation(
     output: dict[str, dict[str, float | int]] = {}
     for hs6 in sorted(by_hs6):
         codes = by_hs6[hs6]
-        # Athletic status is decidable at six digits for footwear.
-        reviewed_count = len({code for code in codes if code[:6] in SPORTS_FAMILIES})
+        # Athletic status is decidable at six digits for footwear; the
+        # escalated general families are estimation-eligible after the
+        # 2026-08-17 boundary review.
+        reviewed_count = len(
+            {code for code in codes if code[:6] in ELIGIBLE_FAMILIES}
+        )
         unreviewed_count = len(codes) - reviewed_count
         output[hs6] = {
             "distinct_full_code_count": len(codes),
@@ -566,6 +572,8 @@ def _finished_scope_ctes(
     description: DescriptionIdentity | None,
 ) -> str:
     sports_families = ", ".join(repr(family) for family in SPORTS_FAMILIES)
+    escalated_families = ", ".join(repr(family) for family in ESCALATED_FAMILIES)
+    eligible_families = ", ".join(repr(family) for family in ELIGIBLE_FAMILIES)
     probe_families = ", ".join(repr(family) for family in PROBE_FAMILIES)
     if description is None:
         description_ctes = """
@@ -632,13 +640,17 @@ hs_scope as (
            case
                when h.hs6 in ({sports_families})
                    then 'athletic_sports'
+               when h.hs6 in ({escalated_families})
+                   then 'athletic_escalated_general'
                else 'general_footwear_unreviewed'
            end as finished_market,
            case
                when h.hs6 in ({sports_families}) then 'reviewed_estimation'
+               when h.hs6 in ({escalated_families})
+                   then 'reviewed_escalated_estimation'
                else 'general_footwear_unreviewed'
            end as hs_review_status,
-           iff(h.hs6 in ({sports_families}), 1, 0) as hs_eligible
+           iff(h.hs6 in ({eligible_families}), 1, 0) as hs_eligible
     from hs_with_counts h
     where h.hs6 in ({probe_families})
 ),

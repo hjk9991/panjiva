@@ -11,7 +11,10 @@ from pathlib import Path
 import pandas as pd
 
 from .config import (
+    G10_DISCLOSED_SHARES,
+    G10_TOLERANCE,
     GAMES,
+    GREATER_CHINA_ORIGINS,
     MANUFACTURER_KEYS,
     OUTPUT_ROOT,
     iter_quarters,
@@ -35,7 +38,7 @@ from .transforms import (
 REVIEW_KEYS = REVIEW_IDENTITY_COLUMNS
 REVIEW_STATUSES = {"confirmed", "probable", "unclear"}
 ADDITIVE = ("value_usd", "weight_kg", "teu", "container_count", "shipment_equivalent")
-REQUIRED_GATES = {"G0", "G1", "G2", "G3", "G4", "G5", "G7", "G8", "G9"}
+REQUIRED_GATES = {"G0", "G1", "G2", "G3", "G4", "G5", "G7", "G8", "G9", "G10"}
 G0_COLUMNS = (
     "game",
     "quarter",
@@ -302,6 +305,7 @@ ORIGIN_VALIDATION_BASIS = (
 )
 FINISHED_MARKETS = {
     "athletic_sports",
+    "athletic_escalated_general",
     "general_footwear_unreviewed",
 }
 RAW_ROUTES = {"manufacturer_direct", "unattributed"}
@@ -547,6 +551,62 @@ def _g8(annual: Mapping[str, pd.DataFrame], seed: pd.DataFrame) -> dict:
     )
 
 
+def _g10(finished: pd.DataFrame, seed: pd.DataFrame) -> dict:
+    """Panjiva athletic origin value shares versus 10-K production shares.
+
+    Shipment origins in Greater China are aggregated (re-invoicing hubs mask
+    the production country); the value-versus-pairs basis difference is part
+    of the documented tolerance.  Applies only to firms with disclosed
+    country shares.
+    """
+
+    labels = dict(
+        zip(
+            pd.to_numeric(seed["manufacturer_parent_id"], errors="coerce"),
+            seed["manufacturer_key"].astype(str),
+        )
+    )
+    scoped = finished.copy()
+    scoped["manufacturer"] = pd.to_numeric(
+        scoped["manufacturer_parent_id"], errors="coerce"
+    ).map(labels)
+    scoped["year"] = (
+        scoped["year_quarter"].astype("string").str.slice(0, 4).astype(int)
+    )
+    scoped = scoped[
+        scoped["manufacturer"].notna()
+        & scoped["year"].isin((2022, 2023, 2024))
+        & pd.to_numeric(scoped["hs_eligible"], errors="coerce").eq(1)
+    ]
+    worst_gap = 0.0
+    checked = []
+    valid = True
+    for firm, disclosed in G10_DISCLOSED_SHARES.items():
+        firm_rows = scoped[scoped["manufacturer"].eq(firm)]
+        total = float(firm_rows["value_usd"].sum())
+        if total <= 0:
+            valid = False
+            checked.append(f"{firm}=no_value")
+            continue
+        origin = firm_rows["origin_country"].astype(str)
+        grouped = origin.where(
+            ~origin.isin(GREATER_CHINA_ORIGINS), "GREATER_CHINA"
+        )
+        shares = firm_rows.groupby(grouped)["value_usd"].sum() / total
+        for country, target in disclosed.items():
+            gap = abs(float(shares.get(country, 0.0)) - float(target))
+            worst_gap = max(worst_gap, gap)
+            valid &= gap <= G10_TOLERANCE
+        checked.append(firm)
+    detail = (
+        "Panjiva athletic origin value shares within "
+        f"{G10_TOLERANCE:.2f} of 10-K production shares "
+        f"(Greater China aggregated; value-vs-pairs basis documented); "
+        f"firms={','.join(checked)}"
+    )
+    return _gate("G10", "pass" if valid else "fail", worst_gap, detail)
+
+
 def _g9(paths: Iterable[Path | str], root: Path | str) -> dict:
     canonical_root = Path(root).resolve(strict=False)
     checked = [Path(path).resolve(strict=False) for path in paths]
@@ -579,6 +639,7 @@ def evaluate_gates(
             _g7(review_queue),
             _g8(annual_origin, parent_seed),
             _g9(licensed_paths, licensed_root),
+            _g10(chunks[GAMES[0]], parent_seed),
         ]
     )
     required = gates.loc[gates["gate"].isin(REQUIRED_GATES)]
