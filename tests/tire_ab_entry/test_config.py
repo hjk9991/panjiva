@@ -89,6 +89,16 @@ def test_finished_scope_keeps_probe_prefixes_separate_from_reviewed_codes():
     assert all(code.startswith(("401110", "401120")) for code in REVIEWED_ESTIMATION_CODES)
     assert any(code.startswith("401120") and len(code) > 6 for code in REVIEWED_ESTIMATION_CODES)
     assert REVIEWED_ESTIMATION_CODES != FINISHED_PROBE_PREFIXES
+    # 2026-08-16 reviewed decision: HS6 4011.10 is passenger-car tires by
+    # heading definition, so every 401110-family depth is estimation-eligible;
+    # bare 401120 stays out because HS6 cannot separate light from heavy truck.
+    assert "401110" in REVIEWED_ESTIMATION_CODES
+    assert "401120" not in REVIEWED_ESTIMATION_CODES
+    assert all(
+        len(code) == 10
+        for code in REVIEWED_ESTIMATION_CODES
+        if code.startswith("401120")
+    )
 
 
 def test_parent_targets_are_exact_and_immutable():

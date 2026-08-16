@@ -46,10 +46,24 @@ RAW_GROUPS = MappingProxyType(
 )
 
 # Probe both finished-tire HS6 families, but estimate only from the reviewed
-# passenger and on-highway light-truck statistical reporting codes.
+# codes. Reviewed 2026-08-16 against observed Panjiva codes: HS6 4011.10 is
+# passenger-car tires by heading definition, so every observed 401110-family
+# reporting depth (6/8/10-digit, incl. historical rim-diameter suffixes) is
+# passenger; HS6 4011.20 mixes light and medium/heavy truck, so only explicit
+# on-highway light-truck statistical codes qualify.
 FINISHED_PROBE_PREFIXES = ("401110", "401120")
 REVIEWED_ESTIMATION_CODES = (
+    "401110",
+    "40111010",
+    "40111050",
     "4011101000",
+    "4011101010",
+    "4011101020",
+    "4011101030",
+    "4011101040",
+    "4011101050",
+    "4011101060",
+    "4011101070",
     "4011105000",
     "4011201005",
     "4011205010",
