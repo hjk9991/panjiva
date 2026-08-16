@@ -1,0 +1,1039 @@
+"""Atomic, resumable extraction for the licensed tire AB-entry package."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import re
+import tempfile
+import time
+from datetime import date
+from datetime import datetime, timezone
+from contextlib import contextmanager
+from dataclasses import dataclass
+from io import BytesIO
+import threading
+from typing import Callable, Iterable, Mapping
+
+import pandas as pd
+
+from . import artifacts
+from .config import (
+    GAMES,
+    MANUFACTURER_KEYS,
+    MANUFACTURER_PARENT_TARGETS,
+    OUTPUT_ROOT,
+    iter_quarters,
+    validate_output_path,
+)
+from .sql import DescriptionIdentity, build_finished_sql
+from .schema_probe import SCHEMA_OUTPUT_PATH, choose_description_column
+
+try:
+    import msvcrt
+except ImportError:  # pragma: no cover - licensed writes are Windows-only
+    msvcrt = None
+
+
+CONTRACT_VERSION = "tire-extraction-contract-v3"
+MANIFEST_VERSION = "tire-extraction-manifest-v1"
+CODE_VERSION = "tire-extraction-code-v3"
+PARENT_SEED_PATH = OUTPUT_ROOT / "review" / "manufacturer_parent_seed.csv"
+PARENT_CANDIDATE_POINTER_PATH = (
+    OUTPUT_ROOT / "review" / "manufacturer_parent_candidates.current.json"
+)
+SEED_COLUMNS = (
+    "manufacturer_key",
+    "manufacturer_parent_id",
+    "review_status",
+    "reviewer",
+    "reviewed_at_utc",
+    "source_candidate_generation_id",
+    "source_candidate_pointer_sha256",
+    "source_candidate_metadata_sha256",
+)
+
+
+@dataclass(frozen=True)
+class ParentSeedSnapshot:
+    """One validated in-memory CSV snapshot and the hash of those exact bytes."""
+
+    parent_ids: dict[str, int]
+    sha256: str
+
+
+ADDITIVE_MEASURES = (
+    "shipment_equivalent",
+    "value_usd",
+    "weight_kg",
+    "teu",
+    "container_count",
+)
+OUTPUT_KEY_COLUMNS = (
+    "manufacturer_parent_id",
+    "importer_companyid",
+    "importer_up",
+    "shipper_panjiva_id",
+    "shipper_companyid",
+    "shipper_up",
+    "origin_country",
+    "year_quarter",
+    "hs_full_code",
+    "hs6",
+    "input_group",
+    "finished_market",
+    "hs_review_status",
+    "hs_eligible",
+    "distinct_full_code_count",
+    "reviewed_full_code_count",
+    "unreviewed_full_code_count",
+    "mixed_review",
+    "description_candidate_parent_id",
+    "description_match_count",
+    "description_ambiguous",
+    "description_matched_alias",
+    "description_alias_count",
+    "importer_xref_distinct_candidate_count",
+    "shipper_xref_distinct_candidate_count",
+    "importer_xref_ambiguous",
+    "shipper_xref_ambiguous",
+    "importer_pit_distinct_parent_candidate_count",
+    "shipper_pit_distinct_parent_candidate_count",
+    "importer_pit_distinct_interval_match_count",
+    "shipper_pit_distinct_interval_match_count",
+    "importer_pit_ambiguous",
+    "shipper_pit_ambiguous",
+    "importer_pit_same_parent_overlap",
+    "shipper_pit_same_parent_overlap",
+    "importer_ownership_source",
+    "shipper_ownership_source",
+    "importer_historical_backcast",
+    "shipper_historical_backcast",
+    "relationship",
+    "import_route",
+    "supplier_relationship",
+    "review_pending_technically_eligible",
+    "sensitivity_eligible",
+    "estimation_eligible",
+)
+DIAGNOSTIC_NAMES = (
+    "manufacturer_conflict",
+    "importer_xref_unmatched",
+    "shipper_xref_unmatched",
+    "importer_xref_ambiguous",
+    "shipper_xref_ambiguous",
+    "importer_pit_ambiguous",
+    "shipper_pit_ambiguous",
+    "importer_pit_same_parent_overlap",
+    "shipper_pit_same_parent_overlap",
+    "importer_current_parent_fallback",
+    "shipper_current_parent_fallback",
+    "importer_self_fallback",
+    "shipper_self_fallback",
+    "importer_historical_backcast",
+    "shipper_historical_backcast",
+    "description_candidate",
+    "description_ambiguous",
+    "unattributed",
+    "hs_review",
+    "main_ineligible",
+)
+DIAGNOSTIC_MEASURES = tuple(
+    f"{name}_{suffix}"
+    for name in DIAGNOSTIC_NAMES
+    for suffix in ("shipment_count_nonadditive", "shipment_equivalent", "value_usd")
+)
+REQUIRED_OUTPUT_COLUMNS = (
+    *OUTPUT_KEY_COLUMNS,
+    "unique_shipment_count_nonadditive",
+    "shipment_count_nonadditive",
+    "shipment_count_compatibility_nonadditive",
+    *ADDITIVE_MEASURES,
+    "manufacturer_conflict",
+    "description_candidate",
+    *DIAGNOSTIC_MEASURES,
+)
+TEXT_OUTPUT_COLUMNS = {
+    "origin_country",
+    "year_quarter",
+    "hs_full_code",
+    "hs6",
+    "input_group",
+    "finished_market",
+    "hs_review_status",
+    "description_matched_alias",
+    "importer_ownership_source",
+    "shipper_ownership_source",
+    "relationship",
+    "import_route",
+    "supplier_relationship",
+}
+
+
+def sha256_file(path: Path | str) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def atomic_parquet(frame: pd.DataFrame, target: Path | str) -> str:
+    """Write, fsync, exactly validate, and atomically replace one Parquet file."""
+
+    destination = validate_output_path(target)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination = validate_output_path(destination)
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=f".{destination.name}.extract-",
+        suffix=".tmp",
+        dir=destination.parent,
+    )
+    temporary = Path(temporary_name)
+    os.close(fd)
+    try:
+        frame.to_parquet(temporary, index=False)
+        with temporary.open("r+b") as handle:
+            os.fsync(handle.fileno())
+        restored = pd.read_parquet(temporary)
+        try:
+            pd.testing.assert_frame_equal(
+                restored.reset_index(drop=True),
+                frame.reset_index(drop=True),
+                check_dtype=True,
+                check_like=False,
+            )
+        except AssertionError as error:
+            raise RuntimeError("Parquet exact-content validation failed") from error
+        digest = sha256_file(temporary)
+        os.replace(validate_output_path(temporary), validate_output_path(destination))
+        if sha256_file(destination) != digest:
+            raise RuntimeError("Parquet replacement checksum validation failed")
+        return digest
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def output_schema_fingerprint(frame: pd.DataFrame) -> str:
+    contract = [(str(column), str(dtype)) for column, dtype in frame.dtypes.items()]
+    return hashlib.sha256(
+        json.dumps(contract, separators=(",", ":"), ensure_ascii=True).encode("ascii")
+    ).hexdigest()
+
+
+def quarter_bounds(year_quarter: str) -> tuple[str, str]:
+    match = re.fullmatch(r"([0-9]{4})Q([1-4])", year_quarter or "")
+    if match is None:
+        raise ValueError("quarter must use strict YYYYQ[1-4] syntax")
+    year = int(match.group(1))
+    quarter = int(match.group(2))
+    start_month = (quarter - 1) * 3 + 1
+    start = date(year, start_month, 1)
+    end = date(year + (quarter == 4), 1 if quarter == 4 else start_month + 3, 1)
+    return start.isoformat(), end.isoformat()
+
+
+def validate_game(game: str) -> str:
+    if game not in set(GAMES):
+        raise ValueError(f"game must be one of {GAMES}")
+    return game
+
+
+def chunk_path(
+    game: str,
+    quarter: str,
+    *,
+    output_root: Path | str = OUTPUT_ROOT,
+) -> Path:
+    validate_game(game)
+    quarter_bounds(quarter)
+    target = Path(output_root) / "_chunks" / game / f"{quarter}.parquet"
+    return validate_output_path(target) if Path(output_root) == OUTPUT_ROOT else target.resolve()
+
+
+def manifest_path(game: str, *, output_root: Path | str = OUTPUT_ROOT) -> Path:
+    validate_game(game)
+    target = Path(output_root) / "_manifests" / f"{game}.json"
+    return validate_output_path(target) if Path(output_root) == OUTPUT_ROOT else target.resolve()
+
+
+def load_parent_seed(
+    seed_path: Path | str = PARENT_SEED_PATH,
+    *,
+    candidate_pointer_path: Path | str = PARENT_CANDIDATE_POINTER_PATH,
+) -> ParentSeedSnapshot:
+    """Validate the human-reviewed seed and its current candidate provenance."""
+
+    seed = Path(seed_path)
+    pointer_path = Path(candidate_pointer_path)
+    try:
+        seed_bytes = seed.read_bytes()
+        seed_hash = hashlib.sha256(seed_bytes).hexdigest()
+        frame = pd.read_csv(
+            BytesIO(seed_bytes), dtype={"manufacturer_key": "string"}
+        )
+    except Exception as error:
+        raise ValueError("reviewed parent seed is missing or unreadable") from error
+    missing_columns = set(SEED_COLUMNS).difference(frame.columns)
+    if missing_columns:
+        raise ValueError(f"parent seed is missing columns: {sorted(missing_columns)}")
+    if len(frame) != len(MANUFACTURER_KEYS):
+        raise ValueError(
+            f"parent seed must have exactly {len(MANUFACTURER_KEYS)} rows"
+        )
+    keys = frame["manufacturer_key"].astype("string")
+    if keys.isna().any() or set(keys) != set(MANUFACTURER_KEYS) or keys.duplicated().any():
+        raise ValueError("parent seed must contain each approved manufacturer key exactly once")
+    numbers = pd.to_numeric(frame["manufacturer_parent_id"], errors="coerce")
+    if (
+        numbers.isna().any()
+        or not numbers.map(lambda value: float(value).is_integer()).all()
+        or (numbers <= 0).any()
+        or numbers.duplicated().any()
+    ):
+        raise ValueError("parent seed IDs must be unique positive integral values")
+    if not frame["review_status"].astype("string").eq("reviewed").all():
+        raise ValueError("parent seed rows must have reviewed status")
+    reviewers = frame["reviewer"].astype("string").str.strip()
+    if reviewers.isna().any() or reviewers.eq("").any():
+        raise ValueError("parent seed reviewer is required")
+    timestamps = frame["reviewed_at_utc"].astype("string")
+    strict_utc = timestamps.str.fullmatch(
+        r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?Z"
+    )
+    parsed = pd.to_datetime(timestamps, utc=True, errors="coerce")
+    if not strict_utc.all() or parsed.isna().any():
+        raise ValueError("parent seed reviewed_at_utc must be a valid UTC timestamp")
+    try:
+        pointer_bytes = pointer_path.read_bytes()
+        pointer_hash = hashlib.sha256(pointer_bytes).hexdigest()
+        loaded_pointer = json.loads(pointer_bytes.decode("utf-8"))
+        generation = artifacts.resolve_candidate_generation_manifest(
+            pointer_path, loaded_pointer
+        )
+    except Exception as error:
+        raise ValueError("parent seed candidate provenance is unreadable") from error
+    provenance = {
+        "source_candidate_generation_id": generation["generation_id"],
+        "source_candidate_pointer_sha256": pointer_hash,
+        "source_candidate_metadata_sha256": generation["metadata_sha256"],
+    }
+    for column, expected_value in provenance.items():
+        values = frame[column].astype("string")
+        if values.isna().any() or not values.eq(str(expected_value)).all():
+            raise ValueError("parent seed candidate provenance is stale or inconsistent")
+    keyed = dict(zip(keys, numbers.astype("int64"), strict=True))
+    try:
+        candidates = pd.read_parquet(generation["canonical_path"])
+        required_candidates = {"target_search_term", "current_ultimate_parent_id"}
+        if not required_candidates.issubset(candidates.columns):
+            raise ValueError
+        candidate_ids = pd.to_numeric(
+            candidates["current_ultimate_parent_id"], errors="coerce"
+        )
+    except Exception as error:
+        raise ValueError("parent seed source candidate contract is invalid") from error
+    for key, target_name in zip(
+        MANUFACTURER_KEYS, MANUFACTURER_PARENT_TARGETS, strict=True
+    ):
+        available = set(
+            candidate_ids.loc[candidates["target_search_term"].eq(target_name)]
+            .dropna()
+            .astype("int64")
+        )
+        if int(keyed[key]) not in available:
+            raise ValueError("parent seed selection is absent from its keyed candidates")
+    return ParentSeedSnapshot(
+        parent_ids={key: int(keyed[key]) for key in MANUFACTURER_KEYS},
+        sha256=seed_hash,
+    )
+
+
+def validate_output_frame(frame: pd.DataFrame, quarter: str) -> pd.DataFrame:
+    """Fail closed on the additive result contract while allowing typed empties."""
+
+    quarter_bounds(quarter)
+    if frame.columns.duplicated().any():
+        raise ValueError("output has duplicate columns")
+    actual_columns = tuple(str(column) for column in frame.columns)
+    if actual_columns != REQUIRED_OUTPUT_COLUMNS:
+        missing = sorted(set(REQUIRED_OUTPUT_COLUMNS).difference(actual_columns))
+        extra = sorted(set(actual_columns).difference(REQUIRED_OUTPUT_COLUMNS))
+        raise ValueError(
+            "output does not match the exact required columns "
+            f"(missing={missing}, extra={extra}, order_mismatch="
+            f"{not missing and not extra})"
+        )
+    if not frame.empty and not frame["year_quarter"].astype("string").eq(quarter).all():
+        raise ValueError("output quarter does not match requested quarter")
+    numeric_columns = [
+        column
+        for column in frame.columns
+        if pd.api.types.is_numeric_dtype(frame[column].dtype)
+    ]
+    required_numeric = set(REQUIRED_OUTPUT_COLUMNS).difference(TEXT_OUTPUT_COLUMNS)
+    if not required_numeric.issubset(numeric_columns):
+        raise ValueError("output additive and count columns must be numeric")
+    for column in numeric_columns:
+        values = pd.to_numeric(frame[column], errors="coerce")
+        non_null = values.dropna().astype("float64")
+        if not np_isfinite(non_null):
+            raise ValueError(f"output numeric column {column} must be finite")
+        if (non_null < 0).any():
+            raise ValueError(f"output numeric column {column} must be nonnegative")
+    if not frame.empty:
+        unique = pd.to_numeric(
+            frame["unique_shipment_count_nonadditive"], errors="coerce"
+        )
+        if (
+            unique.isna().any()
+            or unique.nunique(dropna=False) != 1
+            or not float(unique.iat[0]).is_integer()
+        ):
+            raise ValueError(
+                "output chunk-global unique shipment diagnostic is invalid"
+            )
+    if frame.duplicated(list(OUTPUT_KEY_COLUMNS)).any():
+        raise ValueError("output has duplicate final keys")
+    return frame
+
+
+def np_isfinite(values: pd.Series) -> bool:
+    return all(math.isfinite(float(value)) for value in values)
+
+
+def sql_contract_sha256(
+    sql: str,
+    parent_ids: Mapping[str, int],
+    date_start: str,
+    date_end: str,
+    description_identity,
+) -> str:
+    description = None
+    if description_identity is not None:
+        description = {
+            field: getattr(description_identity, field)
+            for field in ("catalog", "schema", "table", "column")
+        }
+    payload = {
+        "sql": sql,
+        "parent_ids": sorted((str(key), int(value)) for key, value in parent_ids.items()),
+        "date_start": date_start,
+        "date_end": date_end,
+        "description_identity": description,
+        "contract_version": CONTRACT_VERSION,
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def classify_error(error: Exception) -> str:
+    message = str(error).casefold()
+    name = type(error).__name__.casefold()
+    sqlstate = str(getattr(error, "sqlstate", "") or "").strip().upper()
+    raw_errno = getattr(error, "errno", None)
+    try:
+        errno = int(raw_errno) if raw_errno is not None else None
+    except (TypeError, ValueError):
+        errno = None
+
+    authentication_markers = (
+        "authentication failed",
+        "incorrect username",
+        "incorrect password",
+        "login failed",
+        "invalid credential",
+        "invalid username or password",
+    )
+    authentication_errnos = {390100, 390101}
+    if (
+        sqlstate.startswith("28")
+        or errno in authentication_errnos
+        or any(token in message for token in authentication_markers)
+    ):
+        return "authentication"
+    authorization_markers = (
+        "insufficient privilege",
+        "permission denied",
+        "access denied",
+        "not authorized",
+        "not permitted",
+        "unauthorized role",
+    )
+    if sqlstate == "42501" or any(
+        token in message for token in authorization_markers
+    ):
+        return "authorization"
+    contract_markers = (
+        "syntax error",
+        "sql compilation",
+        "invalid identifier",
+        "schema mismatch",
+        "invalid sql",
+        "bind variable",
+    )
+    if (
+        isinstance(error, (ValueError, TypeError))
+        or "programmingerror" in name
+        or (sqlstate.startswith(("22", "23", "42")) and sqlstate != "42501")
+        or errno == 1003
+        or any(token in message for token in contract_markers)
+    ):
+        return "contract"
+    transient_sqlstates = {
+        "08000",
+        "08001",
+        "08003",
+        "08004",
+        "08006",
+        "08S01",
+        "57P03",
+    }
+    transient_errnos = {250002, 250003, 250005, 250006, 250007, 250010}
+    transient_markers = (
+        "connection reset",
+        "connection aborted",
+        "network socket",
+        "network error",
+        "timed out",
+        "timeout",
+        "service temporarily unavailable",
+        "temporary service failure",
+        "session temporarily unavailable",
+        "session renewal failed",
+        "warehouse is restarting",
+        "warehouse is resuming",
+        "warehouse temporarily unavailable",
+    )
+    explicit_transient_class = isinstance(
+        error, (ConnectionError, TimeoutError)
+    ) or any(
+        token in name
+        for token in ("networkerror", "timeouterror", "connectionerror")
+    )
+    if (
+        sqlstate in transient_sqlstates
+        or errno in transient_errnos
+        or explicit_transient_class
+        or any(token in message for token in transient_markers)
+    ):
+        return "transient"
+    return "operation"
+
+
+def query_with_retry(
+    query: Callable[[], pd.DataFrame],
+    *,
+    sleep_fn: Callable[[float], None] = time.sleep,
+) -> tuple[pd.DataFrame, int]:
+    for attempt in range(1, 4):
+        try:
+            return query(), attempt
+        except Exception as error:
+            if classify_error(error) != "transient" or attempt == 3:
+                raise
+            sleep_fn(min(30.0, float(2 ** (attempt - 1))))
+    raise AssertionError("unreachable")
+
+
+def pending_chunks(
+    chunks: Iterable[str],
+    manifest: dict,
+    *,
+    expected: Mapping[str, Mapping[str, object]] | None = None,
+) -> list[str]:
+    """Return input-ordered chunks that do not have a recorded success."""
+
+    if expected is not None:
+        _validate_manifest_contract(manifest)
+    entries = manifest.get("chunks", {}) if isinstance(manifest, dict) else {}
+    pending = []
+    for chunk in chunks:
+        entry = entries.get(chunk)
+        verified = isinstance(entry, dict) and entry.get("status") == "success"
+        if verified and expected is not None:
+            contract = expected.get(chunk)
+            verified = isinstance(contract, Mapping) and _verified_success_entry(
+                chunk, entry, contract
+            )
+        if not verified:
+            pending.append(chunk)
+    return pending
+
+
+class ChunkExtractionError(RuntimeError):
+    """A redacted chunk failure safe for manifests and CLI summaries."""
+
+    def __init__(self, category: str):
+        self.category = category
+        super().__init__(f"chunk extraction failed ({category})")
+
+
+class ManifestContractError(RuntimeError):
+    """An existing manifest cannot safely be used or overwritten."""
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def execute_dataframe_query(connection, sql: str) -> pd.DataFrame:
+    """Execute one query and close its cursor on every path."""
+
+    cursor = connection.cursor()
+    primary_error = None
+    try:
+        return cursor.execute(sql).fetch_pandas_all()
+    except Exception as error:
+        primary_error = error
+        raise
+    finally:
+        try:
+            cursor.close()
+        except Exception as close_error:
+            if primary_error is None:
+                raise RuntimeError("cursor cleanup failed") from close_error
+
+
+_LOCKS_GUARD = threading.Lock()
+_THREAD_LOCKS: dict[str, threading.Lock] = {}
+
+
+@contextmanager
+def extraction_lock(path: Path | str, *, timeout_seconds: float = 30.0):
+    """Use a process-local mutex plus a Windows kernel byte-range lock."""
+
+    if msvcrt is None:
+        raise RuntimeError("licensed extraction locking requires Windows")
+    lock_path = Path(path).resolve()
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    identity = os.path.normcase(str(lock_path))
+    with _LOCKS_GUARD:
+        thread_lock = _THREAD_LOCKS.setdefault(identity, threading.Lock())
+    if not thread_lock.acquire(timeout=timeout_seconds):
+        raise TimeoutError("extraction lock timed out")
+    fd = None
+    try:
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR)
+        if os.fstat(fd).st_size == 0:
+            os.write(fd, b"\0")
+            os.fsync(fd)
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            os.lseek(fd, 0, os.SEEK_SET)
+            try:
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("extraction lock timed out")
+                time.sleep(0.05)
+        try:
+            yield lock_path
+        finally:
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+    finally:
+        if fd is not None:
+            os.close(fd)
+        thread_lock.release()
+
+
+def _read_manifest(path: Path) -> dict:
+    if not path.exists():
+        return {"manifest_version": MANIFEST_VERSION, "chunks": {}}
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ManifestContractError("existing manifest is unreadable or corrupt") from error
+    _validate_manifest_contract(manifest)
+    return manifest
+
+
+SUCCESS_ENTRY_FIELDS = {
+    "quarter",
+    "game",
+    "status",
+    "attempt_count",
+    "row_count",
+    "allocated_value_usd_sum",
+    "shipment_equivalent_sum",
+    "unique_shipment_count_nonadditive",
+    "nonadditive_count_sum",
+    "sql_sha256",
+    "parent_seed_sha256",
+    "output_schema_fingerprint",
+    "file_sha256",
+    "output_path",
+    "started_at",
+    "finished_at",
+    "code_version",
+    "contract_version",
+}
+
+
+def _validate_manifest_contract(manifest: object) -> None:
+    if not isinstance(manifest, dict) or set(manifest) != {
+        "manifest_version",
+        "chunks",
+    }:
+        raise ManifestContractError("existing manifest has a malformed top-level contract")
+    if manifest.get("manifest_version") != MANIFEST_VERSION:
+        raise ManifestContractError("existing manifest version does not match runtime")
+    chunks = manifest.get("chunks")
+    if not isinstance(chunks, dict) or not all(
+        isinstance(key, str) and isinstance(value, dict)
+        for key, value in chunks.items()
+    ):
+        raise ManifestContractError("existing manifest chunks contract is malformed")
+
+
+def _manifest_metrics(frame: pd.DataFrame) -> dict[str, int | float]:
+    unique = (
+        0
+        if frame.empty
+        else int(pd.to_numeric(frame["unique_shipment_count_nonadditive"]).iat[0])
+    )
+    return {
+        "row_count": int(len(frame)),
+        "allocated_value_usd_sum": float(frame["value_usd"].sum()),
+        "shipment_equivalent_sum": float(frame["shipment_equivalent"].sum()),
+        "unique_shipment_count_nonadditive": unique,
+        "nonadditive_count_sum": float(frame["shipment_count_nonadditive"].sum()),
+    }
+
+
+def _verified_success_entry(
+    chunk_key: str, entry: Mapping[str, object], contract: Mapping[str, object]
+) -> bool:
+    if set(entry) != SUCCESS_ENTRY_FIELDS or entry.get("status") != "success":
+        return False
+    try:
+        game, quarter = chunk_key.split("/", 1)
+        validate_game(game)
+        quarter_bounds(quarter)
+        if entry.get("game") != game or entry.get("quarter") != quarter:
+            return False
+        if entry.get("code_version") != CODE_VERSION:
+            return False
+        if entry.get("contract_version") != CONTRACT_VERSION:
+            return False
+        if not isinstance(entry.get("attempt_count"), int) or int(
+            entry["attempt_count"]
+        ) < 1:
+            return False
+        for field in (
+            "sql_sha256",
+            "parent_seed_sha256",
+            "output_schema_fingerprint",
+            "contract_version",
+            "output_path",
+        ):
+            if field in contract and contract.get(field) is not None:
+                if entry.get(field) != contract.get(field):
+                    return False
+        path = Path(str(contract.get("output_path", "")))
+        if not path.is_file() or entry.get("file_sha256") != sha256_file(path):
+            return False
+        restored = pd.read_parquet(path)
+        validate_output_frame(restored, quarter)
+        if output_schema_fingerprint(restored) != entry.get(
+            "output_schema_fingerprint"
+        ):
+            return False
+        metrics = _manifest_metrics(restored)
+        return all(entry.get(field) == value for field, value in metrics.items())
+    except Exception:
+        return False
+
+
+def _entry_file_verified(entry: object) -> bool:
+    if not isinstance(entry, dict) or entry.get("status") != "success":
+        return False
+    try:
+        key = f"{entry['game']}/{entry['quarter']}"
+        return _verified_success_entry(
+            key,
+            entry,
+            {
+                "output_path": entry["output_path"],
+                "sql_sha256": entry["sql_sha256"],
+                "parent_seed_sha256": entry["parent_seed_sha256"],
+                "contract_version": CONTRACT_VERSION,
+            },
+        )
+    except Exception:
+        return False
+
+
+def _atomic_json(payload: dict, target: Path) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(
+        prefix=f".{target.name}.extract-", suffix=".tmp", dir=target.parent
+    )
+    temporary = Path(name)
+    try:
+        encoded = json.dumps(
+            payload, sort_keys=True, indent=2, ensure_ascii=False, allow_nan=False
+        ).encode("utf-8")
+        with os.fdopen(fd, "wb", closefd=True) as handle:
+            fd = -1
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if json.loads(temporary.read_text(encoding="utf-8")) != payload:
+            raise RuntimeError("manifest validation failed")
+        os.replace(temporary, target)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        temporary.unlink(missing_ok=True)
+
+
+def update_manifest_entry(path: Path, chunk_key: str, entry: dict) -> dict:
+    """Atomically merge an entry while serializing all writers to one manifest."""
+
+    with extraction_lock(path.with_name(f".{path.name}.lock")):
+        manifest = _read_manifest(path)
+        manifest["manifest_version"] = MANIFEST_VERSION
+        manifest.setdefault("chunks", {})[chunk_key] = entry
+        _atomic_json(manifest, path)
+        return manifest
+
+
+def _build_sql(game, parent_ids, start, end, description_identity):
+    if game != "finished":
+        raise ValueError("the footwear pilot has a single finished game")
+    return build_finished_sql(parent_ids, start, end, description_identity)
+
+
+def extract_chunk(
+    connection,
+    game: str,
+    quarter: str,
+    parent_ids: Mapping[str, int],
+    *,
+    parent_seed_sha256: str,
+    description_identity=None,
+    output_root: Path | str = OUTPUT_ROOT,
+    query_fn: Callable[[object, str], pd.DataFrame] | None = None,
+    sleep_fn: Callable[[float], None] = time.sleep,
+) -> dict:
+    """Extract one game-quarter under a kernel lock with strict resume checks."""
+
+    validate_game(game)
+    start, end = quarter_bounds(quarter)
+    target = chunk_path(game, quarter, output_root=output_root)
+    manifest_target = manifest_path(game, output_root=output_root)
+    sql = _build_sql(game, parent_ids, start, end, description_identity)
+    sql_hash = sql_contract_sha256(
+        sql, parent_ids, start, end, description_identity
+    )
+    chunk_key = f"{game}/{quarter}"
+    expectation = {
+        chunk_key: {
+            "output_path": str(target),
+            "sql_sha256": sql_hash,
+            "parent_seed_sha256": parent_seed_sha256,
+            "contract_version": CONTRACT_VERSION,
+        }
+    }
+    lock_target = target.with_name(f".{target.name}.lock")
+    with extraction_lock(lock_target):
+        manifest = _read_manifest(manifest_target)
+        if not pending_chunks([chunk_key], manifest, expected=expectation):
+            return {"status": "skipped", "game": game, "quarter": quarter}
+        previous = manifest.get("chunks", {}).get(chunk_key)
+        started = _utc_now()
+        attempts = 0
+        query = query_fn or execute_dataframe_query
+        try:
+            while True:
+                attempts += 1
+                try:
+                    frame = query(connection, sql)
+                    break
+                except Exception as error:
+                    category = classify_error(error)
+                    if category != "transient" or attempts >= 3:
+                        raise
+                    sleep_fn(min(30.0, float(2 ** (attempts - 1))))
+            if not isinstance(frame, pd.DataFrame):
+                raise ValueError("query result must be a dataframe")
+            frame = frame.copy()
+            frame.columns = [str(column).strip().lower() for column in frame.columns]
+            validate_output_frame(frame, quarter)
+            file_hash = atomic_parquet(frame, target)
+            entry = {
+                "quarter": quarter,
+                "game": game,
+                "status": "success",
+                "attempt_count": attempts,
+                "row_count": int(len(frame)),
+                "allocated_value_usd_sum": float(frame["value_usd"].sum()),
+                "shipment_equivalent_sum": float(frame["shipment_equivalent"].sum()),
+                "unique_shipment_count_nonadditive": int(
+                    _manifest_metrics(frame)["unique_shipment_count_nonadditive"]
+                ),
+                "nonadditive_count_sum": float(frame["shipment_count_nonadditive"].sum()),
+                "sql_sha256": sql_hash,
+                "parent_seed_sha256": parent_seed_sha256,
+                "output_schema_fingerprint": output_schema_fingerprint(frame),
+                "file_sha256": file_hash,
+                "output_path": str(target),
+                "started_at": started,
+                "finished_at": _utc_now(),
+                "code_version": CODE_VERSION,
+                "contract_version": CONTRACT_VERSION,
+            }
+            update_manifest_entry(manifest_target, chunk_key, entry)
+            return entry
+        except Exception as error:
+            category = classify_error(error)
+            failed = {
+                "quarter": quarter,
+                "game": game,
+                "status": "failed",
+                "attempt_count": attempts,
+                "row_count": 0,
+                "allocated_value_usd_sum": 0.0,
+                "shipment_equivalent_sum": 0.0,
+                "unique_shipment_count_nonadditive": 0,
+                "nonadditive_count_sum": 0.0,
+                "sql_sha256": sql_hash,
+                "parent_seed_sha256": parent_seed_sha256,
+                "output_schema_fingerprint": None,
+                "file_sha256": None,
+                "output_path": str(target),
+                "started_at": started,
+                "finished_at": _utc_now(),
+                "error_category": category,
+                "redacted_error": "chunk operation failed",
+                "code_version": CODE_VERSION,
+                "contract_version": CONTRACT_VERSION,
+            }
+            if not _entry_file_verified(previous):
+                update_manifest_entry(manifest_target, chunk_key, failed)
+            raise ChunkExtractionError(category) from error
+
+
+def load_description_identity(
+    schema_path: Path | str = SCHEMA_OUTPUT_PATH,
+) -> DescriptionIdentity | None:
+    """Resolve only an identity present in the current persisted Task4 probe."""
+
+    try:
+        frame = pd.read_parquet(schema_path)
+    except Exception as error:
+        raise ValueError("schema probe artifact is missing or unreadable") from error
+    identity_columns = (
+        "table_catalog",
+        "table_schema",
+        "table_name",
+        "column_name",
+    )
+    if not set(identity_columns).issubset(frame.columns) or frame.empty:
+        raise ValueError("schema probe artifact does not satisfy its identity contract")
+    identities = list(
+        frame.loc[:, list(identity_columns)].itertuples(index=False, name=None)
+    )
+    selected = choose_description_column(identities)
+    return DescriptionIdentity(*selected) if selected is not None else None
+
+
+def extract_full(
+    connection,
+    *,
+    game: str,
+    parent_ids: Mapping[str, int],
+    parent_seed_sha256: str,
+    description_identity=None,
+    output_root: Path | str = OUTPUT_ROOT,
+    query_fn: Callable[[object, str], pd.DataFrame] | None = None,
+    sleep_fn: Callable[[float], None] = time.sleep,
+) -> dict:
+    """Resume all requested chunks in raw-then-finished, chronological order."""
+
+    if game != "both" and game not in set(GAMES):
+        raise ValueError(f"game must be 'both' or one of {GAMES}")
+    games = GAMES if game == "both" else (game,)
+    summaries = []
+    for selected_game in games:
+        for quarter in iter_quarters():
+            summaries.append(
+                extract_chunk(
+                    connection,
+                    selected_game,
+                    quarter,
+                    parent_ids,
+                    parent_seed_sha256=parent_seed_sha256,
+                    description_identity=description_identity,
+                    output_root=output_root,
+                    query_fn=query_fn,
+                    sleep_fn=sleep_fn,
+                )
+            )
+    return {
+        "games": list(games),
+        "completed": sum(item["status"] == "success" for item in summaries),
+        "skipped": sum(item["status"] == "skipped" for item in summaries),
+        "chunk_count": len(summaries),
+    }
+
+
+def validate_quarter(
+    connection,
+    quarter: str,
+    *,
+    parent_ids: Mapping[str, int],
+    parent_seed_sha256: str,
+    description_identity=None,
+    run_id: str | None = None,
+    output_root: Path | str = OUTPUT_ROOT,
+    query_fn: Callable[[object, str], pd.DataFrame] | None = None,
+    sleep_fn: Callable[[float], None] = time.sleep,
+) -> dict:
+    """Run both games in an isolated validation generation, never production chunks."""
+
+    quarter_bounds(quarter)
+    identifier = run_id or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    if re.fullmatch(r"[A-Za-z0-9_-]+", identifier) is None:
+        raise ValueError("validation run ID is invalid")
+    licensed_root = Path(output_root)
+    validation_root = licensed_root / "_validation" / identifier
+    if licensed_root == OUTPUT_ROOT:
+        validation_root = validate_output_path(validation_root)
+    results = []
+    for selected_game in GAMES:
+        results.append(
+            extract_chunk(
+                connection,
+                selected_game,
+                quarter,
+                parent_ids,
+                parent_seed_sha256=parent_seed_sha256,
+                description_identity=description_identity,
+                output_root=validation_root,
+                query_fn=query_fn,
+                sleep_fn=sleep_fn,
+            )
+        )
+    return {
+        "run_id": identifier,
+        "quarter": quarter,
+        "validation_root": str(validation_root),
+        "games": [
+            {
+                "game": item["game"],
+                "status": item["status"],
+                "row_count": item.get("row_count", 0),
+                "file_sha256": item.get("file_sha256"),
+                "sql_sha256": item.get("sql_sha256"),
+            }
+            for item in results
+        ],
+    }
