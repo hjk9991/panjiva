@@ -54,8 +54,10 @@ SPORTS_FAMILIES = tuple(
 )
 PROBE_FAMILIES = tuple(HS_FAMILIES)
 
+# "Nike, Inc" is deliberately specific: a bare "nike" substring floods the
+# candidate safeguard with unrelated company names.
 MANUFACTURER_PARENT_TARGETS = (
-    "Nike",
+    "Nike, Inc",
     "Deckers Outdoor",
     "Under Armour",
     "Skechers",
