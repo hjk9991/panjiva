@@ -11,7 +11,7 @@ from pathlib import Path
 import pandas as pd
 
 from .config import (
-    G10_DISCLOSED_SHARES,
+    G10_IMPORT_ANCHOR_SHARES,
     G10_TOLERANCE,
     GAMES,
     GREATER_CHINA_ORIGINS,
@@ -454,7 +454,12 @@ def _g3(chunks: Mapping[str, pd.DataFrame], seed: pd.DataFrame) -> dict:
                     else:
                         overlap += float(pd.to_numeric(frame[column]).sum())
         valid &= math.isclose(overlap, 0.0, abs_tol=1e-9)
-    return _gate("G3", "pass" if valid else "fail", int(valid), "three unique reviewed parents and zero PIT-overlap value")
+    return _gate(
+        "G3",
+        "pass" if valid else "fail",
+        int(valid),
+        f"{len(MANUFACTURER_KEYS)} unique reviewed parents and zero PIT-overlap value",
+    )
 
 
 def _g4(chunks: Mapping[str, pd.DataFrame]) -> dict:
@@ -552,58 +557,45 @@ def _g8(annual: Mapping[str, pd.DataFrame], seed: pd.DataFrame) -> dict:
     )
 
 
-def _g10(finished: pd.DataFrame, seed: pd.DataFrame) -> dict:
-    """Panjiva athletic origin value shares versus 10-K production shares.
+def _g10(finished: pd.DataFrame) -> dict:
+    """Market-level Panjiva origin value shares versus official US imports.
 
-    Shipment origins in Greater China are aggregated (re-invoicing hubs mask
-    the production country); the value-versus-pairs basis difference is part
-    of the documented tolerance.  Applies only to firms with disclosed
-    country shares.
+    Anchors are UN Comtrade US general-import value shares for the six
+    eligible HS6 families pooled over the structural window (2026-08-17
+    approval replacing the Nike global-production anchor, which measures
+    global production rather than US-bound imports).  Shares are conditional
+    on a reported (non-UNKNOWN) origin token; seaborne-versus-all-mode
+    coverage and declared-versus-customs value are documented tolerance
+    components.  Firm attribution quality is covered by G7.
     """
 
-    labels = dict(
-        zip(
-            pd.to_numeric(seed["manufacturer_parent_id"], errors="coerce"),
-            seed["manufacturer_key"].astype(str),
-        )
-    )
     scoped = finished.copy()
-    scoped["manufacturer"] = pd.to_numeric(
-        scoped["manufacturer_parent_id"], errors="coerce"
-    ).map(labels)
     scoped["year"] = (
         scoped["year_quarter"].astype("string").str.slice(0, 4).astype(int)
     )
     scoped = scoped[
-        scoped["manufacturer"].notna()
-        & scoped["year"].isin(STRUCTURAL_WINDOW_YEARS)
+        scoped["year"].isin(STRUCTURAL_WINDOW_YEARS)
         & pd.to_numeric(scoped["hs_eligible"], errors="coerce").eq(1)
+        & scoped["origin_country"].astype(str).ne("UNKNOWN")
     ]
+    total = float(scoped["value_usd"].sum())
+    if total <= 0:
+        return _gate("G10", "fail", 0.0, "no reported-origin market value in the structural window")
+    origin = scoped["origin_country"].astype(str)
+    grouped = origin.where(~origin.isin(GREATER_CHINA_ORIGINS), "GREATER_CHINA")
+    shares = scoped.groupby(grouped)["value_usd"].sum() / total
     worst_gap = 0.0
-    checked = []
     valid = True
-    for firm, disclosed in G10_DISCLOSED_SHARES.items():
-        firm_rows = scoped[scoped["manufacturer"].eq(firm)]
-        total = float(firm_rows["value_usd"].sum())
-        if total <= 0:
-            valid = False
-            checked.append(f"{firm}=no_value")
-            continue
-        origin = firm_rows["origin_country"].astype(str)
-        grouped = origin.where(
-            ~origin.isin(GREATER_CHINA_ORIGINS), "GREATER_CHINA"
-        )
-        shares = firm_rows.groupby(grouped)["value_usd"].sum() / total
-        for country, target in disclosed.items():
-            gap = abs(float(shares.get(country, 0.0)) - float(target))
-            worst_gap = max(worst_gap, gap)
-            valid &= gap <= G10_TOLERANCE
-        checked.append(firm)
+    for country, target in G10_IMPORT_ANCHOR_SHARES.items():
+        gap = abs(float(shares.get(country, 0.0)) - float(target))
+        worst_gap = max(worst_gap, gap)
+        valid &= gap <= G10_TOLERANCE
     detail = (
-        "Panjiva athletic origin value shares within "
-        f"{G10_TOLERANCE:.2f} of 10-K production shares "
-        f"(Greater China aggregated; value-vs-pairs basis documented); "
-        f"firms={','.join(checked)}"
+        "market-level Panjiva origin value shares within "
+        f"{G10_TOLERANCE:.2f} of UN Comtrade US import shares pooled over "
+        "the structural window (Greater China aggregated; conditional on "
+        "reported origin; sea-vs-all-mode and declared-vs-customs value "
+        "documented; firm attribution covered by G7)"
     )
     return _gate("G10", "pass" if valid else "fail", worst_gap, detail)
 
@@ -640,7 +632,7 @@ def evaluate_gates(
             _g7(review_queue),
             _g8(annual_origin, parent_seed),
             _g9(licensed_paths, licensed_root),
-            _g10(chunks[GAMES[0]], parent_seed),
+            _g10(chunks[GAMES[0]]),
         ]
     )
     required = gates.loc[gates["gate"].isin(REQUIRED_GATES)]
@@ -946,7 +938,7 @@ def run_runtime_qa(
     }
     artifact_io.atomic_write_json(payload, report_json)
     lines = [
-        "# Tire AB-entry measurement QA",
+        "# Footwear AB-entry measurement QA",
         "",
         "Exact panel-level distinct shipments are unavailable in Task 5 output; entry_core uses allocated shipment equivalents as a pilot proxy.",
         "",

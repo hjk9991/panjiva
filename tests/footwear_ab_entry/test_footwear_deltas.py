@@ -11,7 +11,7 @@ import re
 import pytest
 
 from scripts.footwear_ab_entry.config import (
-    G10_DISCLOSED_SHARES,
+    G10_IMPORT_ANCHOR_SHARES,
     GAMES,
     HS_FAMILIES,
     MANUFACTURER_DESCRIPTION_ALIASES,
@@ -56,12 +56,13 @@ def test_footwear_scope_contract():
 
 
 def test_structural_window_and_g10_anchor_contract():
-    # 2026-08-17 approval: pre-tariff window; Nike FY2017 10-K factory shares.
+    # 2026-08-17 approvals: pre-tariff window; UN Comtrade US-import anchors
+    # (market-level, pooled 2016-2018) replace Nike global-production shares.
     assert STRUCTURAL_WINDOW_YEARS == (2016, 2017, 2018)
-    assert dict(G10_DISCLOSED_SHARES["NIKE"]) == {
-        "Vietnam": 0.46,
-        "GREATER_CHINA": 0.27,
-        "Indonesia": 0.21,
+    assert dict(G10_IMPORT_ANCHOR_SHARES) == {
+        "GREATER_CHINA": 0.5568,
+        "Vietnam": 0.2582,
+        "Indonesia": 0.0730,
     }
 
 

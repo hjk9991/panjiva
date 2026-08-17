@@ -69,20 +69,20 @@ PROBE_FAMILIES = tuple(HS_FAMILIES)
 # 2019-2021 tariff response is out-of-window validation.
 STRUCTURAL_WINDOW_YEARS = (2016, 2017, 2018)
 
-# G10: Panjiva athletic origin value shares against 10-K disclosed
-# production-country pairs shares, for firms that disclose them.  Anchors are
-# the Nike FY2017 10-K footwear factory shares (Vietnam 46, China 27,
-# Indonesia 21 percent), matching the structural window.  Shipment origins
-# re-invoiced through Hong Kong/Taiwan are aggregated into Greater China
-# (approved 2026-08-17); the value-versus-pairs basis difference is a
-# documented tolerance component.
+# G10: market-level Panjiva origin value shares against official US import
+# value shares (approved 2026-08-17, replacing the Nike global-production
+# anchor: 10-K factory shares measure global production, not US-bound
+# imports, and the two diverge sharply pre-tariff).  Anchors are UN Comtrade
+# US general imports (reporter 842, flow M, CIF primary value) for the six
+# eligible HS6 families, pooled 2016-2018, retrieved 2026-08-17 from
+# comtradeapi.un.org/public/v1/preview; Greater China aggregates China,
+# Hong Kong, Taiwan and Macau partners.  Documented tolerance components:
+# seaborne-manifest versus all-mode coverage, declared versus customs value,
+# and shares conditional on a reported (non-UNKNOWN) origin token.  Firm
+# attribution quality is covered by the G7 manual-review gate.
 GREATER_CHINA_ORIGINS = ("China", "Hong Kong", "Taiwan", "Macau")
-G10_DISCLOSED_SHARES = MappingProxyType(
-    {
-        "NIKE": MappingProxyType(
-            {"Vietnam": 0.46, "GREATER_CHINA": 0.27, "Indonesia": 0.21}
-        ),
-    }
+G10_IMPORT_ANCHOR_SHARES = MappingProxyType(
+    {"GREATER_CHINA": 0.5568, "Vietnam": 0.2582, "Indonesia": 0.0730}
 )
 G10_TOLERANCE = 0.10
 
