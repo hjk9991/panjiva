@@ -17,6 +17,7 @@ from .config import (
     GREATER_CHINA_ORIGINS,
     MANUFACTURER_KEYS,
     OUTPUT_ROOT,
+    STRUCTURAL_WINDOW_YEARS,
     iter_quarters,
     validate_output_path,
 )
@@ -518,8 +519,8 @@ def _g8(annual: Mapping[str, pd.DataFrame], seed: pd.DataFrame) -> dict:
     required = {"manufacturer_parent_id", "link_id", "year", "active"}
     if set(annual) != set(GAMES):
         return _gate("G8", "fail", 0, "raw and finished annual games are required")
-    # The design gate reads "at least two active origin links during
-    # 2022--2024", so links are counted distinct across the whole window.
+    # The design gate reads "at least two active origin links during the
+    # structural window", so links are counted distinct across the window.
     expected = pd.Index(
         sorted(seed["manufacturer_parent_id"].unique()),
         name="manufacturer_parent_id",
@@ -533,7 +534,7 @@ def _g8(annual: Mapping[str, pd.DataFrame], seed: pd.DataFrame) -> dict:
             valid = False
             continue
         scope = frame.loc[
-            frame["year"].isin((2022, 2023, 2024)) & frame["active"].eq(1)
+            frame["year"].isin(STRUCTURAL_WINDOW_YEARS) & frame["active"].eq(1)
         ]
         counts = scope.groupby("manufacturer_parent_id")["link_id"].nunique()
         counts = counts.reindex(expected, fill_value=0)
@@ -575,7 +576,7 @@ def _g10(finished: pd.DataFrame, seed: pd.DataFrame) -> dict:
     )
     scoped = scoped[
         scoped["manufacturer"].notna()
-        & scoped["year"].isin((2022, 2023, 2024))
+        & scoped["year"].isin(STRUCTURAL_WINDOW_YEARS)
         & pd.to_numeric(scoped["hs_eligible"], errors="coerce").eq(1)
     ]
     worst_gap = 0.0

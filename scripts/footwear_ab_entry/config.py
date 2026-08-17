@@ -64,16 +64,23 @@ ESCALATED_FAMILIES = tuple(
 ELIGIBLE_FAMILIES = (*SPORTS_FAMILIES, *ESCALATED_FAMILIES)
 PROBE_FAMILIES = tuple(HS_FAMILIES)
 
+# Structural window: pre-tariff regime with rich manifest attribution
+# (2026-08-17 approval after the confidentiality-collapse diagnosis); the
+# 2019-2021 tariff response is out-of-window validation.
+STRUCTURAL_WINDOW_YEARS = (2016, 2017, 2018)
+
 # G10: Panjiva athletic origin value shares against 10-K disclosed
-# production-country pairs shares, for firms that disclose them.  Shipment
-# origins re-invoiced through Hong Kong/Taiwan are aggregated into Greater
-# China (approved 2026-08-17); the value-versus-pairs basis difference is a
+# production-country pairs shares, for firms that disclose them.  Anchors are
+# the Nike FY2017 10-K footwear factory shares (Vietnam 46, China 27,
+# Indonesia 21 percent), matching the structural window.  Shipment origins
+# re-invoiced through Hong Kong/Taiwan are aggregated into Greater China
+# (approved 2026-08-17); the value-versus-pairs basis difference is a
 # documented tolerance component.
 GREATER_CHINA_ORIGINS = ("China", "Hong Kong", "Taiwan", "Macau")
 G10_DISCLOSED_SHARES = MappingProxyType(
     {
         "NIKE": MappingProxyType(
-            {"Vietnam": 0.50, "Indonesia": 0.27, "GREATER_CHINA": 0.18}
+            {"Vietnam": 0.46, "GREATER_CHINA": 0.27, "Indonesia": 0.21}
         ),
     }
 )

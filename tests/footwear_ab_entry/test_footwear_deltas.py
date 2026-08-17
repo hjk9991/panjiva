@@ -11,6 +11,7 @@ import re
 import pytest
 
 from scripts.footwear_ab_entry.config import (
+    G10_DISCLOSED_SHARES,
     GAMES,
     HS_FAMILIES,
     MANUFACTURER_DESCRIPTION_ALIASES,
@@ -18,6 +19,7 @@ from scripts.footwear_ab_entry.config import (
     OUTPUT_ROOT,
     PROBE_FAMILIES,
     SPORTS_FAMILIES,
+    STRUCTURAL_WINDOW_YEARS,
     iter_quarters,
 )
 from scripts.footwear_ab_entry.extract import REQUIRED_OUTPUT_COLUMNS, TEXT_OUTPUT_COLUMNS
@@ -51,6 +53,16 @@ def test_footwear_scope_contract():
                for family, spec in HS_FAMILIES.items())
     quarters = tuple(iter_quarters())
     assert quarters[0] == "2014Q1" and quarters[-1] == "2025Q4"
+
+
+def test_structural_window_and_g10_anchor_contract():
+    # 2026-08-17 approval: pre-tariff window; Nike FY2017 10-K factory shares.
+    assert STRUCTURAL_WINDOW_YEARS == (2016, 2017, 2018)
+    assert dict(G10_DISCLOSED_SHARES["NIKE"]) == {
+        "Vietnam": 0.46,
+        "GREATER_CHINA": 0.27,
+        "Indonesia": 0.21,
+    }
 
 
 def test_finished_sql_uses_sports_families_and_athletic_markets():
