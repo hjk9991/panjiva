@@ -704,12 +704,12 @@ routed as (
     select a.*,
            case
                when manufacturer_conflict = 1 then 'conflict'
+               -- Footwear semantics: the brand's own US entity importing from
+               -- an arm's-length contract factory IS the direct route; the
+               -- tire pilot's intragroup requirement does not apply here.
                when attribution_source = 'importer_parent'
-                and importer_up = shipper_up
-                and relationship in ('self', 'parent_sub', 'sibling')
                    then 'manufacturer_direct'
                when attribution_source = 'shipper_parent'
-                and relationship = 'arms_length'
                 and nullif(trim(shipper_country), '') is not null
                 and upper(trim(shipper_country)) not in (
                     'UNITED STATES', 'US', 'USA'
