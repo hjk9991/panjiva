@@ -5,12 +5,13 @@ v4_trade_pair_hs_quarter.py — v4 무역 팩트 (분기 x 수출자 x 수입자
 목적: CIQ 재무를 **붙이지 않은 채** 키만 들고 있는 무역 테이블. 나중에 모회사 companyId 로
       양쪽에 연별·분기별 재무를 equi-join 할 수 있게 한다. (v1·v2·v3 와 별개 — 기존은 손대지 않음)
 
-원천 : data\staging\source\trade_2024\imp_ship_YYYYMM.parquet (12개월)
+원천 : data\staging\source\trade\imp_ship_YYYYMM.parquet (2007-07~, 있는 만큼 전부)
+       data\staging\source\ciq_ref\ownership_pit.parquet (`*_up_backcast` 판정용 — 값을 바꾸지 않는다)
 산출 : --out 인자 (기본 data\staging\v4_pairhs_full\)
-         trade_pair_hs_quarter_2024.parquet   분기 x shp x con x hs6 = 1행
-         00_drop_accounting.csv               버린 행 회계 (원천 총계 대사용)
+         trade_pair_hs_quarter_YYYY.parquet   분기 x shp x con x hs6 = 1행 (연도별 파일)
+         00_drop_accounting.csv               버린 행 회계 (원천 총계 대사용 — 선적·금액·중량·TEU·컨테이너)
 
-확정 결정 (2026-08-21 싱크):
+확정 결정 (2026-08-21 싱크, DECISIONS.md D1~D4):
   D1 grain    = panjivaid 쌍 x hs6. panjivaid -> ciqid 가 1:1(Q1 위반 0건)이라
                 ciqid·UP 단위로 손실 없이 roll-up 가능. ciqid·up 은 값으로 동승.
   D2 HS       = imp_hs 자식 안 씀. n_hs6==1 일 때만 실제 코드를 넣고,
@@ -18,33 +19,56 @@ v4_trade_pair_hs_quarter.py — v4 무역 팩트 (분기 x 수출자 x 수입자
                 -> HS별 금액이 오염되지 않으면서 쌍 총액은 보존된다.
   D3 redaction= 양쪽 panjivaid 가 다 있는 행만 남긴다(쌍 미성립분은 버림).
                 버린 비중은 00_drop_accounting.csv 와 가이드 메모에 기록.
-  D4 UP       = 분기 내 UP 이 흔들리면 **금액가중 최빈값**. up_changed_in_quarter 플래그 유지.
-                ★ UP 은 (panjivaid, 분기) 단위로 한 번 정해 모든 행에 뿌린다.
-                  행마다(=HS별로) 따로 구하면 같은 회사가 HS 별로 다른 UP 을 갖게 된다.
+  D4 UP       = 분기 내 UP 이 흔들리면 **금액 최대**(금액가중 최빈값; 건수 최빈값 아님).
+                ★ UP 은 **ciqid 단위**로, 수출자·수입자 관측을 합쳐 분기당 한 번 정해 모든 행에
+                  뿌린다(`pick_mode`). 행마다(=HS별·방향별로) 따로 구하면 같은 회사가 HS 별로,
+                  또는 수출자일 때와 수입자일 때 다른 UP 을 갖게 된다. 흔들린 회사는
+                  `*_up_changed=1` (ciqid 의 속성이므로 그 회사의 모든 행에 같은 값).
+
+2026-09-01 추가 열 (기존 33열의 이름·dtype·값은 그대로, 뒤에 붙는다):
+  shp_up_backcast / con_up_backcast (Int8, NA 허용)
+      그 (ciqid, 분기) 의 UP 이 **시점값이 아니라 소급값**인가. CIQ `ownership_pit` 의 start_date 는
+      1900-01-01 아니면 PIT 추적 시작일(1900 이 아닌 최소 start_date, 실측 2018-04-16) 이후뿐이라,
+      추적 시작 이전 도착 선적의 UP 은 1900 소급 구간이 공급한 값이다(그래서 `*_up_changed` 가
+      2017 까지 전부 0).
+      판정: quarter_start_date < 추적 시작일 -> 1 (그 분기에는 시점별 기록이 없었다 — UP 은 1900 소급
+            구간 값이거나 스냅샷 fallback 값, 구분은 `*_up_fallback_share`). 추적 시작 이후 분기 -> 0
+            (1900 구간이 9999 까지 열려 있어도 '변경 기록 없음' 일 뿐 관측값이다 — 1900 구간 12.53M개 중
+            93% 가 그렇다). UP 이 없는 행 -> NA. D4 의 UP 결정 자체는 건드리지 않는다.
+      기대: 2007~2018Q1 은 UP 이 있는 행 전부 1, 2018Q2 이후 전부 0.
+  hs6_ndigits (Int8, NA 허용)
+      hs6 문자열 길이(2/4/6). 원천이 left(hs_raw, 6) 이라 6 미만이 소수 섞여 있다. hs6 결측이면 NA.
 
 메모리: 월 단위로 부분집계를 만들어 누적한다(전부 합계형이라 결합 가능). 분기 통째 로드 안 함.
       **연도 단위로 저장하고 비운다** — 전 기간(38M행)을 쌓으면 concat 피크 19GB 로 공용 머신에
-      민폐다(실측). 연도별로 쓰면 peak 1.3GB.
+      민폐다(실측). 연도별로 쓰면 peak 1.3GB (+ PIT 조회표 약 0.7GB).
 
-기간 하드코딩 없음: 원천 폴더(들)에 실제로 있는 imp_ship_YYYYMM.parquet 을 discover 한다.
-같은 월이 두 폴더에 있으면 앞 폴더(trade_2024, 검증 완료본)가 이긴다.
+기간 하드코딩 없음: 원천 폴더에 실제로 있는 imp_ship_YYYYMM.parquet 을 discover 한다.
+폴더를 여럿 주면 앞 폴더가 우선한다(같은 월이 겹칠 때).
 
 사용:
-    python v4_trade_pair_hs_quarter.py                          # 원천 전체 -> v4_pairhs_full
-    python v4_trade_pair_hs_quarter.py --years 2024 2024 --out <dir>   # 부분 재실행
+    python v4_trade_pair_hs_quarter.py                                  # 원천 전체 -> v4_pairhs_full
+    python v4_trade_pair_hs_quarter.py --years 2024 2024 --out <dir>    # 부분 재실행 (스모크)
+    python v4_trade_pair_hs_quarter.py --pit ""                         # PIT 없이 (backcast 열은 전부 NA)
 """
 
 import argparse
 import gc
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-from v4_common import (DEFAULT_TRADE_SRC, OUT_FULL, discover_months, to_quarters,
+from v4_common import (CIQ_REF, DEFAULT_TRADE_SRC, OUT_FULL, discover_months, to_quarters,
                        write_manifest)
 
 PATHS = {}          # {YYYYMM: 원천 파일 경로} — main 에서 채움
+PIT_BC = None       # (ids_sorted int64, pit1900_end_ns int64) — load_pit_backcast 가 채움
+
+PIT_1900 = datetime(1900, 1, 1)
+PIT_CAP = datetime(2100, 1, 1)       # end_date 9999-12-31 은 pandas ns 범위 밖 — 여기서 자른다
+NAT_NS = np.iinfo(np.int64).min      # "1900 구간 없음" 표식 (어떤 분기 시작일보다 작다)
 
 READ_COLS = [
     "panjivarecordid", "billofladingtype", "shpmtorigin",
@@ -68,9 +92,16 @@ FACT_KEYS = ["shp_panjivaid", "con_panjivaid", "hs6", "hs_status"]
 SUMS = ["n_shipments", "value_usd", "weight_kg", "teu", "n_containers",
         "n_bl_house", "n_bl_simple"]
 
+# 버림 회계 열 (앞 4개는 기존 그대로, 뒤 3개는 2026-09-01 추가)
+ACCT_COLS = ["n_shipments", "value_usd", "weight_kg", "teu", "n_containers"]
+
 
 def pick_mode(part, keys, valcol):
-    """금액가중 최빈값. 동률은 선적수 -> 값 오름차순으로 결정적으로 깬다."""
+    """**금액 최대**인 값. 동률은 선적수 -> 값 오름차순으로 결정적으로 깬다.
+
+    이름과 달리 최빈값(mode, 건수 argmax)이 아니다 — w=valueofgoodsusd 합의 argmax 다.
+    선적수(n)는 금액 동률일 때만 쓰인다.
+    """
     g = part.dropna(subset=[valcol])
     if not len(g):
         return pd.DataFrame(columns=keys + [valcol])
@@ -78,6 +109,72 @@ def pick_mode(part, keys, valcol):
     g = g.sort_values(["w", "n", valcol], ascending=[False, False, True], kind="mergesort")
     return g.drop_duplicates(keys)[keys + [valcol]]
 
+
+# ---------- PIT 소급 구간 조회표 (*_up_backcast) ----------
+
+def load_pit_backcast(pit_path):
+    """ownership_pit 에서 회사별 `pit1900_end` 를 만든다 -> (ids_sorted, end_ns).
+
+    - PIT 에 있는 모든 회사가 ids_sorted 에 들어간다 (없는 회사 = NA 판정용).
+    - start_date == 1900-01-01 인 구간의 end_date 최대값(2100-01-01 cap) 을 ns 정수로.
+      1900 구간이 없는 회사는 NAT_NS (어떤 분기보다 작아 항상 0 판정).
+    - 전부 pyarrow 로 처리한다: end_date 9999-12-31 은 pandas ns 로 바로 못 읽는다
+      (within_firm_pilot_2024 의 DECISIONS.md §5 — 2100-01-01 로 잘라야 뺄셈도 안전).
+    """
+    import pyarrow as pa
+    import pyarrow.compute as pc
+    import pyarrow.parquet as pq
+
+    t = pq.read_table(pit_path, columns=["companyid", "start_date", "end_date"])
+    ids_all = pc.unique(t["companyid"]).cast(pa.int64()).to_numpy()
+    m = pc.equal(t["start_date"], pa.scalar(PIT_1900, type=t["start_date"].type))
+    # PIT 추적 시작일 = 1900-01-01 이 아닌 start_date 의 최소값 (실측 2018-04-16 09:20:02).
+    # 그 이전 분기의 UP 은 1900 소급 구간이 공급한 값 = 시점값이 아니다.
+    track_start = pc.min(t.filter(pc.invert(m))["start_date"]).as_py()
+    track_ns = np.int64(pd.Timestamp(track_start).value)
+    t19 = t.filter(m)
+    del t
+    end = pc.min_element_wise(t19["end_date"], pa.scalar(PIT_CAP, type=t19["end_date"].type))
+    t19 = pa.table({"companyid": t19["companyid"], "end_date": end})
+    g = t19.group_by("companyid").aggregate([("end_date", "max")])
+    ids19 = g["companyid"].cast(pa.int64()).to_numpy()
+    end19 = g["end_date_max"].cast(pa.timestamp("ns")).cast(pa.int64()).to_numpy()
+    del t19, g
+
+    order = np.argsort(ids_all, kind="mergesort")
+    ids_sorted = ids_all[order]
+    end_ns = np.full(len(ids_sorted), NAT_NS, dtype=np.int64)
+    pos = np.searchsorted(ids_sorted, ids19)
+    assert (ids_sorted[pos] == ids19).all()          # 1900 구간 회사는 당연히 PIT 에 있다
+    end_ns[pos] = end19
+    n1900 = len(ids19)
+    print(f"PIT 조회표: 회사 {len(ids_sorted):,}개 · 1900 소급 구간 보유 {n1900:,}개 "
+          f"({n1900 / len(ids_sorted) * 100:.1f}%) · 추적 시작일 {pd.Timestamp(track_start):%Y-%m-%d}")
+    return ids_sorted, end_ns, track_ns
+
+
+def backcast_flags(up, qstart):
+    """(UP Series[Int64], 분기 시작일) -> Int8 배열.
+
+    1 = 분기 시작일이 PIT 추적 시작일(1900 이 아닌 최소 start_date, 실측 2018-04-16) **이전** —
+        그 분기에는 시점별 소유구조 기록이 아예 없었으므로 UP 은 시점 관측값이 아니다
+        (1900-01-01 소급 구간의 값이거나 스냅샷 fallback 값; 어느 쪽인지는 `*_up_fallback_share`)
+    0 = 추적 시작 이후 분기 — UP 은 그 시점의 PIT 관측값(또는 fallback)
+    NA = UP 자체가 없음(ciqid 없음 / PIT·스냅샷 모두 없음)
+
+    실측 근거: PIT 에 1900-01-01 과 2018-04-16 사이에 시작하는 구간이 0개라, 추적 시작 이전
+    분기를 덮는 PIT 구간은 전부 1900 소급 구간이다(닫힌 1900 구간도 추적 시작 전에 끝난 것은 없다).
+    """
+    _, _, track_ns = PIT_BC
+    s = pd.Series(up).astype("Int64")
+    isna = s.isna().to_numpy()
+    q_ns = np.int64(pd.Timestamp(qstart).value)
+    out = pd.array(np.full(len(s), 1 if q_ns < track_ns else 0, dtype="int8"), dtype="Int8")
+    out[isna] = pd.NA
+    return out
+
+
+# ---------- 월 부분집계 ----------
 
 def month_partials(ym):
     """월 하나를 읽어 부분집계 + 버림 회계를 낸다."""
@@ -87,7 +184,11 @@ def month_partials(ym):
     has_con, has_shp = df["con_panjivaid"].notna(), df["shp_panjivaid"].notna()
     acct = pd.DataFrame([
         {"bucket": label, "n_shipments": int(m.sum()),
-         "value_usd": float(df.loc[m, "valueofgoodsusd"].sum())}
+         "value_usd": float(df.loc[m, "valueofgoodsusd"].sum()),
+         # 아래 3개는 팩트의 weight_kg·teu·n_containers 와 같은 방식(NaN 무시 합)으로 센다
+         "weight_kg": float(df.loc[m, "weightkg"].sum()),
+         "teu": float(df.loc[m, "volumeteu"].sum()),
+         "n_containers": int(df.loc[m, "numberofcontainers"].astype("int64").sum())}
         for label, m in [("kept_both", has_con & has_shp),
                          ("drop_con_only", has_con & ~has_shp),
                          ("drop_shp_only", ~has_con & has_shp),
@@ -148,7 +249,7 @@ def build_quarter(q, months):
             acc[k].append(v)
         print(f" fact {len(f):,}")
 
-    acct = pd.concat(acc["acct"]).groupby("bucket", as_index=False).sum()
+    acct = pd.concat(acc["acct"]).groupby("bucket", as_index=False)[ACCT_COLS].sum()
     acct.insert(0, "trade_quarter", q)
 
     fact = pd.concat(acc["fact"]).groupby(FACT_KEYS, dropna=False, as_index=False)[SUMS].sum()
@@ -228,6 +329,14 @@ def build_quarter(q, months):
 
     for c in ["shp_ciqid", "shp_up", "con_ciqid", "con_up"]:
         fact[c] = fact[c].astype("Int64")
+
+    # ---- 2026-09-01 추가 열 (기존 33열은 위에서 확정됐고 여기서는 읽기만 한다) ----
+    for s in ["shp", "con"]:
+        if PIT_BC is not None:
+            fact[f"{s}_up_backcast"] = backcast_flags(fact[f"{s}_up"], per.start_time)
+        else:
+            fact[f"{s}_up_backcast"] = pd.array([pd.NA] * len(fact), dtype="Int8")
+    fact["hs6_ndigits"] = fact["hs6"].str.len().astype("Int8")
     return acct, fact
 
 
@@ -239,32 +348,42 @@ ORDER = ["trade_quarter", "cal_year", "cal_quarter", "quarter_start_date",
          "hs6", "hs2", "hs_status",
          "n_shipments", "value_usd", "weight_kg", "teu", "n_containers",
          "n_bl_house", "n_bl_simple", "top_origin", "n_origin",
-         "match_status", "is_intra_group", "is_self"]
+         "match_status", "is_intra_group", "is_self",
+         # --- 2026-09-01 추가 (기존 33열 뒤에만 붙인다) ---
+         "shp_up_backcast", "con_up_backcast", "hs6_ndigits"]
+N_LEGACY_COLS = 33
 
 
 def main():
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--src", nargs="*", default=None,
-                    help="원천 폴더(들). 기본: trade_2024 + trade_hist (앞이 우선)")
+                    help=f"원천 폴더(들). 기본: {[str(s) for s in DEFAULT_TRADE_SRC]} (여럿이면 앞이 우선)")
     ap.add_argument("--out", default=str(OUT_FULL))
     ap.add_argument("--years", nargs=2, type=int, default=None,
                     help="이 범위 연도만 (부분 재실행)")
+    ap.add_argument("--pit", default=str(CIQ_REF / "ownership_pit.parquet"),
+                    help="ownership_pit.parquet 경로 (*_up_backcast 판정용). '' 이면 생략 -> 열은 전부 NA")
     args = ap.parse_args()
 
     src_dirs = [Path(s) for s in args.src] if args.src else DEFAULT_TRADE_SRC
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
 
-    global PATHS
-    PATHS = discover_months(src_dirs)
-    if args.years:
-        PATHS = {ym: p for ym, p in PATHS.items()
-                 if args.years[0] <= int(ym[:4]) <= args.years[1]}
+    global PATHS, PIT_BC
+    PATHS = discover_months(src_dirs, years=tuple(args.years) if args.years else None)
     if not PATHS:
-        raise SystemExit(f"원천에 월이 없음: {src_dirs}")
+        raise SystemExit(f"원천에 월이 없음: {src_dirs} (years={args.years})")
     quarters = to_quarters(PATHS)
     years = sorted({q[:4] for q in quarters})
     print(f"원천 {len(PATHS)}개월 ({min(PATHS)}~{max(PATHS)}) -> 연도 {len(years)}개 · 출력 {out}")
+
+    pit_path = Path(args.pit) if args.pit else None
+    if pit_path:
+        if not pit_path.exists():
+            raise SystemExit(f"PIT 없음: {pit_path} — 없이 돌리려면 --pit \"\" (backcast 열 전부 NA)")
+        PIT_BC = load_pit_backcast(pit_path)
+    else:
+        print("PIT 생략 — *_up_backcast 는 전부 NA")
 
     accts, total, outputs = [], 0, []
     for yr in years:                              # 연도 단위로 빌드-저장-해제 (메모리 상한 고정)
@@ -280,14 +399,21 @@ def main():
         ydf.to_parquet(p, index=False, compression="zstd")
         outputs.append(p)
         total += len(ydf)
-        print(f"  == {yr}: {len(ydf):,}행 -> {p.name}")
+        bc = {s: float(ydf[f"{s}_up_backcast"].mean()) if ydf[f"{s}_up_backcast"].notna().any() else float("nan")
+              for s in ["shp", "con"]}
+        print(f"  == {yr}: {len(ydf):,}행 -> {p.name} · up_backcast 평균 shp {bc['shp']:.3f} / con {bc['con']:.3f}")
         del facts, ydf
         gc.collect()
 
-    pd.concat(accts, ignore_index=True).to_csv(out / "00_drop_accounting.csv", index=False)
-    write_manifest(out, "trade_build", inputs=PATHS.values(),
-                   outputs=outputs + [out / "00_drop_accounting.csv"],
-                   extra={"months": len(PATHS), "rows_total": total})
+    acct_path = out / "00_drop_accounting.csv"
+    pd.concat(accts, ignore_index=True)[["trade_quarter", "bucket"] + ACCT_COLS].to_csv(
+        acct_path, index=False)
+    write_manifest(out, "trade_build",
+                   inputs=list(PATHS.values()) + ([pit_path] if pit_path else []),
+                   outputs=outputs + [acct_path],
+                   extra={"months": len(PATHS), "rows_total": total,
+                          "years": [int(y) for y in years], "columns": ORDER,
+                          "pit": str(pit_path) if pit_path else None})
     print(f"\n완료: 총 {total:,}행 · 연도 파일 {len(outputs)}개 -> {out}")
 
 

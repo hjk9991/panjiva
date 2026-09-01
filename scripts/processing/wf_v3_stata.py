@@ -5,7 +5,10 @@ wf_v3_stata.py — v3 패널을 Stata `.dta` 로 내보낸다 (명세 §8.3 "Sta
 산출 (v3 폴더):
     panel_pair_month.dta · dim_relationship.dta
     panel_firm_quarter.dta · panel_firm_origin_hs.dta
-    99_stata_varnames.csv     짧은 변수명 ↔ 원래 컬럼명 ↔ 계정 한글명 대조표
+    panel_firm_export_quarter.dta · panel_firm_origin_quarter.dta
+    99_stata_varnames.csv     패널 ↔ 짧은 변수명 ↔ 원래 컬럼명 ↔ 계정 한글명 대조표
+    99_stata_handoff.md       변환 결과 — `--only` 로 일부만 변환해도 **나머지 패널 행은
+                              parquet 메타·기존 .dta·대조표로 채워 문서를 통째로 덮지 않는다**
 
 parquet 은 Stata 가 기본으로 못 읽는다. 같은 내용을 `.dta` 로 한 벌 더 둔다 —
 **parquet 이 정본이고 `.dta` 는 사본**이다.
@@ -17,8 +20,8 @@ parquet 은 Stata 가 기본으로 못 읽는다. 같은 내용을 `.dta` 로 �
                     → **`{블록}i{data_item_id}[_usd]`** 로 바꾼다. `data_item_id` 가
                       계정당 유일하므로 **이름 충돌이 구조적으로 불가능**하다.
                       원래 이름은 **변수 레이블**로 넣어 `describe` 에서 다 보인다.
-  S-2 변수 개수     `panel_firm_quarter` 는 2,641열이다.
-                    Stata/IC 는 2,048개 한계라 **못 읽는다**. Stata/SE·MP 필요.
+  S-2 변수 개수     `panel_firm_quarter` 의 열 수는 parquet 스키마에서 **실측**한다.
+                    2,048 을 넘으면 Stata/IC 로는 못 읽는다 → SE·MP 필요 경고를 낸다.
                     (김영수 연구원 확인: SE 또는 MP 사용)
   S-3 문자열 결측   Stata 에는 문자열 결측이 없어 **`""` 가 된다.**
                     HS 코드·국가명은 정상값이 `""` 일 수 없으므로 뜻이 헷갈리지 않지만,
@@ -30,16 +33,24 @@ parquet 은 Stata 가 기본으로 못 읽는다. 같은 내용을 `.dta` 로 �
 
 import argparse
 import re
+import sys
 from datetime import date, datetime
 from pathlib import Path
 
 import pandas as pd
+import pyarrow.parquet as pq
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from wf_v3_d8d9 import detect_join  # noqa: E402
 
 V3 = Path(r"C:\panjiva\data\staging\within_firm_pilot_2024")
 FIN = Path(r"C:\panjiva\data\staging\source\ciq_fin")
 
 PANELS = ["panel_pair_month", "dim_relationship",
-          "panel_firm_quarter", "panel_firm_origin_hs"]
+          "panel_firm_quarter", "panel_firm_origin_hs",
+          "panel_firm_export_quarter", "panel_firm_origin_quarter"]
+VARNAMES = "99_stata_varnames.csv"
+STATA_IC_MAX_VARS = 2048
 BLOCKS = ("fin_a_", "fin_q_", "up_a_", "up_q_",
           "shp_a_", "shp_q_", "shp_up_a_", "shp_up_q_",
           "con_a_", "con_q_", "con_up_a_", "con_up_q_")
@@ -72,12 +83,13 @@ def short_names(cols, cat: pd.DataFrame) -> tuple:
     return ren, lab, pd.DataFrame(rows)
 
 
-def export(path: Path, out: Path, cat: pd.DataFrame, note) -> dict:
+def export(path: Path, out: Path, cat: pd.DataFrame) -> dict:
     d = pd.read_parquet(path)
     n0, c0 = len(d), d.shape[1]
     ren, lab, table = short_names(d.columns, cat)
     if ren:
         d = d.rename(columns=ren)
+    table.insert(0, "panel", path.stem)
 
     # S-3 — 문자열 결측은 Stata 에서 `""` 가 된다. 어느 컬럼이 몇 건인지 남긴다.
     strcols = [c for c in d.columns if d[c].dtype == "object"
@@ -88,9 +100,26 @@ def export(path: Path, out: Path, cat: pd.DataFrame, note) -> dict:
 
     d.to_stata(out, write_index=False, version=118, variable_labels=lab or None,
                data_label=f"v3 {path.stem} ({date.today()})")
-    sz = out.stat().st_size / 1e6
-    note(f"| `{path.stem}` | {n0:,} | {c0:,} | {len(ren):,} | {sz:,.0f} |")
-    return {"table": table, "str_missing": smiss, "n": n0, "ncol": c0}
+    return {"table": table, "str_missing": smiss, "n": n0, "ncol": c0,
+            "n_ren": len(ren), "size_mb": out.stat().st_size / 1e6}
+
+
+def load_prev_varnames(v3: Path, schemas: dict) -> pd.DataFrame:
+    """기존 `99_stata_varnames.csv`. `panel` 열이 없는 구판이면 열을 만들고, 각 행의
+    `parquet_name` 이 어느 패널 스키마에 있는지로 귀속시킨다(못 찾으면 빈 문자열)."""
+    p = v3 / VARNAMES
+    if not p.exists():
+        return pd.DataFrame()
+    prev = pd.read_csv(p, encoding="utf-8-sig")
+    if "panel" not in prev.columns:
+        prev.insert(0, "panel", "")
+    prev["panel"] = prev.panel.fillna("").astype(str)
+    blank = prev.panel == ""
+    for name, cols in schemas.items():
+        hit = blank & prev.parquet_name.isin(cols)
+        prev.loc[hit, "panel"] = name
+        blank = prev.panel == ""
+    return prev
 
 
 def main() -> None:
@@ -98,41 +127,77 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--v3-dir", default=str(V3))
     ap.add_argument("--fin-dir", default=str(FIN))
-    ap.add_argument("--only", nargs="*", choices=PANELS)
+    ap.add_argument("--only", nargs="*", choices=PANELS,
+                    help="일부만 변환. 나머지 패널 행은 parquet 메타·기존 .dta·대조표로 채운다")
     a = ap.parse_args()
     V3, FIN = Path(a.v3_dir), Path(a.fin_dir)
     t0 = datetime.now()
     cat = pd.read_csv(FIN / "ciq_dataitem_catalog.csv", encoding="utf-8-sig")
+    todo = list(a.only or PANELS)
+    join = detect_join(V3 / "panel_firm_quarter.parquet",
+                       asof_col="fin_a_age_days", equi_col="fin_a_days_after_close")
+    # 존재하는 패널의 스키마 (행·열 메타는 parquet 푸터만 읽는다)
+    meta = {}
+    for name in PANELS:
+        p = V3 / f"{name}.parquet"
+        if p.exists():
+            pf = pq.ParquetFile(p)
+            meta[name] = (pf.metadata.num_rows, list(pf.schema_arrow.names))
+    prev = load_prev_varnames(V3, {n: set(m[1]) for n, m in meta.items()})
 
     L = []
     L.append("# v3 Stata 핸드오프\n")
-    L.append(f"**생성일** {date.today()} · **스크립트** `wf_v3_stata.py` · "
-             "**포맷** Stata 118 (v14 이상)\n")
+    L.append(f"**생성일** {date.today()} · **대상** `{V3}` · **결합** {join} · "
+             f"**스크립트** `wf_v3_stata.py` · **포맷** Stata 118 (v14 이상)\n")
     L.append("> **parquet 이 정본이고 `.dta` 는 사본이다.** 값이 다르면 parquet 을 믿는다.\n")
     L.append("\n## 변환 결과\n")
-    L.append("| 패널 | 행 | 열 | 이름 줄인 변수 | .dta 크기(MB) |")
-    L.append("|---|---|---|---|---|")
+    if a.only:
+        L.append(f"이번 실행은 `--only {' '.join(todo)}` — 나머지 패널 행은 parquet 메타, "
+                 "기존 `.dta` 크기, 대조표의 행 수로 채웠다(마지막 열 참조).\n")
+    L.append("| 패널 | 행 | 열 | 이름 줄인 변수 | .dta 크기(MB) | .dta 상태 |")
+    L.append("|---|---|---|---|---|---|")
 
     tables, smiss_all = [], {}
-    for name in (a.only or PANELS):
-        p = V3 / f"{name}.parquet"
-        if not p.exists():
+    for name in PANELS:
+        if name not in meta:
             print(f"  {name}.parquet 없음 — 건너뜀")
+            L.append(f"| `{name}` | | | | | parquet 없음 |")
             continue
-        print(f"[{name}] 변환 중...")
-        r = export(p, V3 / f"{name}.dta", cat, L.append)
-        if len(r["table"]):
-            tables.append(r["table"])
-        if r["str_missing"]:
-            smiss_all[name] = r["str_missing"]
-        print(f"  → {name}.dta")
+        n_rows, cols = meta[name]
+        dta = V3 / f"{name}.dta"
+        if name in todo:
+            print(f"[{name}] 변환 중...")
+            r = export(V3 / f"{name}.parquet", dta, cat)
+            if len(r["table"]):
+                tables.append(r["table"])
+            if r["str_missing"]:
+                smiss_all[name] = r["str_missing"]
+            print(f"  → {name}.dta")
+            L.append(f"| `{name}` | {r['n']:,} | {r['ncol']:,} | {r['n_ren']:,} | "
+                     f"{r['size_mb']:,.0f} | 이번 실행에서 변환 |")
+        else:
+            n_ren = int((prev.panel == name).sum()) if len(prev) else 0
+            if dta.exists():
+                sz, st = f"{dta.stat().st_size / 1e6:,.0f}", \
+                    f"기존 유지 ({datetime.fromtimestamp(dta.stat().st_mtime).date()})"
+            else:
+                sz, st = "", ".dta 없음 — 미변환"
+            L.append(f"| `{name}` | {n_rows:,} | {len(cols):,} | {n_ren:,} | {sz} | {st} |")
 
-    if tables:
-        t = pd.concat(tables, ignore_index=True).drop_duplicates("stata_name")
-        t.to_csv(V3 / "99_stata_varnames.csv", index=False, encoding="utf-8-sig")
-        L.append(f"\n## 변수명 대조표\n")
-        L.append(f"`99_stata_varnames.csv` — **{len(t):,}개** 계정의 "
-                 "`stata_name` ↔ `parquet_name` ↔ 계정 한글명.\n")
+    # 대조표 — 변환한 패널의 행은 새로 쓰고, 나머지 패널의 행은 기존 csv 에서 유지한다
+    keep = prev[~prev.panel.isin(todo)] if len(prev) else pd.DataFrame()
+    new = pd.concat(tables, ignore_index=True) if tables else pd.DataFrame()
+    t = pd.concat([x for x in (keep, new) if len(x)], ignore_index=True) \
+        if (len(keep) or len(new)) else pd.DataFrame()
+    if len(t):
+        t = (t.drop_duplicates(["panel", "stata_name"])
+              .sort_values(["panel", "stata_name"], kind="mergesort"))
+        t.to_csv(V3 / VARNAMES, index=False, encoding="utf-8-sig")
+        L.append("\n## 변수명 대조표\n")
+        L.append(f"`{VARNAMES}` — **{t.stata_name.nunique():,}개** 계정의 "
+                 "`panel` ↔ `stata_name` ↔ `parquet_name` ↔ 계정 한글명"
+                 + (" (이번 실행에서 변환하지 않은 패널의 행은 기존 것을 유지)" if a.only else "")
+                 + ".\n")
         L.append("Stata 변수명이 32자를 넘을 수 없어 재무 계정을 "
                  "**`{블록}i{data_item_id}[_usd]`** 로 줄였다.\n")
         L.append("```")
@@ -142,6 +207,10 @@ def main() -> None:
         L.append("**원래 이름은 변수 레이블에 있다** — Stata 에서 바로 확인된다:\n")
         L.append("```stata\nuse panel_firm_quarter.dta, clear\n"
                  "describe fin_a_i28*\nlookfor revenue\n```\n")
+    else:
+        L.append("\n## 변수명 대조표\n")
+        L.append("이름을 줄인 변수가 없다(재무 계정 열이 있는 패널을 변환하지 않았고 기존 "
+                 f"`{VARNAMES}` 도 없음).\n")
 
     if smiss_all:
         L.append("\n## ⚠️ 문자열 결측은 `\"\"` 가 된다\n")
@@ -154,10 +223,21 @@ def main() -> None:
                 L.append(f"| `{k}` | `{c}` | {n:,} |")
         L.append("\n숫자 결측(`.`)은 정상 보존된다. nullable 정수는 실수형이 되지만 "
                  "**값과 결측 위치는 그대로**다(왕복 검증 완료).\n")
+        if a.only:
+            L.append("(이번 실행에서 변환한 패널만 집계 — 나머지는 이전 실행의 기록을 볼 것)\n")
 
     L.append("\n## Stata 에디션\n")
-    L.append("`panel_firm_quarter` 는 **2,641개 변수**다. "
-             "**Stata/IC(2,048개 한계)로는 열리지 않는다** — SE 또는 MP 가 필요하다.\n")
+    if "panel_firm_quarter" in meta:
+        nvar = len(meta["panel_firm_quarter"][1])
+        if nvar > STATA_IC_MAX_VARS:
+            L.append(f"`panel_firm_quarter` 는 **{nvar:,}개 변수**다(parquet 스키마 실측). "
+                     f"**Stata/IC({STATA_IC_MAX_VARS:,}개 한계)로는 열리지 않는다** — "
+                     "SE 또는 MP 가 필요하다.\n")
+        else:
+            L.append(f"`panel_firm_quarter` 는 {nvar:,}개 변수다(parquet 스키마 실측) — "
+                     f"Stata/IC({STATA_IC_MAX_VARS:,}개 한계)로도 열린다.\n")
+    else:
+        L.append("`panel_firm_quarter.parquet` 이 없어 변수 수를 확인하지 못했다.\n")
 
     (V3 / "99_stata_handoff.md").write_text("\n".join(L), encoding="utf-8")
     print(f"\n완료 ({(datetime.now()-t0).seconds}초) → {V3}")

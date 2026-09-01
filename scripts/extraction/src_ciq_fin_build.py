@@ -16,7 +16,7 @@ v4 판과의 차이:
   3. 출력 = `data\staging\source\ciq_fin\` — 원천 옆에 두어 네 버전이 같은 것을 본다.
 
 원천 : source\ciq_ref\{fin_period, fin_data_YYYY, fx_rate}.parquet
-       source\trade_2024\{imp,exp}_ship_YYYYMM.parquet   (대상 기업 범위)
+       source\trade\{imp,exp}_ship_YYYYMM.parquet        (대상 기업 범위. exp 는 있는 월만)
        shared memory\ciq_dataitems.md                     (계정 이름·분류 카탈로그)
 
 산출 : data\staging\source\ciq_fin\
@@ -33,22 +33,26 @@ v4 판과의 차이:
   F-2 통화        = **환산하지 않고 원표시통화 저장** + `fx_per_usd` 동봉.
                     `unit_type_id` 는 통화/비율 구분이 아니라 "백만 단위" 표시라
                     (주식수 3217 도 unit_type=2) 일괄 환산하면 주식수·비율까지 환산된다.
-  F-3 기간 범위   = **거래 기간과 같게 잡으면 된다.** 무역과 `(cal_year, cal_quarter)` 로
-                    equi-join 하므로 거래 연도의 재무만 쓰인다 — 소급분이 필요 없다.
-                    앞으로 더 받는 것은 **표본 시작 시점에서 시차변수(L1·L4…)를 만들
-                    여유분**일 때만 의미가 있다.
+  F-3 기간 범위   = **결합 방식에서 유도한다.** `--cal-years` 를 안 주면
+                    `y0 = start.year − (2 if asof else 0)`, `y1 = (end − 1일).year`.
+                    · equi-join(`(cal_year, cal_quarter)` 일치)은 거래 연도의 재무만 쓴다.
+                    · **as-of(명세 §3.3, 정본)는 기준시점 직전 완료 기간을 최대 2년 소급**
+                      하므로 표본 **시작 2년 전**부터 담아야 첫 해 선적에 재무가 붙는다.
+                    시차변수(L1·L4…) 여유분이 더 필요하면 `--cal-years` 로 명시한다.
   F-4 주기        = 1 연간 · 2 분기 · 10 반기 전부. 반기만 내는 기업이 있다.
   F-5 중복 해소   = 행을 지우지 않고 `is_preferred`(분기키) · `is_preferred_year`(연도키)
                     플래그만 세운다. 우선순위: period_end 최신 > 정정유형 > id.
   F-6 wide 범위   = 카탈로그에 이름이 확인된 계정만 눕힌다. 전량은 long 에 있다.
 
 사용:
-  python scripts\extraction\src_ciq_fin_build.py
-  python ... --cal-years 2018 2024                     # 담을 cal_year 범위 넓히기
+  python scripts\extraction\src_ciq_fin_build.py                          # 원천 전 기간, equi 창
+  python ... --start 2024-01-01 --end 2025-01-01 --join asof              # cal_year 2022~2024
+  python ... --cal-years 2018 2024 --force                                # 범위 명시 + 덮어쓰기
 """
 
 import argparse
 import re
+import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -56,9 +60,12 @@ import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "processing"))
+from v4_common import discover_months                # noqa: E402
+
 SRC = Path(r"C:\panjiva\data\staging\source")
 CIQ = SRC / "ciq_ref"
-TRADE = SRC / "trade_2024"
+TRADE = SRC / "trade"
 OUT = SRC / "ciq_fin"
 DOC = Path(r"C:\panjiva\shared memory\ciq_dataitems.md")
 
@@ -78,17 +85,48 @@ UNIVERSE_COLS = {
 
 
 # ---------------------------------------------------------------------------
-def trade_universe(trade_dir: Path) -> set:
-    """무역 원천에 등장하는 모든 CIQ 회사 = 법인 + 최종모회사, 수입 양측 + 수출자."""
+def resolve_months(trade_dir: Path, start, end) -> list:
+    """`--start/--end` 가 있으면 그 월들(원천에 없는 월이 있으면 예외), 없으면 디스크에서 발견."""
+    found = list(discover_months([trade_dir], "imp_ship"))
+    if not found:
+        raise FileNotFoundError(f"원천 폴더에 imp_ship_YYYYMM.parquet 이 없다: {trade_dir}")
+    if start is None and end is None:
+        return found
+    if start is None:
+        start = f"{found[0][:4]}-{found[0][4:]}-01"
+    if end is None:
+        last = pd.Timestamp(f"{found[-1][:4]}-{found[-1][4:]}-01") + pd.offsets.MonthBegin(1)
+        end = last.strftime("%Y-%m-%d")
+    rng = pd.date_range(start, end, freq="MS")
+    months = [d.strftime("%Y%m") for d in rng[:-1]] if len(rng) > 1 else []
+    missing = [m for m in months if m not in set(found)]
+    if not months or missing:
+        raise FileNotFoundError(f"요청 기간 {start}~{end} 중 원천에 없는 월: "
+                                f"{missing[:12]}{' …' if len(missing) > 12 else ''} ({trade_dir})")
+    return months
+
+
+def trade_universe(trade_dir: Path, months) -> set:
+    """무역 원천에 등장하는 모든 CIQ 회사 = 법인 + 최종모회사, 수입 양측 + 수출자.
+
+    수입(`imp_ship`)은 요청한 월이 전부 있어야 하고, 수출(`exp_ship`)은 **있는 월만** 쓴다
+    (수출 원천은 2024 12개월뿐 — 없는 기간에서 죽지 않는다).
+    """
     ids = set()
     for pat, cols in UNIVERSE_COLS.items():
-        files = sorted(trade_dir.glob(pat))
+        prefix = pat.split("_*")[0]
+        files = [trade_dir / f"{prefix}_{m}.parquet" for m in months]
+        exist = [f for f in files if f.exists()]
+        if prefix == "imp_ship" and len(exist) != len(files):
+            miss = [f.name for f in files if not f.exists()]
+            raise FileNotFoundError(f"수입 원천 월 파일 없음 {len(miss)}개: {miss[:12]}")
         got = set()
-        for f in files:
+        for f in exist:
             d = pd.read_parquet(f, columns=cols)
             for c in cols:
                 got |= set(d[c].dropna().astype("int64").unique())
-        print(f"  {pat:<22} 파일 {len(files):>2}개 → 회사 {len(got):,}개")
+        print(f"  {prefix:<9} 파일 {len(exist):>3}/{len(files)}개 → 회사 {len(got):,}개"
+              + ("" if len(exist) == len(files) else "  (없는 월은 건너뜀)"))
         ids |= got
     print(f"  합집합 {len(ids):,}개")
     return ids
@@ -222,22 +260,55 @@ def build_wide(long, fp, cat, ptype: int, name: str, out: Path) -> int:
     return len(res)
 
 
+OUTPUTS = ["ciq_fin_period.parquet", "ciq_fin_long.parquet", "ciq_fin_wide_annual.parquet",
+           "ciq_fin_wide_quarter.parquet", "ciq_dataitem_catalog.csv"]
+
+
 def main() -> None:
+    global CIQ
     ap = argparse.ArgumentParser()
-    ap.add_argument("--cal-years", nargs=2, type=int, default=[2022, 2024],
+    ap.add_argument("--start", default=None,
+                    help="무역 표본 시작월(YYYY-MM-DD). 미지정이면 원천 폴더의 첫 월")
+    ap.add_argument("--end", default=None,
+                    help="무역 표본 종료(미포함). 미지정이면 원천 폴더의 마지막 월까지")
+    ap.add_argument("--join", choices=["equi", "asof"], default="equi",
+                    help="무역층이 쓸 결합 방식 — cal_year 창 유도에만 쓴다. "
+                         "asof 는 시작 2년 소급(명세 §3.3 최대 2년)")
+    ap.add_argument("--cal-years", nargs=2, type=int, default=None,
                     help="담을 cal_year 범위(양끝 포함). 무역과 붙이는 키와 같은 축이다. "
-                         "거래 기간과 같게 잡으면 되고, 앞으로 더 받는 것은 시차변수용 여유분")
+                         "미지정이면 --start/--end/--join 에서 유도: "
+                         "y0 = start.year − (2 if asof else 0), y1 = (end − 1일).year. "
+                         "명시하면 그 값이 우선(시차변수 여유분 등)")
     ap.add_argument("--trade-dir", default=str(TRADE))
+    ap.add_argument("--ciq-dir", default=str(CIQ), help="CIQ 원천 (fin_period · fin_data · fx_rate)")
     ap.add_argument("--out-dir", default=str(OUT))
+    ap.add_argument("--force", action="store_true",
+                    help="기존 산출이 전부 있어도 다시 만든다 (기본은 건너뜀 — 명세 §10)")
     a = ap.parse_args()
+    CIQ = Path(a.ciq_dir)
     out = Path(a.out_dir)
+    if all((out / f).exists() for f in OUTPUTS) and not a.force:
+        print(f"기존 산출 {len(OUTPUTS)}개가 모두 있어 건너뜀 (다시 만들려면 --force): {out}")
+        return
     out.mkdir(parents=True, exist_ok=True)
     t0 = datetime.now()
 
-    print(f"[1] 대상 기업 범위 (무역 원천 전체)")
-    ids = trade_universe(Path(a.trade_dir))
+    months = resolve_months(Path(a.trade_dir), a.start, a.end)
+    start = pd.Timestamp(f"{months[0][:4]}-{months[0][4:]}-01")
+    end = pd.Timestamp(f"{months[-1][:4]}-{months[-1][4:]}-01") + pd.offsets.MonthBegin(1)
+    if a.cal_years:
+        y0, y1 = a.cal_years
+        how = "명시(--cal-years)"
+    else:
+        y0 = start.year - (2 if a.join == "asof" else 0)
+        y1 = (end - pd.Timedelta(days=1)).year
+        how = f"유도(--join {a.join}: 시작 {'2년 소급' if a.join == 'asof' else '연도'} ~ 종료 연도)"
+    print(f"[0] 무역 표본 {months[0]}~{months[-1]} ({len(months)}개월) · "
+          f"cal_year 창 {y0}~{y1} — {how}")
 
-    y0, y1 = a.cal_years
+    print(f"[1] 대상 기업 범위 (무역 원천 전체)")
+    ids = trade_universe(Path(a.trade_dir), months)
+
     print(f"[2] 회계기간 dim  (cal_year {y0} ~ {y1})")
     fp = build_period(ids, y0, y1)
     fp.to_parquet(out / "ciq_fin_period.parquet", index=False, compression="zstd")
@@ -268,8 +339,10 @@ def main() -> None:
     (out / "_build_log.md").write_text(
         "# 공용 CIQ 재무층 빌드 로그 (`src_ciq_fin_build.py`)\n\n"
         f"- 실행: {t0:%Y-%m-%d %H:%M} ~ {datetime.now():%H:%M}\n"
-        f"- 기간 창: **`cal_year` {y0} ~ {y1}** "
-        "(period_end 가 아니라 cal_year 로 자른다 — 무역과 붙이는 키가 같은 축이므로)\n"
+        f"- 무역 표본: **{months[0]} ~ {months[-1]}** ({len(months)}개월, `{a.trade_dir}`)\n"
+        f"- 기간 창: **`cal_year` {y0} ~ {y1}** — {how} "
+        "(period_end 가 아니라 cal_year 로 자른다 — 무역과 붙이는 키가 같은 축이므로. "
+        "as-of 는 시작 2년 소급분이 있어야 첫 해 선적에 재무가 붙는다)\n"
         f"- 대상 기업: 무역 원천 전체 **{len(ids):,}개** "
         f"(그중 재무 보유 {fp.companyid.nunique():,}개, "
         f"{fp.companyid.nunique()/len(ids)*100:.1f}%)\n"

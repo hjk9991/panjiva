@@ -2,14 +2,21 @@
 r"""
 wf_v3_panels.py — 명세 04 산출물 **v3 (공식 within-firm 분석패널)**
 
-명세 §8.3 대응. 산출 폴더는 명세 §2.2 가 지정한 `within_firm_pilot_2024\`.
+명세 §8.3 대응. 산출 폴더는 `--out-dir` 인자다(2024 파일럿 기본값 `within_firm_pilot_2024\`).
 
-    panel_pair_month.parquet     1행 = 수입자 법인 × 수출자 법인 × **월**
-    dim_relationship.parquet     1행 = pair (관계 이력 요약 + 관계전환 = 명세 §6.4)
-    panel_firm_quarter.parquet   1행 = 법인 × 분기 (v2 03_firm + within 전용 지표)
-    panel_firm_origin_hs.parquet 1행 = 수입기업 × 원산국 × HS6 (균등배분)
+    panel_pair_month.parquet          1행 = 수입자 법인 × 수출자 법인 × **월**
+    dim_relationship.parquet          1행 = pair (관계 이력 요약 + 관계전환 = 명세 §6.4)
+    panel_firm_quarter.parquet        1행 = 법인 × 분기 (v2 03_firm + within 전용 지표)
+    panel_firm_origin_hs.parquet      1행 = 수입기업 × 원산국 × HS6 (균등배분)
+    panel_firm_export_quarter.parquet 1행 = **미국 수출 B/L 의 shipper** 법인 × 분기 (원천 `exp_ship_*`)
+    panel_firm_origin_quarter.parquet 1행 = 수입기업 × 원산국 × 분기 (원산국 **진입 시점** 포함)
 
 기간·경로가 전부 인자다(명세 §10). 재현 절차는 `scripts\RUNBOOK.md`.
+분기는 `--start/--end` 로 만든 **달력 분기 목록**(`YYYYQn`)을 쓴다 — 표본에서 관측된 분기가
+아니라 달력 위치로 "직전/다음 분기" 를 판정한다(빈 분기가 있어도 인접성이 왜곡되지 않는다).
+
+⚠️ `panel_firm_quarter` 의 `exp_*` 는 v2 `03_firm` 이 준 것으로 **"이 법인이 shipper 인 미국
+   수입 B/L"** 이다. 진짜 미국 수출(수출 B/L)은 `panel_firm_export_quarter` 에만 있다.
 
 ## 김영수 연구원 확정 결정
 
@@ -46,7 +53,7 @@ from relationship import RELATIONSHIP_VALUES  # noqa: E402,F401  (값 목록 문
 
 V1 = Path(r"C:\panjiva\data\staging\tom_v1_2024")
 V2 = Path(r"C:\panjiva\data\staging\tom_v2_2024")
-SRC = Path(r"C:\panjiva\data\staging\source\trade_2024")
+SRC = Path(r"C:\panjiva\data\staging\source\trade")
 OUT = Path(r"C:\panjiva\data\staging\within_firm_pilot_2024")
 
 SHIP_COLS = ["panjivarecordid", "arrivaldate", "trade_quarter", "cal_year", "cal_quarter",
@@ -55,6 +62,10 @@ SHIP_COLS = ["panjivarecordid", "arrivaldate", "trade_quarter", "cal_year", "cal
              "con_up_ciq_country", "shp_up_ciq_country",
              "relationship", "self_shipment", "within_firm_type",
              "hs6", "n_hs6", "shpmtorigin"]
+# 수출 원천(`exp_ship_YYYYMM`)에서 읽는 열 — 수출 B/L 에는 상대방(consignee) 식별자가 없다.
+EXP_COLS = ["panjivarecordid", "shpmtdate", "shpmtdestination", "portofunladingcountry",
+            "valueofgoodsusd", "weightkg", "volumeteu", "hs6", "hs2",
+            "shp_ciqid_original", "shp_up", "shp_ownership_is_fallback"]
 
 
 # ---------------------------------------------------------------------------
@@ -92,7 +103,10 @@ def rel_split(sub: pd.DataFrame, keys, prefix: str = "") -> pd.DataFrame:
 
 
 def top_by_value(df: pd.DataFrame, keys, col: str, out: str) -> pd.DataFrame:
-    """금액가중 최빈값. 동점이면 사전순 앞선 값(재현 가능하게)."""
+    """**금액 최대**인 값. 동점이면 사전순 앞선 값(재현 가능하게).
+
+    최빈값(mode, 건수 argmax)이 아니다 — 값별 금액 합의 argmax 다.
+    """
     sub = df[df[col].notna()]
     if not len(sub):
         return pd.DataFrame(columns=list(keys) + [out])
@@ -131,7 +145,7 @@ def build_pair_month(ship: pd.DataFrame) -> pd.DataFrame:
                      ("within_firm_type", "within_type_main")):
         p = p.merge(top_by_value(s, gk, col, out), on=gk, how="left")
 
-    # 월 안에서 최종모회사가 흔들리면 금액가중 최빈값 + 변동 플래그 (명세 §6.3 예비)
+    # 월 안에서 최종모회사가 흔들리면 금액 최대 + 변동 플래그 (명세 §6.3 예비)
     for side in ("con", "shp"):
         u = top_by_value(s[s[f"{side}_up"].notna()], gk, f"{side}_up", f"{side}_up")
         n = s.groupby(gk)[f"{side}_up"].nunique().rename(f"{side}_up_changed").reset_index()
@@ -142,7 +156,10 @@ def build_pair_month(ship: pd.DataFrame) -> pd.DataFrame:
                      "shp_up_ciq_country", "shp_up_country")
     p = p.merge(c, on=gk, how="left")
     # kor_mnc_link: 수출자 모회사가 한국 기업이면서 그룹내 거래인 pair-월
-    p["kor_mnc_link"] = ((p.shp_up_country == "KR") & (p.within_firm == 1)).astype("int8")
+    # ⚠️ `within_firm` 은 nullable(Int8) — 분류 가능한 선적이 없는 pair-월은 NA 다.
+    #    NA 를 그대로 int8 로 바꾸면 ValueError 라 False 로 채운 뒤 바꾼다(NA = 링크 아님).
+    p["kor_mnc_link"] = ((p.shp_up_country == "KR") & (p.within_firm == 1)) \
+        .fillna(False).astype("int8")
 
     p["pair_id"] = (p.con_ciqid.astype("int64").astype(str) + "_"
                     + p.shp_ciqid.astype("int64").astype(str))
@@ -180,17 +197,29 @@ def transitions(ship: pd.DataFrame) -> pd.DataFrame:
     w2a = s[s.chg & (s.wf == 0)].groupby("pair_id").size().rename("within_to_arms")
     a2w = s[s.chg & (s.wf == 1)].groupby("pair_id").size().rename("arms_to_within")
     tr = tr.merge(w2a, on="pair_id", how="left").merge(a2w, on="pair_id", how="left")
-    tr[["within_to_arms", "arms_to_within"]] =         tr[["within_to_arms", "arms_to_within"]].fillna(0)
+    tr[["within_to_arms", "arms_to_within"]] = \
+        tr[["within_to_arms", "arms_to_within"]].fillna(0)
     # 연중 within_firm 과 arms_length 가 **모두** 관측되면 1 (명세 §6.4)
     tr["relationship_changed_2024"] = ((tr._min == 0) & (tr._max == 1)).astype("int8")
-    tr["value_transitioned"] = s[s.chg].groupby("pair_id")["valueofgoodsusd"].sum()         .reindex(tr.pair_id).fillna(0).to_numpy()
+    chg = s[s.chg]
+    tr["value_transitioned"] = chg.groupby("pair_id")["valueofgoodsusd"].sum() \
+        .reindex(tr.pair_id).fillna(0).to_numpy()
+    # 명세 §6.5 전환일 — 전환이 일어난 선적(직전 분류가능 선적과 값이 다른 선적)의
+    # `arrivaldate` 최소·최대. 전환이 없는 pair 는 NaT.
+    dt = chg.groupby("pair_id")["arrivaldate"].agg(first_transition_date="min",
+                                                   last_transition_date="max")
+    tr = tr.merge(dt.reset_index(), on="pair_id", how="left")
     return tr.drop(columns=["_min", "_max"])
 
 
 def build_relationship(pm: pd.DataFrame, ship: pd.DataFrame, months: list) -> pd.DataFrame:
     """pair 단위 요약 + 명세 §6.4 관계전환(선적 단위)."""
     gk = ["pair_id", "con_ciqid", "shp_ciqid"]
-    d = pm.sort_values(gk + ["ym"], kind="mergesort")
+    d = pm.sort_values(gk + ["ym"], kind="mergesort").copy()
+    # ⚠️ 2026-08-31 수정 — 이전에는 `shp_up_changed` 만 셌다(수입자 쪽 변동을 통째로 놓침).
+    #    이제 양측 OR 을 기본값으로 하고 방향별 2열을 함께 남긴다.
+    d["_up_changed_either"] = (d.con_up_changed.fillna(0).astype("int8")
+                               | d.shp_up_changed.fillna(0).astype("int8"))
     r = d.groupby(gk, dropna=False).agg(
         first_ym=("ym", "min"), last_ym=("ym", "max"),
         n_active_months=("ym", "nunique"),
@@ -204,12 +233,18 @@ def build_relationship(pm: pd.DataFrame, ship: pd.DataFrame, months: list) -> pd
         n_classified=("n_classified", "sum"),
         ever_within=("within_firm", "max"),
         kor_mnc_link=("kor_mnc_link", "max"),
-        n_up_changed_months=("shp_up_changed", "sum"),
+        n_up_changed_months=("_up_changed_either", "sum"),
+        n_con_up_changed_months=("con_up_changed", "sum"),
+        n_shp_up_changed_months=("shp_up_changed", "sum"),
     ).reset_index()
     r["within_share_value"] = (r.value_within_firm / r.value_classified).where(
         r.value_classified > 0)
     r["within_share_count"] = (r.n_within_firm / r.n_classified).where(r.n_classified > 0)
     r["within_share"] = r.within_share_value.fillna(r.within_share_count)
+    # 명세 §5 "대체 여부 표시" — 분류가능 금액이 0/결측이라 건수 기준으로 대체했으면 1
+    # (`panel_pair_month` 의 같은 이름 열과 정의가 같다). 분류가능 선적이 아예 없으면 0.
+    r["within_share_is_count_based"] = (r.within_share_value.isna()
+                                        & r.within_share_count.notna()).astype("int8")
 
     r = r.merge(transitions(ship), on="pair_id", how="left")
 
@@ -223,19 +258,37 @@ def build_relationship(pm: pd.DataFrame, ship: pd.DataFrame, months: list) -> pd
     r["left_censored"] = (r.first_ym == months[0]).astype("int8")
     r["right_censored"] = (r.last_ym == months[-1]).astype("int8")
 
-    for col, out in (("hs6_main", "hs6_main"), ("origin_main", "origin_main")):
-        t = (pm.groupby(["pair_id", col], dropna=False)["value_usd"].sum().reset_index()
-               .sort_values(["value_usd", col], ascending=[False, True], kind="mergesort")
-               .drop_duplicates("pair_id").rename(columns={col: out})[["pair_id", out]])
-        r = r.merge(t, on="pair_id", how="left")
+    # ⚠️ 2026-08-31 수정 — 이전에는 pm(월패널)의 **월별 대표값**을 다시 집계했다.
+    #    그러면 월별 승자가 한 번도 못 된 코드는 연간 대표가 될 수 없다(매달 조금씩 오는
+    #    품목이 가끔 크게 오는 품목을 이긴다). 원선적에서 직접 뽑는다.
+    sp = ship[ship.con_ciqid.notna() & ship.shp_ciqid.notna()].copy()
+    sp["pair_id"] = (sp.con_ciqid.astype("int64").astype(str) + "_"
+                     + sp.shp_ciqid.astype("int64").astype(str))
+    for col, out in (("hs6", "hs6_main"), ("shpmtorigin", "origin_main")):
+        r = r.merge(top_by_value(sp, ["pair_id"], col, out), on="pair_id", how="left")
+    del sp
     return to_int(r)
 
 
 # ---------------------------------------------------------------------------
 # 3. panel_firm_quarter — v2 03_firm + within 전용 지표 (X-2)
 # ---------------------------------------------------------------------------
-def firm_extra(ship: pd.DataFrame) -> pd.DataFrame:
-    """within 전용 지표만 계산한다 — 나머지는 v2 03_firm 이 이미 갖고 있다."""
+def firm_extra(ship: pd.DataFrame, quarters: list) -> pd.DataFrame:
+    """within 전용 지표만 계산한다 — 나머지는 v2 03_firm 이 이미 갖고 있다.
+
+    **분모가 두 가지다** (COLUMNS.md 에 그대로 적을 것):
+      · `*_hhi_partners` · `*_n_entry` · `*_n_exit` = **양측 CIQ 매칭** 선적
+        (상대 법인이 식별돼야 파트너가 정의된다 — 결정 X-4 와 같은 분모)
+      · `imp_n_origin_countries` = **수입자(con) CIQ 매칭 선적 전체**
+        (원산국은 상대 매칭 없이도 B/L 에 있다. 양측 매칭으로 좁히면 체계적 과소추정 —
+         H1 판 `wf2q_30_build_panels.py` 와 같은 분모로 되돌린 것)
+    `quarters` 는 `--start/--end` 로 만든 **달력 분기 목록** — 진입·이탈의 직전/다음 분기와
+    `entry/exit_assessable` 이 이것을 따른다(표본에 빈 분기가 있어도 인접성이 안 깨진다).
+    """
+    qi = pd.Index(quarters)
+    stray = set(ship.trade_quarter.dropna().unique()) - set(quarters)
+    if stray:
+        raise SystemExit(f"달력 분기 목록 밖의 trade_quarter 가 있다: {sorted(stray)}")
     extra = []
     for tag, key, other in (("imp", "con_ciqid", "shp_ciqid"),
                             ("exp", "shp_ciqid", "con_ciqid")):
@@ -245,18 +298,21 @@ def firm_extra(ship: pd.DataFrame) -> pd.DataFrame:
         pv = s.groupby(gk + [other])["valueofgoodsusd"].sum().reset_index()
         tot = pv.groupby(gk)["valueofgoodsusd"].transform("sum")
         pv["_sh2"] = (pv.valueofgoodsusd / tot.where(tot > 0)) ** 2
-        b = pv.groupby(gk)["_sh2"].sum().rename(f"{tag}_hhi_partners").reset_index()
-        # 원산국 수 (수입 방향만 의미 있음)
+        # ⚠️ 분기 금액 합이 0 이면 점유율이 정의되지 않는다 → **NaN** (`min_count=1`).
+        #    기본 sum 은 전부 NaN 이어도 0 을 돌려줘 정의역 [1/n, 1] 밖의 값이 생긴다.
+        b = pv.groupby(gk)["_sh2"].sum(min_count=1).rename(f"{tag}_hhi_partners") \
+            .reset_index()
+        # 원산국 수 (수입 방향만 의미 있음) — **수입자 매칭 선적 전체**에서 센다.
+        #   outer: 상대가 한 건도 매칭 안 된 기업×분기도 원산국 수는 가진다(HHI 는 NaN).
         if tag == "imp":
-            b = b.merge(s.groupby(gk)["shpmtorigin"].nunique()
-                        .rename("imp_n_origin_countries").reset_index(), on=gk, how="left")
-        # 진입·이탈 — 직전/다음 분기와 파트너 집합을 비교한다.
+            sa = ship[ship[key].notna()]
+            b = b.merge(sa.groupby(gk)["shpmtorigin"].nunique()
+                        .rename("imp_n_origin_countries").reset_index(), on=gk, how="outer")
+        # 진입·이탈 — 직전/다음 **달력** 분기와 파트너 집합을 비교한다.
         #   진입 = 이 분기에 있는데 **직전 분기에 없던** 파트너
         #   이탈 = 이 분기에 있는데 **다음 분기에 없는** 파트너
         # ⚠️ 표본 첫 분기의 진입, 마지막 분기의 이탈은 **판정 불가**다(비교 대상이 없다).
-        #    0 으로 채우면 "아무도 안 들어왔다"로 오독되므로 결측으로 둔다.
-        qs = sorted(ship.trade_quarter.unique())
-        qi = pd.Index(qs)
+        #    값은 0 으로 두되 `entry/exit_assessable` 플래그로 구분한다.
         cur = pv[gk + [other]].copy()
         cur["_qi"] = qi.get_indexer(cur.trade_quarter)
         link = cur[[key, other, "_qi"]]
@@ -282,24 +338,37 @@ def firm_extra(ship: pd.DataFrame) -> pd.DataFrame:
     for c in e.columns:
         if c.endswith(("_n_entry", "_n_exit", "_n_origin_countries")):
             e[c] = e[c].fillna(0).round().astype("Int64")
-    qs = sorted(ship.trade_quarter.dropna().unique())
-    e["entry_assessable"] = (e.trade_quarter != qs[0]).astype("int8")
-    e["exit_assessable"] = (e.trade_quarter != qs[-1]).astype("int8")
+    e["entry_assessable"] = (e.trade_quarter != quarters[0]).astype("int8")
+    e["exit_assessable"] = (e.trade_quarter != quarters[-1]).astype("int8")
     return e
 
 
-def write_firm_quarter(extra: pd.DataFrame, v2_dir: Path, path: Path,
+# `panel_firm_quarter` 에 덧붙이는 열 중 **건수형** — 03_firm 에만 있는 기업×분기는 0
+COUNT_SUFFIX = ("_n_entry", "_n_exit", "_n_origin_countries")
+# 분기만의 함수라 결측이 있을 수 없는 열 — 03_firm 의 모든 행에서 `trade_quarter` 로 재계산
+FLAG_COLS = ("entry_assessable", "exit_assessable")
+
+
+def write_firm_quarter(extra: pd.DataFrame, v2_dir: Path, path: Path, quarters: list,
                        chunk: int = 100_000) -> tuple:
     """v2 `03_firm` 을 그대로 흘려보내면서 within 지표 열만 덧붙여 쓴다.
 
     03_firm 은 2,632열이라 통째로 메모리에 올리면 13GB 다. 행 청크로 읽고 쓴다.
     키가 1:1 이므로 **행 수는 변하지 않는다**(아래에서 검증).
+
+    `extra` 에 없는 (companyid, trade_quarter) — 상대가 매칭된 거래가 없던 기업×분기 — 는
+      · 건수형(`*_n_entry` · `*_n_exit` · `imp_n_origin_countries`) → **0** (결측 아님)
+      · `*_hhi_partners` → NaN (파트너가 없으니 정의 불가)
+      · `entry/exit_assessable` → 그 행의 `trade_quarter` 로 **전 행 재계산**(int8, NaN 없음)
+    dtype 은 `extra` 의 것을 열마다 그대로 복원한다(int8 · Int64 · float64 전부).
+    반환: (행 수, 지표가 붙은 행 수, 03_firm 에 없어 버려진 extra 키 수)
     """
     ex = extra.copy()
     ex["companyid"] = ex["companyid"].astype("int64")
     ex["trade_quarter"] = ex["trade_quarter"].astype(str)
     ex = ex.set_index(["companyid", "trade_quarter"])
     cols = list(ex.columns)
+    found = np.zeros(len(ex), dtype=bool)
 
     pf = pq.ParquetFile(v2_dir / "03_firm.parquet")
     writer, schema, n, hit = None, None, 0, 0
@@ -307,14 +376,21 @@ def write_firm_quarter(extra: pd.DataFrame, v2_dir: Path, path: Path,
     try:
         for b in pf.iter_batches(batch_size=chunk):
             d = b.to_pandas()
-            key = pd.MultiIndex.from_arrays(
-                [d["companyid"].astype("int64"), d["trade_quarter"].astype(str)])
+            tq = d["trade_quarter"].astype(str)
+            key = pd.MultiIndex.from_arrays([d["companyid"].astype("int64"), tq])
+            pos = ex.index.get_indexer(key)
+            hit += int((pos >= 0).sum())
+            found[pos[pos >= 0]] = True
             sub = ex.reindex(key)
             for c in cols:
-                v = sub[c].to_numpy()
-                d[c] = pd.array(v, dtype="Float64").astype(ex[c].dtype) \
-                    if str(ex[c].dtype).startswith("Int") else v
-            hit += int(sub[cols].notna().any(axis=1).sum())
+                if c in FLAG_COLS:
+                    continue
+                v = sub[c]
+                if c.endswith(COUNT_SUFFIX):
+                    v = v.fillna(0)
+                d[c] = v.astype(ex[c].dtype).array       # 위치 기준 대입(인덱스 정렬 없음)
+            d["entry_assessable"] = (tq != quarters[0]).astype("int8").to_numpy()
+            d["exit_assessable"] = (tq != quarters[-1]).astype("int8").to_numpy()
             t = pa.Table.from_pandas(d, preserve_index=False)
             if writer is None:
                 schema = t.schema
@@ -328,7 +404,7 @@ def write_firm_quarter(extra: pd.DataFrame, v2_dir: Path, path: Path,
             writer.close()
         pf.close()
     tmp.replace(path)
-    return n, hit
+    return n, hit, int((~found).sum())
 
 
 # ---------------------------------------------------------------------------
@@ -380,9 +456,127 @@ def build_origin_hs(ship: pd.DataFrame, src: Path, months: list) -> pd.DataFrame
 
 
 # ---------------------------------------------------------------------------
+# 5. panel_firm_export_quarter — 미국 **수출** B/L 의 shipper 법인 × 분기 (사용자 요청 표 ①④⑤)
+# ---------------------------------------------------------------------------
+def load_export_ships(src: Path, months: list) -> pd.DataFrame:
+    """원천 `exp_ship_YYYYMM` 을 읽어 분기·목적지(coalesce)를 붙인다.
+
+    ⚠️ 수출 원천에는 `shp_ciqid`(override 적용본) 가 없다 — v1 은 수입 전용이다.
+       crosswalk 원본 값 `shp_ciqid_original` 을 그대로 쓴다.
+    ⚠️ 수출 파일이 없는 달은 **건너뛰고 로그에 남긴다**(2024 외 기간은 수출 미추출).
+       전 기간 실행에서 수출이 2024 뿐이어도 여기서 죽지 않는다.
+    목적지 = `coalesce(shpmtdestination, portofunladingcountry)`, 출처는 `dest_source`
+      ("declared" = 신고 목적지 / "port" = 양륙항 국가로 대체 / 결측 = 둘 다 없음).
+    """
+    parts, missing = [], []
+    for m in months:
+        f = src / f"exp_ship_{m}.parquet"
+        if not f.exists():
+            missing.append(m)
+            continue
+        parts.append(pd.read_parquet(f, columns=EXP_COLS))
+    if missing:
+        print(f"  ⚠️ 수출 월 파일 없음 {len(missing)}/{len(months)}개월 — 건너뜀: "
+              + ", ".join(missing[:6]) + (" …" if len(missing) > 6 else ""))
+    if not parts:
+        return pd.DataFrame(columns=EXP_COLS + ["trade_quarter", "dest_country", "dest_source"])
+    e = pd.concat(parts, ignore_index=True)
+    del parts
+    e["trade_quarter"] = e.shpmtdate.dt.to_period("Q").astype(str)    # v1 과 같은 `YYYYQn`
+    e["dest_country"] = e.shpmtdestination.fillna(e.portofunladingcountry)
+    e["dest_source"] = (pd.Series(pd.NA, index=e.index, dtype="string")
+                        .mask(e.portofunladingcountry.notna(), "port")
+                        .mask(e.shpmtdestination.notna(), "declared"))
+    return e
+
+
+EXPORT_PANEL_COLS = ["companyid", "trade_quarter", "n_ship", "value_usd", "weight_kg", "teu",
+                     "n_dest_countries", "top_dest", "dest_missing_share", "n_hs6", "top_hs2",
+                     "up", "up_changed", "n_ship_fallback"]
+
+
+def build_firm_export_quarter(src: Path, months: list) -> pd.DataFrame:
+    """미국 수출 B/L 의 shipper(`shp_ciqid_original` 비결측) × 분기.
+
+    `panel_firm_quarter` 의 `exp_*`(= 이 법인이 shipper 인 **수입** B/L) 와 다른 것이다.
+    수출 B/L 에는 consignee 식별자가 없어 파트너·within 지표는 정의되지 않는다.
+    `n_hs6` 는 선적 대표 `hs6`(원천 `exp_ship` 의 열) 기준이다 — `exp_hs` 자식은 쓰지 않는다.
+    """
+    e = load_export_ships(src, months)
+    e = e[e.shp_ciqid_original.notna()].rename(columns={"shp_ciqid_original": "companyid"})
+    if not len(e):
+        print("  ⚠️ 매칭된 수출 선적이 없다 — 빈 패널을 쓴다")
+        return pd.DataFrame(columns=EXPORT_PANEL_COLS)
+    e = e.copy()
+    e["companyid"] = e.companyid.astype("int64")
+    gk = ["companyid", "trade_quarter"]
+    e["_fb"] = (e.shp_ownership_is_fallback == 1).astype("int64")
+    e["_vmiss"] = e.valueofgoodsusd.where(e.dest_country.isna(), 0)
+    g = e.groupby(gk).agg(
+        n_ship=("panjivarecordid", "size"),
+        value_usd=("valueofgoodsusd", "sum"),
+        weight_kg=("weightkg", "sum"),
+        teu=("volumeteu", "sum"),
+        n_dest_countries=("dest_country", "nunique"),
+        n_hs6=("hs6", "nunique"),
+        _n_up=("shp_up", "nunique"),
+        n_ship_fallback=("_fb", "sum"),
+        _vmiss=("_vmiss", "sum"),
+    ).reset_index()
+    # coalesce 뒤에도 목적지가 없는 선적의 금액 비중 (분기 금액 0 이면 NaN)
+    g["dest_missing_share"] = (g._vmiss / g.value_usd).where(g.value_usd > 0)
+    for col, out in (("dest_country", "top_dest"), ("hs2", "top_hs2"), ("shp_up", "up")):
+        g = g.merge(top_by_value(e, gk, col, out), on=gk, how="left")    # 금액 최대
+    g["up"] = g.up.astype("Int64")
+    g["up_changed"] = (g._n_up > 1).astype("int8")          # 분기 안에 UP 이 2개 이상
+    return to_int(g[EXPORT_PANEL_COLS])
+
+
+# ---------------------------------------------------------------------------
+# 6. panel_firm_origin_quarter — 수입기업 × 원산국 × 분기 (원산국 진입 시점)
+# ---------------------------------------------------------------------------
+def build_firm_origin_quarter(ship: pd.DataFrame, quarters: list) -> pd.DataFrame:
+    """v1 선적 중 수입자(con) CIQ 매칭분 → (con_ciqid, shpmtorigin, trade_quarter).
+
+    `first_quarter` = 그 (기업, 원산국) 의 **표본 내** 첫 분기, `is_new_origin` = 이 분기가 그
+    첫 분기, `new_origin_assessable` = 첫 분기가 표본 첫 분기가 아니면 1 (표본 첫 분기에
+    이미 있던 원산국은 그 전부터 있었는지 알 수 없다 — 좌측절단).
+    ⚠️ `shpmtorigin` 결측은 라벨로 바꾸지 않고 **결측 그대로 별도 행**으로 집계한다.
+    `n_partners` 는 그 셀에서 수출자(shp_ciqid)도 매칭된 선적의 수출자 법인 수(양측 매칭 분모).
+    """
+    s = ship.loc[ship.con_ciqid.notna(),
+                 ["panjivarecordid", "con_ciqid", "shp_ciqid", "shpmtorigin",
+                  "trade_quarter", "valueofgoodsusd"]]
+    gk = ["con_ciqid", "shpmtorigin", "trade_quarter"]
+    g = s.groupby(gk, dropna=False).agg(
+        n_ship=("panjivarecordid", "size"),
+        value_usd=("valueofgoodsusd", "sum"),
+        n_partners=("shp_ciqid", "nunique"),        # nunique 는 결측을 세지 않는다
+    ).reset_index()
+    qi = pd.Index(quarters)
+    g["_qi"] = qi.get_indexer(g.trade_quarter)
+    g["_fq"] = g.groupby(["con_ciqid", "shpmtorigin"], dropna=False)["_qi"].transform("min")
+    g["first_quarter"] = np.asarray(quarters, dtype=object)[g._fq.to_numpy()]
+    g["first_quarter"] = g.first_quarter.astype(g.trade_quarter.dtype)
+    g["is_new_origin"] = (g._qi == g._fq).astype("int8")
+    g["new_origin_assessable"] = (g._fq > 0).astype("int8")
+    return to_int(g.drop(columns=["_qi", "_fq"]))
+
+
+# ---------------------------------------------------------------------------
 def month_list(start: str, end: str) -> list:
     rng = pd.date_range(start, end, freq="MS")
     return [d.strftime("%Y%m") for d in rng[:-1]] if len(rng) > 1 else []
+
+
+def quarter_list(start: str, end: str) -> list:
+    """`[start, end)` 가 걸치는 **달력 분기** 목록 — v1 `trade_quarter` 와 같은 `YYYYQn`.
+
+    표본에서 관측된 분기가 아니라 달력에서 만든다. 진입·이탈의 "직전/다음 분기" 와
+    `entry/exit_assessable` 이 달력 인접성을 따르게 하기 위해서다.
+    """
+    last = pd.Timestamp(end) - pd.Timedelta(days=1)
+    return [str(q) for q in pd.period_range(start, last, freq="Q")]
 
 
 def main() -> None:
@@ -398,9 +592,11 @@ def main() -> None:
     V1, V2, SRC = Path(a.v1_dir), Path(a.v2_dir), Path(a.src_dir)
     out = Path(a.out_dir); out.mkdir(parents=True, exist_ok=True)
     months = month_list(a.start, a.end)
+    quarters = quarter_list(a.start, a.end)
     t0 = datetime.now()
 
-    print(f"[1] 선적 base — v1 {len(months)}개월 ({months[0]}~{months[-1]})")
+    print(f"[1] 선적 base — v1 {len(months)}개월 ({months[0]}~{months[-1]}) · "
+          f"달력 분기 {len(quarters)}개 ({quarters[0]}~{quarters[-1]})")
     parts = [pd.read_parquet(V1 / f"shipment_master_{m}.parquet", columns=SHIP_COLS)
              for m in months]
     ship = pd.concat(parts, ignore_index=True); del parts
@@ -418,18 +614,43 @@ def main() -> None:
     print(f"  {len(rel):,}행 × {rel.shape[1]}열")
 
     print("[4] panel_firm_quarter — v2 03_firm + within 지표")
-    ex = firm_extra(ship)
+    ex = firm_extra(ship, quarters)
     print(f"  within 지표 {len(ex):,}행 × {ex.shape[1]-2}개")
-    n_fq, hit = write_firm_quarter(ex, V2, out / "panel_firm_quarter.parquet")
+    n_fq, hit, orphan = write_firm_quarter(ex, V2, out / "panel_firm_quarter.parquet",
+                                           quarters)
     nc = len(pq.ParquetFile(out / "panel_firm_quarter.parquet").schema_arrow.names)
     v2n = pq.ParquetFile(V2 / "03_firm.parquet").metadata.num_rows
     assert n_fq == v2n, f"행 수가 변했다 {v2n:,} -> {n_fq:,}"
-    print(f"  {n_fq:,}행 × {nc:,}열 (v2 03_firm {v2n:,}행과 일치) · 지표 부착 {hit:,}행")
+    print(f"  {n_fq:,}행 × {nc:,}열 (v2 03_firm {v2n:,}행과 일치) · 지표 부착 {hit:,}행 · "
+          f"나머지 {n_fq - hit:,}행은 건수 0 · HHI NaN")
+    if orphan:
+        print(f"  ⚠️ 03_firm 에 없는 (companyid, trade_quarter) {orphan:,}개가 버려졌다 — "
+              "v1·v2 기간이 다른지 확인")
+    del ex
 
     print("[5] panel_firm_origin_hs")
     fo = build_origin_hs(ship, SRC, months)
     fo.to_parquet(out / "panel_firm_origin_hs.parquet", index=False, compression="zstd")
     print(f"  {len(fo):,}행 × {fo.shape[1]}열")
+    del fo
+
+    print("[6] panel_firm_export_quarter — 미국 수출 B/L 의 shipper (원천 exp_ship_*)")
+    fx = build_firm_export_quarter(SRC, months)
+    fx.to_parquet(out / "panel_firm_export_quarter.parquet", index=False, compression="zstd")
+    if len(fx):
+        vmiss = float((fx.dest_missing_share.fillna(0) * fx.value_usd).sum()) \
+            / max(float(fx.value_usd.sum()), 1) * 100
+        print(f"  {len(fx):,}행 × {fx.shape[1]}열 · 수출기업 {fx.companyid.nunique():,} · "
+              f"선적 {int(fx.n_ship.sum()):,} · ${fx.value_usd.sum()/1e9:,.1f}B · "
+              f"목적지 결측(coalesce 후) 금액 {vmiss:.1f}%")
+    else:
+        print(f"  0행 × {len(EXPORT_PANEL_COLS)}열 (이 기간에 수출 원천 없음)")
+
+    print("[7] panel_firm_origin_quarter — 수입기업 × 원산국 × 분기")
+    fq_o = build_firm_origin_quarter(ship, quarters)
+    fq_o.to_parquet(out / "panel_firm_origin_quarter.parquet", index=False, compression="zstd")
+    print(f"  {len(fq_o):,}행 × {fq_o.shape[1]}열 · 원산국 결측 행 {int(fq_o.shpmtorigin.isna().sum()):,} · "
+          f"신규 원산국(판정가능) 셀 {int(((fq_o.is_new_origin == 1) & (fq_o.new_origin_assessable == 1)).sum()):,}")
 
     print(f"\n완료 ({(datetime.now()-t0).seconds}초) → {out}")
 

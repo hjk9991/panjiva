@@ -2,12 +2,16 @@
 r"""
 wf_v3_d8d9.py — 명세 §6 소유구조 변화·관계전환 진단
 
-산출 (`output\tables\wf2024\` + v3 폴더):
-    d8_ownership_change_summary.csv    기업 변경·거래 노출·판정불가 비율 (건수/금액)
+산출 (`--tables-dir` — 기본 `output\tables\wf{start 연도}[_asof]` — + v3 폴더):
+    d8_ownership_change_summary.csv    기업 변경·거래 노출·판정불가·판정가능무변경 (건수/금액)
     d8_ownership_change_monthly.csv    월별 변경 노출 및 판정 가능성
     d8_firm_ownership_change.parquet   기업별 원자료 (up_changed_2024 · 변경일 · 판정가능)
     d9_relationship_transition_summary.csv   관계전환 pair·선적·금액 비율과 방향
-    d9_relationship_transition_pairs.parquet 전환 pair, 최초·최종 상태, 관련 금액
+    d9_relationship_transition_pairs.parquet 전환 pair, 최초·최종 상태, 관련 금액, 전환일
+
+결합 방식(equi/asof)은 d8·d9 에 영향이 없다(재무 열을 읽지 않는다). 리포트 헤더의 `**결합**` 은
+v1 폴더 첫 월 파일의 스키마로 자동 판별한 것이다(`detect_join`) — 어느 판을 대상으로
+돌렸는지 식별하기 위해서일 뿐이다. `_2024` 접미 컬럼명은 명세대로 유지한다(사용자 결정 Q2).
 
 ## 명세가 정한 것
 
@@ -36,16 +40,48 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 
 V1 = Path(r"C:\panjiva\data\staging\tom_v1_2024")
 V3 = Path(r"C:\panjiva\data\staging\within_firm_pilot_2024")
 CIQ = Path(r"C:\panjiva\data\staging\source\ciq_ref")
-TABLES = Path(r"C:\panjiva\projects\20251201\output\tables\wf2024")
+TABLES_ROOT = Path(r"C:\panjiva\projects\20251201\output\tables")
 
 SHIP_COLS = ["panjivarecordid", "arrivaldate", "valueofgoodsusd",
              "con_ciqid", "shp_ciqid", "con_up", "shp_up",
              "con_ownership_is_fallback", "shp_ownership_is_fallback", "relationship"]
 L = []
+
+
+# ---------------------------------------------------------------------------
+# 공통 헬퍼 — `wf_v3_stats.py` · `wf_v3_90_checks.py` 도 import 해서 쓴다
+# ---------------------------------------------------------------------------
+def detect_join(parquet_path: Path, asof_col: str = "con_up_a_age_days",
+                equi_col: str = "con_up_a_days_after_close") -> str:
+    """파일 스키마로 재무 결합 방식을 판별한다 — "asof" / "equi" / "unknown".
+
+    v1 선적층: as-of 판은 `con_up_a_age_days`, equi 판은 `con_up_a_days_after_close`.
+    v2·v3 firm 패널은 `fin_a_age_days` / `fin_a_days_after_close` 로 같은 규칙.
+    """
+    if not Path(parquet_path).exists():
+        return "unknown"
+    names = set(pq.ParquetFile(parquet_path).schema_arrow.names)
+    if asof_col in names:
+        return "asof"
+    if equi_col in names:
+        return "equi"
+    return "unknown"
+
+
+def detect_join_v1(v1_dir: Path, start: str) -> str:
+    """v1 폴더의 **첫 월** 파일 스키마로 결합 방식을 판별한다."""
+    ym = pd.Timestamp(start).strftime("%Y%m")
+    return detect_join(Path(v1_dir) / f"shipment_master_{ym}.parquet")
+
+
+def default_tables_dir(start: str, join: str, root: Path = TABLES_ROOT) -> Path:
+    """`--tables-dir` 기본값 — `output\\tables\\wf{start 연도}` + as-of 판이면 `_asof`."""
+    return root / f"wf{pd.Timestamp(start).year}{'_asof' if join == 'asof' else ''}"
 
 
 def say(s=""):
@@ -69,11 +105,17 @@ def md(df, fmt="{:,.2f}"):
 # ---------------------------------------------------------------------------
 # §6.1 · §6.2 — 기업 단위 소유구조 변화
 # ---------------------------------------------------------------------------
-def firm_ownership_change(ciq: Path, w0: str, w1: str) -> pd.DataFrame:
-    """PIT 구간에서 기업별 연중 UP 변경과 판정 가능성을 계산한다."""
+def firm_ownership_change(ciq: Path, w0: str, w1: str) -> tuple:
+    """PIT 구간에서 기업별 연중 UP 변경과 판정 가능성을 계산한다.
+
+    반환: (기업별 표, PIT 전체 고유 companyid 수).
+    ⚠️ 표에 담기는 기업은 **창 `[w0, w1)` 과 겹치는 PIT 구간이 있는 기업**이다 — PIT 에 기록이
+       있어도 창 밖 구간뿐인 기업은 빠진다. 판정가능 비율의 분모가 이것이다.
+    """
     p = pd.read_parquet(ciq / "ownership_pit.parquet",
                         columns=["companyid", "ultimate_parent_companyid",
                                  "start_date", "end_date"])
+    n_pit_total = int(p.companyid.nunique())
     # ⚠️ `end_date` 에 **`9999-12-31`** 이 들어 있다 — "지금도 유효한 개방 구간" 표시다.
     #    pandas 의 나노초 타임스탬프 상한은 **2262-04-11** 이라 그대로 변환하면
     #    OutOfBoundsDatetime 으로 죽는다. 상한을 2100 년으로 잘라서 쓴다 — 비교 결과는
@@ -122,7 +164,7 @@ def firm_ownership_change(ciq: Path, w0: str, w1: str) -> pd.DataFrame:
     out["n_up_changes_2024"] = out.n_up_changes_2024.fillna(0).astype("Int64")
     out["up_changed_2024"] = (out.n_up_changes_2024 > 0).astype("int8")
     out["up_change_assessable_2024"] = out.up_change_assessable_2024.fillna(0).astype("int8")
-    return out
+    return out, n_pit_total
 
 
 # ---------------------------------------------------------------------------
@@ -172,45 +214,67 @@ def exposure_report(ship: pd.DataFrame) -> pd.DataFrame:
          "선적": int((~ass).sum()), "선적 분모": n_all, "선적 비율(%)": (~ass).mean() * 100,
          "금액($B)": float(v[~ass & hasv].sum()) / 1e9, "금액 분모($B)": v_all / 1e9,
          "금액 비율(%)": float(v[~ass & hasv].sum()) / v_all * 100},
+        # 4행 — 명세 §11-10 의 세 번째 구성요소. 2행 분자 + 4행 분자 + 3행 분자 = 전체 거래
+        # (선적·금액 모두). `wf_v3_90_checks.py` G10 이 이 항등식을 검사한다.
+        {"지표": "4. 판정 가능·무변경 거래", "분자": "판정가능 & 노출 아님", "분모": "전체 거래",
+         "선적": int((ass & ~exp_).sum()), "선적 분모": n_all,
+         "선적 비율(%)": (ass & ~exp_).mean() * 100,
+         "금액($B)": float(v[ass & ~exp_ & hasv].sum()) / 1e9, "금액 분모($B)": v_all / 1e9,
+         "금액 비율(%)": float(v[ass & ~exp_ & hasv].sum()) / v_all * 100},
     ]
     return pd.DataFrame(rows)
 
 
 # ---------------------------------------------------------------------------
 def main() -> None:
-    global V1, V3, CIQ, TABLES
+    global V1, V3, CIQ
     ap = argparse.ArgumentParser()
     ap.add_argument("--start", default="2024-01-01")
     ap.add_argument("--end", default="2025-01-01", help="미포함")
     ap.add_argument("--v1-dir", default=str(V1))
     ap.add_argument("--v3-dir", default=str(V3))
     ap.add_argument("--ciq-dir", default=str(CIQ))
-    ap.add_argument("--tables-dir", default=str(TABLES))
+    ap.add_argument("--tables-dir", default=None,
+                    help="기본: output\\tables\\wf{start 연도}[_asof] (v1 스키마로 판별)")
     a = ap.parse_args()
     V1, V3, CIQ = Path(a.v1_dir), Path(a.v3_dir), Path(a.ciq_dir)
-    TABLES = Path(a.tables_dir); TABLES.mkdir(parents=True, exist_ok=True)
+    join = detect_join_v1(V1, a.start)
+    TABLES = Path(a.tables_dir) if a.tables_dir else default_tables_dir(a.start, join)
+    TABLES.mkdir(parents=True, exist_ok=True)
     t0 = datetime.now()
 
     say("# d8 · d9 — 소유구조 변화와 관계전환 (명세 §6)\n")
     say(f"**생성일** {date.today()} · **기간** {a.start} ~ {a.end}(미포함) · "
+        f"**대상** `{V3}` · **결합** {join} · **표** `{TABLES}` · "
         f"**스크립트** `wf_v3_d8d9.py`\n")
 
     print("[1] PIT 구간에서 기업별 UP 변경 계산")
-    firm = firm_ownership_change(CIQ, a.start, a.end)
+    firm, n_pit_total = firm_ownership_change(CIQ, a.start, a.end)
     firm.to_parquet(V3 / "d8_firm_ownership_change.parquet", index=False,
                     compression="zstd")
     n_ass = int(firm.up_change_assessable_2024.sum())
     n_chg = int(firm.up_changed_2024.sum())
+    # 비율의 분자는 **판정가능 AND 변경** 이다. 전체 변경수(n_chg)로 나누면 값이 안 맞는다
+    # — 변경이 관측된 기업 중 일부는 판정불가로 표시되기 때문(표 아래 주석 참조).
+    n_chg_ass = int(((firm.up_changed_2024 == 1)
+                     & (firm.up_change_assessable_2024 == 1)).sum())
     say("\n## d8-1. 기업 단위 (명세 §6.1·§6.2)\n")
     say(md(pd.DataFrame([{
-        "PIT 기록 있는 기업": len(firm),
+        "PIT 전체 기업": n_pit_total,
+        "창과 겹치는 PIT 기록이 있는 기업": len(firm),
         "판정 가능 (구간이 창을 공백없이 덮음)": n_ass,
         "판정 가능 비율(%)": n_ass / len(firm) * 100,
-        "연중 UP 변경 기업": n_chg,
-        "판정가능 중 변경 비율(%)":
-            int(((firm.up_changed_2024 == 1)
-                 & (firm.up_change_assessable_2024 == 1)).sum()) / max(n_ass, 1) * 100,
+        "연중 UP 변경 기업 (전체)": n_chg,
+        "↳ 그중 판정가능": n_chg_ass,
+        "판정가능 중 변경 비율(%)": n_chg_ass / max(n_ass, 1) * 100,
     }])))
+    say(f"\n> **분모 주의** — `판정 가능 비율` 의 분모는 PIT 전체({n_pit_total:,})가 아니라 "
+        f"**창 `[{a.start}, {a.end})` 과 겹치는 PIT 구간이 있는 기업({len(firm):,})** 이다. "
+        "창 밖 구간만 있는 기업은 표에 들어오지 않는다.")
+    say(f"\n> ⚠️ **`판정가능 중 변경 비율` 의 분자는 {n_chg_ass:,} 이지 {n_chg:,} 가 아니다.** "
+        f"변경이 관측된 {n_chg:,}개 중 {n_chg - n_chg_ass:,}개는 판정불가로 표시된다 — "
+        "`판정가능=1` 은 *변경이 없었음을 확인할 수 있다* 는 뜻이라, 구간이 창을 부분만 "
+        "덮어도 그 안에서 변경이 보이면 `up_changed_2024=1` 이 된다. 모순이 아니다.")
     say("\n> ⚠️ **판정 불가 기업의 변경 여부는 알 수 없다** — 없다는 뜻이 아니다. "
         "PIT 구간이 2024년을 부분적으로만 덮으면 그 밖에서 일어난 변경을 볼 수 없다.")
     say(f"\n변경 횟수 분포: "
@@ -231,6 +295,9 @@ def main() -> None:
     hasv = ship.valueofgoodsusd.notna()
     say(f"\n- 금액 비결측률: **{hasv.mean()*100:.1f}%** "
         f"({int(hasv.sum()):,} / {len(ship):,}건) — 금액 기준 분모는 이 부분집합이다")
+    say("- 4행은 명세 §11-10 의 구성요소 검사용이다: **2행 분자 + 4행 분자 + 3행 분자 = 전체 거래** "
+        f"(선적 {int(rep['선적'].iloc[1] + rep['선적'].iloc[3] + rep['선적'].iloc[2]):,} = "
+        f"{len(ship):,}). `wf_v3_90_checks.py` G10 이 금액까지 검사한다.")
 
     mon = ship.assign(ym=ship.arrivaldate.dt.strftime("%Y%m")).groupby("ym").agg(
         n_ship=("panjivarecordid", "size"),
@@ -268,6 +335,13 @@ def main() -> None:
     say(md(d9))
     say("\n> **전환은 선적 단위로 센다** — 같은 pair 의 분류 가능 선적을 날짜순으로 놓고 "
         "직전 선적과 값이 달라질 때마다 1건이다. 미매칭 선적은 건너뛴다.")
+    if "first_transition_date" in tr.columns and len(tr):
+        # 명세 §6.5 전환일 — `d9_relationship_transition_pairs.parquet` 에 pair 별로 실린다
+        f0, l1 = tr.first_transition_date.min(), tr.last_transition_date.max()
+        say(f"\n- 전환일(`first_transition_date` ~ `last_transition_date`): 전환 pair 의 최초 전환 "
+            f"선적 도착일 범위 **{pd.Timestamp(f0).date()} ~ {pd.Timestamp(l1).date()}** · "
+            f"pair 당 전환 기간 중위 "
+            f"{(tr.last_transition_date - tr.first_transition_date).dt.days.median():.0f}일")
     say("\n> ⚠️ **기업의 최종모회사가 변해도 관계전환은 0 일 수 있다.** 양측이 계속 같은 "
         "가족이거나 계속 다른 가족이면 분류가 안 바뀐다(명세 §6.4). 반대로 UP 이 안 변해도 "
         "**상대방**이 바뀌면 전환이 생긴다 — d8 과 d9 는 다른 것을 재는 지표다.")

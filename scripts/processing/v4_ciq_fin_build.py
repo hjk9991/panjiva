@@ -5,7 +5,8 @@ v4_ciq_fin_build.py — v4 의 CIQ 재무 쪽. **무역과 섞지 않고 따로*
 결정 근거: v4 폴더 DECISIONS.md §2 (F-1~F-7). 요약:
   F-1 전 계정 long 보관 (계정을 미리 고르지 않는다)
   F-2 원표시통화 저장 + fx_per_usd 동봉 (환산은 **나눗셈** value/fx — v4_join.to_usd 사용)
-  F-3 기간 = 무역 연도 ±2 (인자)
+  F-3 기간 = 무역 연도 ±2. `--years` 를 주지 않으면 trade-dir 의 무역 파일명 연도에서
+      (min-2, max+2) 를 **유도**한다 (새 연도 원천을 넣으면 재무 범위도 따라온다). 인자로 덮어쓸 수 있다.
   F-4 연간·분기·반기 전부
   F-5 중복은 지우지 않고 is_preferred / is_preferred_year 플래그
       (tie-break: period_end > 정정유형 > 계정수 > id)
@@ -16,9 +17,12 @@ v4_ciq_fin_build.py — v4 의 CIQ 재무 쪽. **무역과 섞지 않고 따로*
   전 기간을 concat 하면 피크 ~29GB (실측 배수 0.97x) 로 공용 머신에 민폐 — 분할 시 ~2GB.
   wide 피벗도 연도별로 하고 작은 결과만 concat 한다.
 
+체크포인트: --out 에 period·wide 2종·카탈로그가 이미 있으면 **건너뛴다** (다시 만들려면 --force).
+
 사용:
-    python v4_ciq_fin_build.py                      # trade-dir 의 무역 팩트 기준, 2005~2026
-    python v4_ciq_fin_build.py --years 2022 2024    # 기간 제한
+    python v4_ciq_fin_build.py                      # trade-dir 의 무역 연도에서 cal_year 범위 유도 (예: 2007~2025 -> 2005~2027)
+    python v4_ciq_fin_build.py --years 2022 2024    # 기간 명시
+    python v4_ciq_fin_build.py --force              # 기존 산출 덮어쓰기
 """
 
 import argparse
@@ -31,7 +35,7 @@ import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
 
-from v4_common import CIQ_REF, OUT_FULL, write_manifest
+from v4_common import CIQ_REF, OUT_FULL, file_years, write_manifest
 
 DOC = Path(r"C:\panjiva\shared memory\ciq_dataitems.md")
 
@@ -234,16 +238,30 @@ def main():
     ap.add_argument("--trade-dir", default=str(OUT_FULL),
                     help="무역 팩트 폴더 (조회 대상 기업을 여기서 뽑는다)")
     ap.add_argument("--out", default=str(OUT_FULL))
-    ap.add_argument("--years", nargs=2, type=int, default=[2005, 2026],
-                    help="fin_period cal_year 범위 (기본 = 무역 2007~2025 의 소급 2년 + 현재)")
+    ap.add_argument("--years", nargs=2, type=int, default=None,
+                    help="fin_period cal_year 범위. 기본 = 무역 파일명 연도의 (min-2, max+2) — F-3")
+    ap.add_argument("--force", action="store_true",
+                    help="기존 산출(period·wide·카탈로그)이 있어도 다시 만든다. 없으면 건너뜀")
     a = ap.parse_args()
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
-    years = (a.years[0], a.years[1])
+
+    done = [out / "ciq_fin_period.parquet", out / "ciq_fin_wide_annual.parquet",
+            out / "ciq_fin_wide_quarter.parquet", out / "ciq_dataitem_catalog.csv"]
+    if not a.force and all(p.exists() for p in done):
+        print(f"기존 재무 산출이 있어 건너뜀 ({out}) — 다시 만들려면 --force")
+        return
 
     print(f"[1] 조회 대상 기업 (무역: {a.trade_dir})")
     ids, trade_files = sample_companies(a.trade_dir)
     print(f"  ciqid ∪ up 합집합 {len(ids):,}개")
+    ty = file_years(trade_files)
+    if a.years:
+        years = (a.years[0], a.years[1])
+        print(f"  cal_year 범위 (인자): {years[0]}~{years[1]} · 무역 연도 {ty[0]}~{ty[-1]}")
+    else:
+        years = (ty[0] - 2, ty[-1] + 2)
+        print(f"  cal_year 범위 (유도, F-3 ±2): 무역 연도 {ty[0]}~{ty[-1]} -> {years[0]}~{years[1]}")
 
     print(f"[2] 회계기간 dim  (cal_year {years[0]}~{years[1]})")
     fp = build_period(ids, years)

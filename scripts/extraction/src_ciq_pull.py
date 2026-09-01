@@ -38,7 +38,7 @@ OUT = Path(r"C:\panjiva\data\staging\source\ciq_ref")
 PERIOD_TYPES = "(1, 2, 10)"        # C-1: 연간·분기·반기. YTD/LTM 은 계산 가능하므로 제외
 
 # 재무 값은 6.8억 행이라 연도로 쪼개 받는다(중단·재개 가능, 메모리 안전)
-FIN_YEARS_DEFAULT = list(range(1990, 2027))
+FIN_YEARS_DEFAULT = list(range(1990, datetime.now().year + 2))   # 상한 = 현재연도+1 (새해에 코드 수정 불필요)
 
 SQL = {
     # --- 회계기간 메타 (회사 × 기간) ---

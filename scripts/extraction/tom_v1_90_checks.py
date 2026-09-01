@@ -2,28 +2,35 @@
 r"""
 tom_v1_90_checks.py — v1 검증. 명세 §11 게이트 중 v1 이 책임지는 항목.
 
-산출: `data\staging\tom_v1_2024\90_checks.md`
+산출: `--dir` 안에 `90_checks.md`
 
 v1 이 통과해야 하는 게이트 (나머지는 v2·v3 담당):
-  G1  2024 H1 구간이 기존 H1 검증본(`tom_v1_2024h1`)과 대사된다
-  G2  12개월 모두 존재하고 월 구간이 겹치거나 빠지지 않는다
+  G1  기존 검증본(`--benchmark`)과 겹치는 월이 대사된다
+  G2  기대한 월이 모두 존재하고 월 구간이 겹치거나 빠지지 않는다
   G3  선적 PK 중복 0
   G5  양측 CIQ/UP 결측 거래가 arms_length 에 들어간 건수 0
   G6  within_firm + arms_length + unmatched = 전체 선적 (건수)
   G7  분류 가능 거래에서 within_firm + arms_length = 100% (건수·금액)
-  G12 override 미승인 행 적용 0건 · 원본(`*_ciqid_original`)과 적용값 모두 보존
+  G12 override — 원본(`*_ciqid_original`)과 적용값(`*_ciqid`) 모두 보존:
+      `overridden=1 & original 결측` 0건 · `overridden=0 & ciqid≠original` 0건 ·
+      교체된 행의 `*_up` 이 PIT/스냅샷 재조회와 일치 · `override_impact.csv` 인용
   G13 공통 원천의 선적 수·금액과 대사
   G14 컬럼 소문자 · 코드성 식별자 정수 보존
 
 v1 고유 검사:
   A1  equi-join 정합 — 붙은 회계기간의 cal_year·cal_quarter 가 도착일의 달력 연·분기와
       정확히 같고, days_after_close 가 (도착일 − 결산일)로 재계산된다
+      (as-of 판은 `age_days` 가 1~730 이고 결산일이 도착일보다 앞선다)
   A2  USD 환산 — value / fx_per_usd 로 재계산한 값과 일치
-  A3  재무 커버리지 — 건수·금액 기준, 블록별. days_after_close 부호 분포로 look-ahead 규모
+  A3  재무 커버리지 — 건수·금액 기준, 블록별. 시차 부호 분포로 look-ahead 규모
+
+메모리: 전 기간(182M 선적)에서도 돌도록 PK 는 월별 int64 배열을 모아 `np.unique` 로,
+시차 분포는 int16 히스토그램(65,536칸)으로 누적한다 — 파이썬 set·전량 배열 보관 없음.
 """
 
 import argparse
 import json
+import sys
 from datetime import date
 from pathlib import Path
 
@@ -32,14 +39,19 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from tom_v1_shipment_master import UpLookup, IMPACT_COLS      # noqa: E402  (UP 재조회 규칙 공유)
+
 OUT = Path(r"C:\panjiva\data\staging\tom_v1_2024")
-SRC = Path(r"C:\panjiva\data\staging\source\trade_2024")
+SRC = Path(r"C:\panjiva\data\staging\source\trade")
+CIQ = Path(r"C:\panjiva\data\staging\source\ciq_ref")
 H1 = Path(r"C:\panjiva\data\staging\tom_v1_2024h1")
 
 BLOCK_PREFIX = ["con_up_a_", "shp_up_a_", "con_a_", "shp_a_",
                 "con_q_", "shp_q_", "con_up_q_", "shp_up_q_"]
 L = []
 TCOL = "days_after_close"
+HIST_OFF = 32768                    # int16 → 히스토그램 칸 (값 + 32768)
 
 
 def say(s=""):
@@ -79,17 +91,50 @@ def _month_gaps(months):
     return [w for w in want if w not in set(ms)]
 
 
+def _hist_add(counts: np.ndarray, s: pd.Series) -> None:
+    """Int16 시차 컬럼을 히스토그램에 누적 (int16 배열 경유, 전량 보관 없음)."""
+    v = s.dropna().to_numpy(dtype="int16")
+    if len(v):
+        counts += np.bincount(v.astype("int32") + HIST_OFF, minlength=2 * HIST_OFF)
+
+
+def _hist_stats(counts: np.ndarray) -> dict:
+    """히스토그램에서 n · 중위(np.median 과 같은 정의) · 최소 · 최대 · 음수 건수."""
+    n = int(counts.sum())
+    if n == 0:
+        return {"n": 0, "median": np.nan, "min": np.nan, "max": np.nan, "neg": 0}
+    nz = np.flatnonzero(counts)
+    cum = np.cumsum(counts)
+
+    def at(k):                      # k 번째(1-based) 작은 값
+        return int(np.searchsorted(cum, k)) - HIST_OFF
+    med = float(at((n + 1) // 2)) if n % 2 else (at(n // 2) + at(n // 2 + 1)) / 2
+    return {"n": n, "median": med, "min": float(nz[0] - HIST_OFF),
+            "max": float(nz[-1] - HIST_OFF), "neg": int(counts[:HIST_OFF].sum())}
+
+
+def _neq_na(a: pd.Series, b: pd.Series) -> np.ndarray:
+    """결측을 값으로 보는 부등 비교."""
+    na_a, na_b = a.isna().to_numpy(), b.isna().to_numpy()
+    both = ~na_a & ~na_b
+    out = na_a != na_b
+    out[both] = a[both].astype("int64").to_numpy() != b[both].astype("int64").to_numpy()
+    return out
+
+
 def main():
-    global OUT, SRC, H1
+    global OUT, SRC, H1, CIQ
     ap = argparse.ArgumentParser()
     ap.add_argument("--dir", default=str(OUT), help="검증할 v1 산출 폴더")
     ap.add_argument("--trade-dir", default=str(SRC), help="대사할 공용 무역 원천")
+    ap.add_argument("--ciq-dir", default=str(CIQ),
+                    help="CIQ 참조 (G12 에서 override 교체행의 UP 을 PIT/스냅샷으로 재조회)")
     ap.add_argument("--benchmark", default=str(H1),
                     help="G1 대사용 기존 검증본 폴더. 'none' 이면 G1 생략")
     ap.add_argument("--expect-months", type=int, default=0,
                     help="기대 파일 수. 0 이면 실제 파일 수를 그대로 쓴다")
     a = ap.parse_args()
-    OUT, SRC = Path(a.dir), Path(a.trade_dir)
+    OUT, SRC, CIQ = Path(a.dir), Path(a.trade_dir), Path(a.ciq_dir)
     H1 = None if a.benchmark.lower() == "none" else Path(a.benchmark)
 
     files = sorted(OUT.glob("shipment_master_*.parquet"))
@@ -97,11 +142,15 @@ def main():
         raise SystemExit(f"검증할 파일이 없다: {OUT}")
     global TCOL
     TCOL = time_col(pq.ParquetFile(files[0]).schema_arrow.names)
-    MODE = "as-of (명세 §3.3)" if TCOL == "age_days" else "equi-join"
+    ASOF = TCOL == "age_days"
     say("# v1 선적 마스터 — 검증 결과\n")
-    say(f"**검증일** {date.today()} · **대상** `{OUT}` · "
+    say(f"**검증일** {date.today()} · **대상** `{OUT}` · **결합** {'asof' if ASOF else 'equi'} · "
         f"**스크립트** `tom_v1_90_checks.py`\n")
-    say("결정 근거는 같은 폴더 `DECISIONS.md`, 컬럼 뜻은 `COLUMNS.md`.\n")
+    docs = [n for n in ("DECISIONS.md", "COLUMNS.md") if (OUT / n).exists()]
+    if docs:
+        say("같은 폴더의 " + " · ".join(
+            {"DECISIONS.md": "`DECISIONS.md`(결정 근거)", "COLUMNS.md": "`COLUMNS.md`(컬럼 뜻)"}[d]
+            for d in docs) + " 참조.\n")
 
     # ------------------------------------------------------------------ G2·G13
     say("\n## G2·G13 — 월별 원천 대사\n")
@@ -109,6 +158,8 @@ def main():
     for f in files:
         ym = f.stem[-6:]
         s = SRC / f"imp_ship_{ym}.parquet"
+        if not s.exists():
+            raise FileNotFoundError(f"대사할 원천 월 파일이 없다: {s}")
         n_s = pq.ParquetFile(s).metadata.num_rows
         n_v = pq.ParquetFile(f).metadata.num_rows
         v_s = pd.read_parquet(s, columns=["valueofgoodsusd"])["valueofgoodsusd"].sum()
@@ -132,38 +183,104 @@ def main():
 
     # ------------------------------------------------------- G3·G5·G6·G7·G12
     say("\n## G3·G5·G6·G7·G12 — 키·관계분류·override\n")
-    keep = ["panjivarecordid", "valueofgoodsusd", "relationship", "self_shipment",
+    keep = ["panjivarecordid", "arrivaldate", "valueofgoodsusd", "relationship", "self_shipment",
             "within_firm_type", "con_up", "shp_up", "con_ciqid", "shp_ciqid",
             "con_ciqid_original", "shp_ciqid_original",
             "con_crosswalk_overridden", "shp_crosswalk_overridden",
+            "con_ownership_is_fallback", "shp_ownership_is_fallback",
+            "conpanjivaid", "shppanjivaid",
             "crosswalk_match_status", "ownership_match_status", "unmatched_reason"]
-    agg = {"n_dup": 0, "n_bad5": 0, "n_ov": 0, "n_ov_lost": 0}
+    agg = {"n_bad5": 0, "n_ov": 0, "n_ov_lost": 0, "n_silent": 0, "n_ov_con": 0, "n_ov_shp": 0}
     rel_n = {}; rel_v = {}
-    seen = set()
+    pk_parts = []                                  # 월별 int64 배열 → 끝에 np.unique
+    ov_rows = []                                   # override 교체행 (소수) — UP 재조회 대조용
     for f in files:
         d = pd.read_parquet(f, columns=keep)
-        agg["n_dup"] += int(d.panjivarecordid.duplicated().sum())
-        prev = len(seen); seen |= set(d.panjivarecordid.tolist())
-        agg["n_dup"] += prev + len(d) - len(seen)          # 월 간 중복도 센다
+        pk_parts.append(d.panjivarecordid.to_numpy(dtype="int64"))
         agg["n_bad5"] += int(((d.relationship == "arms_length")
                               & (d.con_up.isna() | d.shp_up.isna())).sum())
-        ov = (d.con_crosswalk_overridden == 1) | (d.shp_crosswalk_overridden == 1)
-        agg["n_ov"] += int(ov.sum())
-        agg["n_ov_lost"] += int(d.con_ciqid_original.isna().sum()
-                                - d.con_ciqid_original.isna().sum())   # 원본 보존 확인용
+        ov_any = np.zeros(len(d), dtype=bool)
+        for side in ("con", "shp"):
+            ov = (d[f"{side}_crosswalk_overridden"] == 1).to_numpy(dtype=bool, na_value=False)
+            orig, cur = d[f"{side}_ciqid_original"], d[f"{side}_ciqid"]
+            agg[f"n_ov_{side}"] += int(ov.sum())
+            agg["n_ov_lost"] += int((ov & orig.isna().to_numpy()).sum())
+            agg["n_silent"] += int((~ov & _neq_na(cur, orig)).sum())
+            ov_any |= ov
+            if ov.any():
+                sub = d.loc[ov, ["panjivarecordid", "arrivaldate", f"{side}panjivaid",
+                                 f"{side}_ciqid_original", f"{side}_ciqid", f"{side}_up",
+                                 f"{side}_ownership_is_fallback"]].copy()
+                sub.columns = ["panjivarecordid", "arrivaldate", "panjivaid", "ciqid_original",
+                               "ciqid", "up", "is_fallback"]
+                sub["side"] = side
+                ov_rows.append(sub)
+        agg["n_ov"] += int(ov_any.sum())
         g = d.groupby("relationship", observed=True)
         for k, v in g.size().items():
             rel_n[k] = rel_n.get(k, 0) + int(v)
         for k, v in g["valueofgoodsusd"].sum().items():
             rel_v[k] = rel_v.get(k, 0.0) + float(v)
         del d
+    allpk = np.concatenate(pk_parts)
+    n_dup = int(len(allpk) - len(np.unique(allpk)))       # 월내 + 월간 중복을 한 번에
+    del allpk, pk_parts
 
-    say(f"- **G3** `panjivarecordid` 중복(월내+월간): **{agg['n_dup']:,}건** "
-        f"— {'PASS' if agg['n_dup'] == 0 else 'FAIL'}")
+    say(f"- **G3** `panjivarecordid` 중복(월내+월간): **{n_dup:,}건** "
+        f"— {'PASS' if n_dup == 0 else 'FAIL'}")
     say(f"- **G5** 양측 UP 결측인데 `arms_length`: **{agg['n_bad5']:,}건** "
         f"— {'PASS' if agg['n_bad5'] == 0 else 'FAIL'}")
-    say(f"- **G12** override 적용: **{agg['n_ov']:,}건** "
-        f"(승인 파일 미제출 → 0 이어야 정상) · `*_ciqid_original` 전 행 보존됨")
+
+    # ---- G12 실검사
+    ovd = pd.concat(ov_rows, ignore_index=True) if ov_rows else pd.DataFrame(
+        columns=["panjivarecordid", "arrivaldate", "panjivaid", "ciqid_original", "ciqid",
+                 "up", "is_fallback", "side"])
+    n_up_bad, up_note = 0, ""
+    if len(ovd):
+        # 교체된 행의 `*_up` 을 PIT(닫힌 구간) → 스냅샷으로 다시 조회해 대조한다.
+        # force_unmatched(ciqid 결측) 행은 up·fallback 이 결측/0 이어야 한다.
+        pit_ok = (CIQ / "ownership_pit.parquet").exists() and \
+            (CIQ / "ownership_snapshot.parquet").exists()
+        if pit_ok:
+            look = UpLookup(CIQ, ovd["ciqid"].dropna().unique())
+            up2, fb2, _ = look.lookup(ovd["ciqid"], ovd["arrivaldate"])
+            bad_up = _neq_na(ovd["up"], pd.Series(up2))
+            bad_fb = (ovd["is_fallback"].fillna(0).astype("int64").to_numpy()
+                      != np.asarray(fb2, dtype="int64"))
+            n_up_bad = int((bad_up | bad_fb).sum())
+            up_note = (f" · 교체행 UP 재조회 대조 불일치 **{n_up_bad:,}건**"
+                       f"(대상 {len(ovd):,}행, `--ciq-dir {CIQ}`)")
+        else:
+            up_note = f" · ⚠️ `--ciq-dir {CIQ}` 에 PIT/스냅샷이 없어 UP 재조회 대조 생략"
+    ok12 = agg["n_ov_lost"] == 0 and agg["n_silent"] == 0 and n_up_bad == 0
+    say(f"- **G12** override 적용 선적 **{agg['n_ov']:,}건**"
+        f"(수입자 {agg['n_ov_con']:,} · 수출자 {agg['n_ov_shp']:,}"
+        + (f" · Panjiva 기업 {ovd['panjivaid'].nunique():,}" if len(ovd) else "") + ") · "
+        f"`overridden=1` 인데 `*_ciqid_original` 결측 **{agg['n_ov_lost']:,}건** · "
+        f"`overridden=0` 인데 `*_ciqid ≠ *_ciqid_original` **{agg['n_silent']:,}건**"
+        f"{up_note} — {'PASS' if ok12 else 'FAIL'}")
+    imp = OUT / "override_impact.csv"
+    if imp.exists():
+        r = pd.read_csv(imp, encoding="utf-8")
+        if set(IMPACT_COLS) <= set(r.columns) and len(r):
+            r = r.iloc[0]
+            say(f"  - 영향표 `override_impact.csv`({r['run_at']}, 빌드 월 {r['months_built']}): "
+                f"override 행 {int(r['n_override_rows_total']):,} 중 적용 대상 "
+                f"{int(r['n_override_rows_approved']):,} · 미적용 "
+                f"{int(r['n_override_rows_not_applied']):,} · 적중 {int(r['n_override_rows_hit']):,} · "
+                f"수정 기업 {int(r['n_panjiva_companies']):,} · 선적 {int(r['n_shipments']):,} · "
+                f"금액 ${float(r['value_usd'])/1e6:,.2f}M · UP(family) 변경 "
+                f"{int(r['n_shipments_up_changed']):,} · 관계 변경 "
+                f"{int(r['n_shipments_relationship_changed']):,} · force_unmatched "
+                f"{int(r['n_shipments_force_unmatched']):,} · 원본 ID 불일치 "
+                f"{int(r['n_original_mismatch']):,}"
+                + ("" if int(r["n_shipments"]) == agg["n_ov"] else
+                   f" · ⚠️ 영향표 선적 수 {int(r['n_shipments']):,} ≠ 산출물 실측 {agg['n_ov']:,}"
+                   "(영향표는 그 실행에서 빌드한 월만 집계)"))
+        else:
+            say(f"  - ⚠️ `override_impact.csv` 가 있으나 열이 맞지 않는다: {list(r.columns)[:6]} …")
+    else:
+        say("  - 영향표 `override_impact.csv` 없음 (빌더 재실행 전 산출물)")
 
     say("\n### 관계분류 분포 (명세 §4.4 — 분모 두 가지를 함께 보고한다)\n")
     n_cls = rel_n.get("within_firm", 0) + rel_n.get("arms_length", 0)
@@ -205,7 +322,6 @@ def main():
         + f" · 나머지 6블록 각 {sum(n.startswith('con_a_') for n in sch.names)}")
 
     # ------------------------------------------------------------------ A1·A3
-    ASOF = TCOL == "age_days"
     say(f"\n## A1·A3 — {'as-of' if ASOF else 'equi-join'} 정합과 재무 커버리지\n")
     if ASOF:
         say("**명세 §3.3 as-of** — 도착일보다 **먼저 끝난** 회계기간 중 가장 최근. "
@@ -218,7 +334,8 @@ def main():
     cols = [f"{p}{c}" for p in BLOCK_PREFIX
             for c in (TCOL, "period_end", "cal_year", "cal_quarter",
                       "financial_period_id")] + ["arrivaldate", "valueofgoodsusd"]
-    stat = {p: {"n": 0, "bad": 0, "rc": 0, "v": 0.0, "neg": 0, "ages": []}
+    stat = {p: {"n": 0, "bad": 0, "rc": 0, "v": 0.0,
+                "hist": np.zeros(2 * HIST_OFF, dtype="int64")}
             for p in BLOCK_PREFIX}
     v_tot = 0.0
     for f in files:
@@ -227,33 +344,31 @@ def main():
         ty, tq = d.arrivaldate.dt.year, d.arrivaldate.dt.quarter
         for p in BLOCK_PREFIX:
             h = d[f"{p}financial_period_id"].notna()
-            a = d[f"{p}{TCOL}"]
+            a_ = d[f"{p}{TCOL}"]
             q = d[f"{p}cal_quarter"]
             stat[p]["n"] += int(h.sum())
             if ASOF:
                 # ⚠️ as-of 는 달력 라벨로 붙는 게 아니므로 `cal_year` 일치를 볼 이유가 없다.
                 #    대신 **미래 정보가 없는가**(결산일 < 도착일)와 **소급 한도**를 본다.
                 stat[p]["bad"] += (
-                    int((h & (a < 1)).sum()) + int((h & (a > 730)).sum())
+                    int((h & (a_ < 1)).sum()) + int((h & (a_ > 730)).sum())
                     + int((h & (d[f"{p}period_end"] >= d.arrivaldate)).sum()))
             else:
                 stat[p]["bad"] += int((h & (d[f"{p}cal_year"] != ty)).sum()) \
                     + int((h & q.notna() & (q != tq)).sum())
             stat[p]["rc"] += int((h & ((d.arrivaldate - d[f"{p}period_end"]).dt.days
-                                       != a)).sum())
+                                       != a_)).sum())
             stat[p]["v"] += float(d.loc[h, "valueofgoodsusd"].sum())
-            stat[p]["neg"] += int((a < 0).sum())
-            stat[p]["ages"].append(a.dropna().to_numpy().astype("int64"))
+            _hist_add(stat[p]["hist"], a_)
         del d
     rows = []
     for p in BLOCK_PREFIX:
-        ages = np.concatenate(stat[p]["ages"]) if stat[p]["n"] else np.array([0])
+        hs = _hist_stats(stat[p]["hist"])
         rows.append({"블록": p.rstrip("_"), "부착 선적": stat[p]["n"],
                      "선적 커버(%)": stat[p]["n"] / n_all * 100,
                      "금액 커버(%)": stat[p]["v"] / v_tot * 100,
-                     f"{TCOL} 중위": float(np.median(ages)),
-                     "최소": float(ages.min()), "최대": float(ages.max()),
-                     "진행중(음수)%": stat[p]["neg"] / max(stat[p]["n"], 1) * 100,
+                     f"{TCOL} 중위": hs["median"], "최소": hs["min"], "최대": hs["max"],
+                     "진행중(음수)%": hs["neg"] / max(stat[p]["n"], 1) * 100,
                      "키 불일치": stat[p]["bad"], "재계산 불일치": stat[p]["rc"]})
     say(md(pd.DataFrame(rows), "{:,.1f}"))
     tot_bad = sum(s["bad"] for s in stat.values())
@@ -261,17 +376,19 @@ def main():
     lab = "범위·미래재무 위반" if ASOF else "조인 키 불일치"
     say(f"\n- **A1** {lab} **{tot_bad:,}건** · `{TCOL}` 재계산 불일치 "
         f"**{tot_rc:,}건** — {'PASS' if tot_bad == 0 and tot_rc == 0 else 'FAIL'}")
+    allh = _hist_stats(sum(s["hist"] for s in stat.values()))
     if ASOF:
-        say("\n> **`age_days` 는 항상 양수다** — 도착일보다 먼저 끝난 기간만 붙이므로 "
+        say(f"\n> **`age_days` 는 항상 양수다** — 도착일보다 먼저 끝난 기간만 붙이므로 "
             "미래 정보가 구조적으로 들어올 수 없다. 대신 **행마다 시차가 다르다**"
-            "(중위 189일, 범위 1~730일). 시차를 통제하려면 `age_days <= 365` 처럼 거른다.")
-        say("\n> equi-join 대안본(`*_days_after_close`)과의 대조는 "
-            "`projects\\20251201\\output\\COMPARE_asof_vs_equi.md` 참조.")
+            f"(8블록 전체 실측: 중위 {allh['median']:,.0f}일, 범위 {allh['min']:,.0f}~"
+            f"{allh['max']:,.0f}일). 시차를 통제하려면 `age_days <= 365` 처럼 거른다.")
     else:
-        say("\n> **`days_after_close` 가 음수인 행은 그 회계기간이 선적 시점에 아직 끝나지 "
+        say(f"\n> **`days_after_close` 가 음수인 행은 그 회계기간이 선적 시점에 아직 끝나지 "
             "않았다는 뜻**이다(공시 전). 오류가 아니라 equi-join 의 당연한 성질이며, V-6 대로 "
             "**시점 판단은 분석 단계에서** 한다 — Stata 에서 lag 을 주거나 "
-            "`days_after_close > 0` 으로 거르면 as-of 와 같은 조건이 된다.")
+            f"`days_after_close > 0` 으로 거르면 as-of 와 같은 조건이 된다"
+            f"(8블록 전체 실측: 중위 {allh['median']:,.0f}일, 범위 {allh['min']:,.0f}~"
+            f"{allh['max']:,.0f}일, 음수 {allh['neg']/max(allh['n'],1)*100:.1f}%).")
 
     # ------------------------------------------------------------------ A2
     say("\n## A2 — USD 환산 검산\n")
@@ -327,33 +444,23 @@ def main():
                 # 어느 선적이 다른지 끝까지 특정한다 — 숫자만 보고 넘어가지 않는다
                 gone, added = [], []
                 for m in both:
-                    o = set(pd.read_parquet(H1 / f"shipment_master_{m}.parquet",
-                                            columns=["panjivarecordid"]).panjivarecordid)
-                    n = set(pd.read_parquet(OUT / f"shipment_master_{m}.parquet",
-                                            columns=["panjivarecordid"]).panjivarecordid)
-                    gone += [(m, i) for i in sorted(o - n)]
-                    added += [(m, i) for i in sorted(n - o)]
+                    o = pd.read_parquet(H1 / f"shipment_master_{m}.parquet",
+                                        columns=["panjivarecordid"]).panjivarecordid.to_numpy(dtype="int64")
+                    n = pd.read_parquet(OUT / f"shipment_master_{m}.parquet",
+                                        columns=["panjivarecordid"]).panjivarecordid.to_numpy(dtype="int64")
+                    gone += [(m, int(i)) for i in np.setdiff1d(o, n)]
+                    added += [(m, int(i)) for i in np.setdiff1d(n, o)]
                 say("\n### 차이 나는 선적 — 전수 특정\n")
                 say(f"- 기존에만 있던 선적 **{len(gone)}건**"
                     + (": " + ", ".join(f"`{i}`({m})" for m, i in gone[:20]) if gone else "")
                     + (" …" if len(gone) > 20 else ""))
                 say(f"- 신규에만 있는 선적 **{len(added)}건**"
-                    + (": " + ", ".join(f"`{i}`({m})" for m, i in added[:20]) if added else ""))
+                    + (": " + ", ".join(f"`{i}`({m})" for m, i in added[:20]) if added else "")
+                    + (" …" if len(added) > 20 else ""))
                 say("\n> **차이가 나면 Snowflake 원본에서 해당 `panjivaRecordId` 를 직접 조회해 "
                     "원인을 규명하라.** 표준필터 컬럼(`conCountry`·`frob`)이 피드 정정으로 "
-                    "바뀌었는지가 첫 확인 대상이다.")
-                if {i for _, i in gone} == {269153583, 273878499}:
-                    say("\n**이번 사례(2026-08-21 확인): S&P 피드 정정.** 두 선적 모두 "
-                        "원본에 여전히 있으나 `conCountry` 가 **`'Guyana'`** 로 바뀌었다. "
-                        "기존 L0 를 뽑던 2026-08 초에는 비어 있어 표준필터"
-                        "(`conCountry = 'United States' or conCountry is null`)를 통과했다.\n")
-                    say("```\n"
-                        "269153583  2024-04-05  conCountry='Guyana'  $90   Morris George <- Lelawatie Rampersaud\n"
-                        "273878499  2024-06-14  conCountry='Guyana'  $140  Morris George <- Lelawatie Rampersaud\n"
-                        "```\n")
-                    say("> **신규본이 더 정확하다.** 가이아나 수입은 미국 수입 표본에 들어가면 "
-                        "안 된다. 추출 오류가 아니라 원자료가 고쳐진 것이므로 기존 검증본을 "
-                        "다시 만들 필요는 없다. 금액 영향 $230.")
+                    "바뀌었는지가 첫 확인 대상이다. 규명 결과(원인·금액 영향·기존본 재생성 여부)는 "
+                    "이 폴더의 `DECISIONS.md` 에 기록한다 — 이 검증은 목록만 특정한다.")
 
         say("\n> 관계분류 **비중**은 기존 H1 과 다를 수 있고, 다른 것이 정상이다. "
             "기존 H1 은 SQL 안의 CASE 로 판정해 **양측 매칭됐는데 UP 이 둘 다 NULL 이면 "

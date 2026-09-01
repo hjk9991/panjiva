@@ -90,14 +90,23 @@ def main():
     OUT, V1 = Path(a.dir), Path(a.v1_dir)
 
     global TCOL
-    TCOL = time_col(pq.ParquetFile(OUT / "04_group.parquet").schema_arrow.names)
+    # 결합 방식은 **존재하는 첫 패널**의 스키마로 판별한다 (`--only` 로 일부만 만든 폴더도 통한다)
+    present = [OUT / f"{n}.parquet" for n in PANELS if (OUT / f"{n}.parquet").exists()]
+    if not present:
+        raise SystemExit(f"검증할 패널이 없다: {OUT}")
+    TCOL = time_col(pq.ParquetFile(present[0]).schema_arrow.names)
     ASOF = TCOL == "age_days"
 
     say("# v2 패널 — 검증 결과\n")
-    say(f"**검증일** {date.today()} · **대상** `{OUT}` · **선적 base** `{V1}`\n")
+    say(f"**검증일** {date.today()} · **대상** `{OUT}` · **선적 base** `{V1}` · "
+        f"**결합** {'asof' if ASOF else 'equi'}\n")
     say(f"**재무 결합 방식**: **{'as-of (명세 §3.3)' if ASOF else 'equi-join'}** "
-        f"— 시점 컬럼 `*_{TCOL}`\n")
-    say("결정 근거는 같은 폴더 `DECISIONS.md`, 컬럼 뜻은 `COLUMNS.md`.\n")
+        f"— 시점 컬럼 `*_{TCOL}` (판별 근거: `{present[0].name}` 스키마)\n")
+    docs = [n for n in ("DECISIONS.md", "COLUMNS.md") if (OUT / n).exists()]
+    if docs:
+        say("같은 폴더의 " + " · ".join(
+            {"DECISIONS.md": "`DECISIONS.md`(결정 근거)", "COLUMNS.md": "`COLUMNS.md`(컬럼 뜻)"}[d]
+            for d in docs) + " 참조.\n")
 
     print("v1 대사 기준값 계산 중...")
     t1 = v1_totals(V1)

@@ -4,19 +4,30 @@ wf_v3_90_checks.py — v3 검증. 명세 §11 게이트 중 v3 가 책임지는 
 
 산출: `--dir` 안에 `90_checks.md`
 
-  G3   키 유일성 (패널 4종)
+  G3   키 유일성 (패널 6종)
   G4   **HS 균등배분 후 금액·중량·TEU 합계가 선적층과 대사**된다
   G6·G7 관계 분해 합계와 분류가능 100%
   G8   `within_share` 가 [0,1] 이고 분자·분모가 재계산된다
   G9   PIT 변경 이벤트가 **동일 UP 인접구간을 중복 변경으로 세지 않는다**
-  G10  전체거래 하한 + 판정불가 구성요소가 정의된 분모와 대사된다
-  G11  관계전환 pair 는 **실제로 연중 두 관계 상태가 모두 관측**된다
+  G10  §11-10 구성요소 합 — 판정가능·노출 + 판정가능·무변경 + 판정불가 = 전체 (선적·금액)
+  G11  관계전환 pair 는 **실제로 연중 두 관계 상태가 모두 관측**된다 (+ 전환일 정합)
   G13  v1 · v2 와 총계가 대사된다
   G14  컬럼 소문자 · 코드성 식별자 정수 보존
+
+  v3 추가 게이트 (명세 §11 번호와 무관):
+  G15  `panel_firm_export_quarter` 금액·선적 수 = 원천 `exp_ship_*` 의 매칭 수출자 선적
+  G16  `panel_firm_origin_quarter` 금액·선적 수 = v1 수입자(con) 매칭 선적
+  G17  `dim_relationship.within_share_is_count_based` ⇔ 분류가능 금액 0/결측 & 분류가능 선적 > 0
+  G18  `panel_firm_quarter.entry/exit_assessable` NaN 0 · 값 {0,1} · int8
+  G19  `*_hhi_partners` 0 인 행 없음 · 비결측 값 (0,1]
+
+d8 표는 `--tables-dir`(기본 `output\tables\wf{start 연도}[_asof]` — v1 스키마로 결합 방식 판별)
+에서 읽는다. as-of 판을 검증할 때 equi 표를 읽던 하드코딩은 없앴다.
 """
 
 import argparse
 import json
+import sys
 from datetime import date
 from pathlib import Path
 
@@ -25,16 +36,21 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from wf_v3_d8d9 import detect_join_v1, default_tables_dir  # noqa: E402
+
 V1 = Path(r"C:\panjiva\data\staging\tom_v1_2024")
 V2 = Path(r"C:\panjiva\data\staging\tom_v2_2024")
 V3 = Path(r"C:\panjiva\data\staging\within_firm_pilot_2024")
-SRC = Path(r"C:\panjiva\data\staging\source\trade_2024")
+SRC = Path(r"C:\panjiva\data\staging\source\trade")
 CIQ = Path(r"C:\panjiva\data\staging\source\ciq_ref")
 
 KEYS = {"panel_pair_month": ["con_ciqid", "shp_ciqid", "ym"],
         "dim_relationship": ["pair_id"],
         "panel_firm_quarter": ["companyid", "trade_quarter"],
-        "panel_firm_origin_hs": ["con_ciqid", "origin_country", "hs6"]}
+        "panel_firm_origin_hs": ["con_ciqid", "origin_country", "hs6"],
+        "panel_firm_export_quarter": ["companyid", "trade_quarter"],
+        "panel_firm_origin_quarter": ["con_ciqid", "shpmtorigin", "trade_quarter"]}
 L, GATE = [], {}
 
 
@@ -71,14 +87,22 @@ def main() -> None:
     ap.add_argument("--v2-dir", default=str(V2))
     ap.add_argument("--src-dir", default=str(SRC))
     ap.add_argument("--ciq-dir", default=str(CIQ))
+    ap.add_argument("--tables-dir", default=None,
+                    help="d8 표 폴더. 기본: output\\tables\\wf{start 연도}[_asof] (v1 스키마로 판별)")
     a = ap.parse_args()
     V3, V1, V2 = Path(a.dir), Path(a.v1_dir), Path(a.v2_dir)
     SRC, CIQ = Path(a.src_dir), Path(a.ciq_dir)
+    join = detect_join_v1(V1, a.start)
+    TABLES = Path(a.tables_dir) if a.tables_dir else default_tables_dir(a.start, join)
     months = list(pd.date_range(a.start, a.end, freq="MS").strftime("%Y%m")[:-1])
 
     say("# v3 within-firm 분석패널 — 검증 결과\n")
-    say(f"**검증일** {date.today()} · **대상** `{V3}` · **스크립트** `wf_v3_90_checks.py`\n")
-    say("결정 근거는 같은 폴더 `DECISIONS.md`, 컬럼 뜻은 `COLUMNS.md`.\n")
+    say(f"**검증일** {date.today()} · **대상** `{V3}` · **결합** {join} · "
+        f"**기간** {a.start} ~ {a.end}(미포함) · **d8 표** `{TABLES}` · "
+        f"**스크립트** `wf_v3_90_checks.py`\n")
+    docs = [n for n in ("DECISIONS.md", "COLUMNS.md") if (V3 / n).exists()]
+    if docs:
+        say("결정 근거·컬럼 뜻은 같은 폴더의 " + " · ".join(f"`{n}`" for n in docs) + ".\n")
 
     print("입력 로드...")
     ship = pd.concat([pd.read_parquet(
@@ -237,26 +261,50 @@ def main() -> None:
 
     # ------------------------------------------------------------------ G10·G11
     say("\n## G10 · G11 — d8 · d9 정합\n")
-    say("- **G10**: 노출·판정불가 구성요소가 전체 분모와 대사되는지")
-    exp_sum = Path(a.dir).parent.parent / "projects"      # 참고 경로만
-    tb = Path(r"C:\panjiva\projects\20251201\output\tables\wf2024")
-    f10 = tb / "d8_ownership_change_summary.csv"
-    if f10.exists():
-        r = pd.read_csv(f10, encoding="utf-8-sig")
-        n_all = int(r["선적 분모"].iloc[0])
-        gate("G10", int(r["선적 분모"].iloc[2]) == n_all and len(ship) == n_all,
-             f"전체 분모 {n_all:,} = v1 선적 {len(ship):,}")
+    say("- **G10**: 명세 §11-10 — **판정가능·노출(2행) + 판정가능·무변경(4행) + 판정불가(3행) "
+        "= 전체 거래**, 선적과 금액 모두. 전체 분모는 v1 선적 수와 같아야 한다.")
+    f10 = TABLES / "d8_ownership_change_summary.csv"
+    if not f10.exists():
+        say(f"  - `{f10}` 없음 — 건너뜀 (`wf_v3_d8d9.py --tables-dir` 와 같은 폴더여야 한다)")
     else:
-        say("  - `d8_ownership_change_summary.csv` 없음 — 건너뜀")
+        r = pd.read_csv(f10, encoding="utf-8-sig")
+        if len(r) < 4:
+            gate("G10", False, "d8 summary 가 4행 미만(구판) — `wf_v3_d8d9.py` 를 다시 돌릴 것")
+        else:
+            n_all, v_all = int(r["선적 분모"].iloc[0]), float(r["금액 분모($B)"].iloc[0])
+            parts = {"판정가능·노출 (2행)": (int(r["선적"].iloc[1]), float(r["금액($B)"].iloc[1])),
+                     "판정가능·무변경 (4행)": (int(r["선적"].iloc[3]), float(r["금액($B)"].iloc[3])),
+                     "판정불가 (3행)": (int(r["선적"].iloc[2]), float(r["금액($B)"].iloc[2]))}
+            n_sum = sum(x[0] for x in parts.values())
+            v_sum = sum(x[1] for x in parts.values())
+            say(md(pd.DataFrame(
+                [{"구성요소": k, "선적": n, "금액($B)": v} for k, (n, v) in parts.items()]
+                + [{"구성요소": "합", "선적": n_sum, "금액($B)": v_sum},
+                   {"구성요소": "전체 분모 (1행)", "선적": n_all, "금액($B)": v_all},
+                   {"구성요소": "v1 선적 (금액은 비결측 합)", "선적": len(ship),
+                    "금액($B)": float(ship.valueofgoodsusd.sum()) / 1e9}]), "{:,.6f}"))
+            dv = abs(v_sum - v_all) * 1e9
+            dv1 = abs(v_all * 1e9 - float(ship.valueofgoodsusd.sum()))
+            gate("G10", n_sum == n_all == len(ship) and dv < 1e3 and dv1 < 1,
+                 f"선적 {n_sum:,} = {n_all:,} = v1 {len(ship):,} · 금액 합 차이 ${dv:,.2f} · "
+                 f"분모 vs v1 차이 ${dv1:,.2f}")
 
     tr = rel[rel.relationship_changed_2024 == 1]
     ok11 = bool(((tr.first_state != tr.last_state) | (tr.n_transitions >= 2)).all()) \
         and bool((tr.n_transitions >= 1).all())
-    gate("G11", ok11,
-         f"전환 pair {len(tr):,}개 전부 두 상태가 실제로 관측됨 "
-         f"(전환 {int(tr.n_transitions.sum()):,}건: "
-         f"within→arms {int(tr.within_to_arms.sum()):,} · "
-         f"arms→within {int(tr.arms_to_within.sum()):,})")
+    det11 = (f"전환 pair {len(tr):,}개 전부 두 상태가 실제로 관측됨 "
+             f"(전환 {int(tr.n_transitions.sum()):,}건: "
+             f"within→arms {int(tr.within_to_arms.sum()):,} · "
+             f"arms→within {int(tr.arms_to_within.sum()):,})")
+    if "first_transition_date" in tr.columns:
+        # 명세 §6.5 전환일 — 전환 pair 는 전부 있고 순서가 맞아야, 비전환 pair 는 NaT 여야 한다
+        no_tr = rel[rel.n_transitions.fillna(0) == 0]
+        ok_dt = bool(tr.first_transition_date.notna().all()) \
+            and bool((tr.first_transition_date <= tr.last_transition_date).all()) \
+            and bool(no_tr.first_transition_date.isna().all())
+        ok11 = ok11 and ok_dt
+        det11 += f" · 전환일 정합 {'OK' if ok_dt else '불일치'}"
+    gate("G11", ok11, det11)
 
     # ------------------------------------------------------------------ G14
     say("\n## G14 — 컬럼명·타입\n")
@@ -273,6 +321,68 @@ def main() -> None:
     gate("G14", not bad_up and not bad_int,
          f"대문자 컬럼 {len(bad_up)}개 · 식별자 비정수 {len(bad_int)}개"
          + (f" — {', '.join((bad_up + bad_int)[:5])}" if (bad_up or bad_int) else ""))
+
+    # ------------------------------------------------------------------ G15~G19
+    say("\n## G15 ~ G19 — v3 추가 게이트 (명세 §11 번호와 무관)\n")
+    # G15 수출 패널 = 원천 exp_ship 의 shp_ciqid_original 비결측 선적
+    fxp = V3 / "panel_firm_export_quarter.parquet"
+    if fxp.exists():
+        fx = pd.read_parquet(fxp, columns=["n_ship", "value_usd"])
+        files = [SRC / f"exp_ship_{m}.parquet" for m in months]
+        files = [f for f in files if f.exists()]
+        if files:
+            e = pd.concat([pd.read_parquet(f, columns=["shp_ciqid_original", "valueofgoodsusd"])
+                           for f in files], ignore_index=True)
+            e = e[e.shp_ciqid_original.notna()]
+            n_src, v_src = len(e), float(e.valueofgoodsusd.fillna(0).sum())
+            del e
+        else:
+            n_src, v_src = 0, 0.0
+        n_p, v_p = int(fx.n_ship.sum()), float(fx.value_usd.sum())
+        gate("G15/export_panel", n_p == n_src and abs(v_p - v_src) < 1,
+             f"패널 선적 {n_p:,} vs 원천 매칭 수출 선적 {n_src:,} · 금액 차이 ${abs(v_p - v_src):,.2f} "
+             f"(수출 월 파일 {len(files)}/{len(months)}개월)")
+    else:
+        say("- `panel_firm_export_quarter.parquet` 없음 — G15 건너뜀")
+    # G16 원산국 패널 = v1 con 매칭 선적
+    fop = V3 / "panel_firm_origin_quarter.parquet"
+    if fop.exists():
+        fo2 = pd.read_parquet(fop, columns=["n_ship", "value_usd"])
+        con = ship.con_ciqid.notna()
+        n_p, v_p = int(fo2.n_ship.sum()), float(fo2.value_usd.sum())
+        n_c, v_c = int(con.sum()), float(v[con].sum())
+        gate("G16/origin_panel", n_p == n_c and abs(v_p - v_c) < 1,
+             f"패널 선적 {n_p:,} vs v1 수입자 매칭 선적 {n_c:,} · 금액 차이 ${abs(v_p - v_c):,.2f}")
+    else:
+        say("- `panel_firm_origin_quarter.parquet` 없음 — G16 건너뜀")
+    # G17 건수 대체 플래그 ⇔ 분류가능 금액 0/결측 & 분류가능 선적 > 0
+    if "within_share_is_count_based" in rel.columns:
+        exp17 = (rel.value_classified.fillna(0) <= 0) & (rel.n_classified.fillna(0) > 0)
+        mism = int(((rel.within_share_is_count_based == 1) != exp17).sum())
+        gate("G17/count_based_flag", mism == 0,
+             f"flag=1 {int((rel.within_share_is_count_based == 1).sum()):,}행 · 정의와 불일치 {mism}행 "
+             f"· 분류가능 선적 0 인 pair(flag 0·share NaN) "
+             f"{int((rel.n_classified.fillna(0) == 0).sum()):,}")
+    else:
+        gate("G17/count_based_flag", False, "`within_share_is_count_based` 열 없음")
+    # G18 · G19 panel_firm_quarter 플래그·HHI
+    if fq.exists():
+        af = pd.read_parquet(fq, columns=["entry_assessable", "exit_assessable"])
+        bad = sum(int(af[c].isna().sum()) + int((~af[c].isin([0, 1])).sum()) for c in af.columns)
+        dt_ok = all(str(af[c].dtype) == "int8" for c in af.columns)
+        gate("G18/assessable_flags", bad == 0 and dt_ok,
+             f"NaN·{{0,1}} 밖 {bad}건 · dtype {af.entry_assessable.dtype}/{af.exit_assessable.dtype} · "
+             f"entry_assessable=0 {int((af.entry_assessable == 0).sum()):,}행 · "
+             f"exit_assessable=0 {int((af.exit_assessable == 0).sum()):,}행")
+        hh = pd.read_parquet(fq, columns=["imp_hhi_partners", "exp_hhi_partners"])
+        z = int((hh.imp_hhi_partners == 0).sum()) + int((hh.exp_hhi_partners == 0).sum())
+        nn = pd.concat([hh.imp_hhi_partners.dropna(), hh.exp_hhi_partners.dropna()])
+        out_ = int(((nn <= 0) | (nn > 1 + 1e-9)).sum())
+        gate("G19/hhi_range", z == 0 and out_ == 0,
+             f"0 인 행 {z} · (0,1] 밖 {out_} · 비결측 imp {int(hh.imp_hhi_partners.notna().sum()):,} "
+             f"/ exp {int(hh.exp_hhi_partners.notna().sum()):,} · 최소 {float(nn.min()):.4f}")
+    else:
+        say("- `panel_firm_quarter.parquet` 없음 — G18 · G19 건너뜀")
 
     # ------------------------------------------------------------------ 요약
     say("\n---\n\n## 요약\n")

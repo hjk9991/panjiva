@@ -16,6 +16,10 @@ src_trade_pull.py — v1·v2·v3 공용 무역 원천 추출 (Panjiva 수입·�
   <out>/exp_ship_YYYYMM.parquet   수출 선적 (상대방 식별자 없음 — 구조적)
   <out>/exp_hs_YYYYMM.parquet
   <out>/_run_log.md               월별 실행 로그 (쿼리기간·행수·고유수·크기·시각)
+  <out>/_crosswalk_dup.md         실행마다 crosswalk 중복 건수 1행 (명세 §3.1, DECISIONS T-9)
+
+검사: 선적 파일은 추출 직후 `행 수 == 고유 panjivaRecordId 수` 가 아니면 예외로 중단한다
+      (crosswalk·PIT 조인의 행 증식 감지). 파일은 쓰지 않는다.
 
 사용법:
   python scripts\extraction\src_trade_pull.py --start 2024-01-01 --end 2025-01-01
@@ -32,7 +36,7 @@ from pathlib import Path
 import pandas as pd
 import snowflake.connector
 
-OUT_DEFAULT = Path(r"C:\panjiva\data\staging\source\trade_2024")
+OUT_DEFAULT = Path(r"C:\panjiva\data\staging\source\trade")
 
 # T-2 기본 제외: 긴 텍스트(압축 불가) · 기존 컬럼과 중복 표기 · 피드 내부값
 DEFAULT_EXCLUDE = {
@@ -96,6 +100,12 @@ hs_cnt as (
     where regexp_like(t.value, '.*(Classified|Parsed|Manual): ?[0-9].*')
     group by a.panjivaRecordId
 )"""
+
+# 명세 §3.1 — 같은 Panjiva ID 가 복수 companyId 에 연결된 중복 건수를 실행마다 기록한다.
+# XR_CTE 의 필터와 정확히 같은 조건에서 센다 (행 수 − 고유 identifierValue 수 = 여분 행).
+XR_COUNT_SQL = """select count(*) as n_rows, count(distinct identifierValue) as n_ids
+from panjivaCompanyCrossRef
+where activeFlag = 1 and identifierValue is not null"""
 
 # crosswalk: activeFlag=1 만, identifierValue 당 1행(낮은 companyId 승자)
 XR_CTE = """xr as (
@@ -234,6 +244,39 @@ def save(df, path):
     return path.stat().st_size
 
 
+def log_crosswalk_dup(out, conn_kw):
+    """명세 §3.1 — crosswalk 중복 건수. 실행 시작 시 count 1회 → `_crosswalk_dup.md` 에 한 줄.
+
+    규칙(XR_CTE): `qualify row_number() over (partition by identifierValue order by companyId) = 1`
+    → 낮은 companyId 가 이긴다. 근거·실측은 `DECISIONS.md` T-9.
+    """
+    with snowflake.connector.connect(**conn_kw) as conn:
+        with conn.cursor() as cur:
+            cur.execute(XR_COUNT_SQL)
+            n_rows, n_ids = cur.fetchone()
+    n_rows, n_ids = int(n_rows), int(n_ids)
+    dup = n_rows - n_ids
+    p = out / "_crosswalk_dup.md"
+    if not p.exists():
+        p.write_text(
+            "# crosswalk 중복 실측 (src_trade_pull.py · 명세 §3.1)\n\n"
+            "`panjivaCompanyCrossRef` 에서 `activeFlag = 1 and identifierValue is not null` 인 "
+            "행 수(n_rows)와 고유 `identifierValue` 수(n_ids). **중복 = n_rows − n_ids** 는 같은 "
+            "Panjiva ID 가 복수 companyId 에 연결된 여분 행이며, 추출 SQL 은 "
+            "`qualify row_number() over (partition by identifierValue order by companyId) = 1` "
+            "로 **낮은 companyId** 를 택한다(`DECISIONS.md` T-9). 실행마다 한 줄 보탠다.\n\n"
+            "| 측정시각 | n_rows | n_ids | 중복(n_rows−n_ids) | 중복률 |\n|---|---|---|---|---|\n",
+            encoding="utf-8")
+    with p.open("a", encoding="utf-8") as fh:
+        fh.write("| %s | %s | %s | %s | %.4f%% |\n"
+                 % (datetime.now().strftime("%Y-%m-%d %H:%M"), "{:,}".format(n_rows),
+                    "{:,}".format(n_ids), "{:,}".format(dup), dup / n_rows * 100))
+    print("crosswalk 중복 실측: 행 %s · 고유 ID %s · 중복 %s (%.4f%%) → %s"
+          % ("{:,}".format(n_rows), "{:,}".format(n_ids), "{:,}".format(dup),
+             dup / n_rows * 100, p.name))
+    return n_rows, n_ids
+
+
 def acquire_lock(out):
     """같은 출력 폴더에 대한 동시 실행 차단 — 2026-08-20 동시 write 로 5개 파일이 손상된
     사고의 재발 방지. 락 파일에 PID 를 남기고, 살아있는 PID 면 즉시 중단한다."""
@@ -298,6 +341,7 @@ def main():
     conn_kw = connect_kwargs()
     lock = acquire_lock(out)
     try:
+        log_crosswalk_dup(out, conn_kw)            # 명세 §3.1 — 실행마다 중복 건수 기록
         run_months(months, args, keep, out, log, conn_kw)
     finally:
         lock.unlink(missing_ok=True)
@@ -319,6 +363,19 @@ def run_months(months, args, keep, out, log, conn_kw):
                         t0 = datetime.now()
                         cur.execute(sql)
                         df = cur.fetch_pandas_all()
+                        if kind == "ship":
+                            # 행 증식 감지 — crosswalk(xr)·PIT(pit_wk)·스냅샷 조인은 전부 1:1 이어야
+                            # 한다. 아니면 파일을 쓰지 않고 중단한다 (명세 §3.1·§3.2 진단).
+                            pk = next((c for c in df.columns
+                                       if c.lower() == "panjivarecordid"), None)
+                            if pk is None:
+                                raise RuntimeError("%s: panjivaRecordId 컬럼이 없다" % p.name)
+                            n_uq = int(df[pk].nunique())
+                            if n_uq != len(df):
+                                raise RuntimeError(
+                                    "%s: 행 증식 감지 — %s행 vs 고유 선적 %s (crosswalk/PIT 조인이 "
+                                    "1:1 이 아니다). 파일을 쓰지 않았다."
+                                    % (p.name, "{:,}".format(len(df)), "{:,}".format(n_uq)))
                         size = save(df, p)
                         uq = (df["panjivarecordid"].nunique()
                               if "panjivarecordid" in df.columns else len(df))

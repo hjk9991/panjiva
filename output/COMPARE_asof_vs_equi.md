@@ -1,14 +1,21 @@
 # as-of 판 vs equi-join 판 — 대조
 
-**대조일** 2026-08-28 · **스크립트** `compare_join_modes.py`
+**대조일** 2026-09-01 · **스크립트** `compare_join_modes.py` · **월** 202401~202412 (12개월)
 
 두 산출물은 **재무 결합 방식만** 다르다. 선적·관계는 같고 재무만 달라야 정상이다.
 
-- `tom_v1_2024_asof` 등 = **명세 §3.3 준수본** (`*_age_days`, 항상 양수)
+- `tom_v1_2024_asof` 등 = **명세 §3.3 준수본(정본)** (`*_age_days`, 항상 양수)
 - `tom_v1_2024` 등 = **대안본** (`*_days_after_close`, 음수 가능)
+
+| 판 | v1 | v2 | v3 | 통계표 |
+|---|---|---|---|---|
+| equi | `C:\panjiva\data\staging\tom_v1_2024` | `C:\panjiva\data\staging\tom_v2_2024` | `C:\panjiva\data\staging\within_firm_pilot_2024` | `C:\panjiva\projects\20251201\output\tables\wf2024` |
+| asof | `C:\panjiva\data\staging\tom_v1_2024_asof` | `C:\panjiva\data\staging\tom_v2_2024_asof` | `C:\panjiva\data\staging\within_firm_pilot_2024_asof` | `C:\panjiva\projects\20251201\output\tables\wf2024_asof` |
 
 
 ## v1 — 선적층
+
+비교한 월: 12/12
 
 ### 같아야 하는 것
 
@@ -49,7 +56,7 @@
 | 패널 | equi 행 | asof 행 | 행 차이 | equi 열 | asof 열 |
 |---|---|---|---|---|---|
 | panel_pair_month | 852,303 | 852,303 | 0 | 36 | 36 |
-| dim_relationship | 246,317 | 246,317 | 0 | 33 | 33 |
+| dim_relationship | 246,317 | 246,317 | 0 | 38 | 38 |
 | panel_firm_quarter | 612,269 | 612,269 | 0 | 2,641 | 2,641 |
 | panel_firm_origin_hs | 993,394 | 993,394 | 0 | 14 | 14 |
 - [PASS] **v3 패널 행 수 동일** 
@@ -67,10 +74,24 @@
 | exp_value_usd | 825,894,280,646.00 | 825,894,280,646.00 | 0.00 |
 - [PASS] **v2 거래 측정치 전부 동일** 
 
+## 문서 대조 — asof 폴더 문서가 equi 폴더 문서와 (결합방식 단락 빼고) 같은가
+
+정규화: `<!-- JOIN:equi|asof -->…<!-- /JOIN -->` 블록 제거 → 폴더명 → `age_days`→`days_after_close` → 줄 단위 비교(줄 끝 공백 무시, 연속 빈 줄 하나로).
+
+- [PASS] **문서 v1 `README.md` equi = asof** — 정규화 후 36/36줄
+- [PASS] **문서 v1 `COLUMNS.md` equi = asof** — 정규화 후 233/233줄
+- [PASS] **문서 v1 `DECISIONS.md` equi = asof** — 정규화 후 79/79줄
+- [PASS] **문서 v2 `README.md` equi = asof** — 정규화 후 32/32줄
+- [PASS] **문서 v2 `COLUMNS.md` equi = asof** — 정규화 후 409/409줄
+- [PASS] **문서 v2 `DECISIONS.md` equi = asof** — 정규화 후 110/110줄
+- [PASS] **문서 v3 `README.md` equi = asof** — 정규화 후 49/49줄
+- [PASS] **문서 v3 `COLUMNS.md` equi = asof** — 정규화 후 472/472줄
+- [PASS] **문서 v3 `DECISIONS.md` equi = asof** — 정규화 후 138/138줄
+
 ---
 
 ## 요약
 
-**12개 항목 중 12개 PASS**
+**21개 항목 중 21개 PASS**
 
-> 두 판은 **선적·관계·패널 구조가 완전히 같고 재무만 다르다.** PI 판단에 따라 어느 쪽이든 그대로 쓸 수 있다.
+> 두 판은 **선적·관계·패널 구조·문서가 완전히 같고 재무만 다르다.** PI 판단에 따라 어느 쪽이든 그대로 쓸 수 있다(정본은 as-of).

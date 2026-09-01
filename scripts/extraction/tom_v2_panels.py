@@ -44,14 +44,17 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "common"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "processing"))
 from finblocks import (attach_block_keys, load_fin_layer,       # noqa: E402
                        write_with_blocks)
+from v4_common import discover_months                            # noqa: E402
 
 V1 = Path(r"C:\panjiva\data\staging\tom_v1_2024")
 FIN = Path(r"C:\panjiva\data\staging\source\ciq_fin")
+CIQ = Path(r"C:\panjiva\data\staging\source\ciq_ref")
 OUT = Path(r"C:\panjiva\data\staging\tom_v2_2024")
 
-# v1 에서 읽어올 컬럼만 (1,425열 중 필요한 것만 — parquet 은 컬럼 단위로 읽는다)
+# v1 에서 읽어올 컬럼만 (1,428열 중 필요한 것만 — parquet 은 컬럼 단위로 읽는다)
 SHIP_COLS = [
     "panjivarecordid", "arrivaldate", "valueofgoodsusd", "weightkg", "volumeteu",
     "con_ciqid", "shp_ciqid", "con_up", "shp_up",
@@ -156,7 +159,10 @@ def finalize_counts(p: pd.DataFrame) -> pd.DataFrame:
 
 
 def top_by_value(df: pd.DataFrame, keys, col: str, out: str) -> pd.DataFrame:
-    """분기 안에서 **금액가중 최빈값**. 동점이면 사전순 앞선 값(재현 가능하게)."""
+    """분기 안에서 **금액 최대**인 값. 동점이면 사전순 앞선 값(재현 가능하게).
+
+    최빈값(mode, 건수 argmax)이 아니다 — 값별 금액 합의 argmax 다.
+    """
     sub = df[df[col].notna()]
     if not len(sub):
         return pd.DataFrame(columns=list(keys) + [out])
@@ -193,7 +199,7 @@ def build_pair(ship: pd.DataFrame) -> pd.DataFrame:
     for col, out in (("hs2", "top_hs2"), ("hs6", "top_hs6"),
                      ("shpmtorigin", "top_origin"), ("within_firm_type", "top_within_type")):
         p = p.merge(top_by_value(s, gk, col, out), on=gk, how="left")
-    # 분기 내 UP — 금액가중 최빈값. 흔들리면 up_changed 로 표시한다(명세 §6.3 예비)
+    # 분기 내 UP — 금액 최대. 흔들리면 up_changed 로 표시한다(명세 §6.3 예비)
     for side in ("shp", "con"):
         u = top_by_value(s[s[f"{side}_up"].notna()], gk, f"{side}_up", f"{side}_up")
         n = (s.groupby(gk)[f"{side}_up"].nunique().rename(f"{side}_up_changed")
@@ -267,32 +273,63 @@ def month_list(start: str, end: str) -> list:
     return [d.strftime("%Y%m") for d in rng[:-1]] if len(rng) > 1 else []
 
 
+def resolve_months(v1: Path, start, end) -> list:
+    """`--start/--end` 가 있으면 그 월들(v1 에 없는 월이 있으면 예외), 없으면 v1 폴더에서 발견."""
+    found = list(discover_months([v1], "shipment_master"))
+    if not found:
+        raise SystemExit(f"v1 폴더에 shipment_master_YYYYMM.parquet 이 없다: {v1}")
+    if start is None and end is None:
+        return found
+    if start is None:
+        start = f"{found[0][:4]}-{found[0][4:]}-01"
+    if end is None:
+        last = pd.Timestamp(f"{found[-1][:4]}-{found[-1][4:]}-01") + pd.offsets.MonthBegin(1)
+        end = last.strftime("%Y-%m-%d")
+    months = month_list(start, end)
+    missing = [m for m in months if m not in set(found)]
+    if not months or missing:
+        raise SystemExit(f"요청 기간 {start}~{end} 중 v1 에 없는 월: {missing[:12]} ({v1})")
+    return months
+
+
 def main() -> None:
-    global V1, FIN
+    global V1, FIN, CIQ
     ap = argparse.ArgumentParser()
-    ap.add_argument("--start", default="2024-01-01")
-    ap.add_argument("--end", default="2025-01-01", help="미포함")
+    ap.add_argument("--start", default=None, help="시작월. 미지정이면 v1 폴더의 첫 월")
+    ap.add_argument("--end", default=None, help="종료(미포함). 미지정이면 v1 폴더의 마지막 월까지")
     ap.add_argument("--v1-dir", default=str(V1), help="선적 base (v1 산출물)")
     ap.add_argument("--fin-dir", default=str(FIN))
+    ap.add_argument("--ciq-dir", default=str(CIQ), help="CIQ 참조 (company.parquet)")
     ap.add_argument("--out-dir", default=str(OUT))
     ap.add_argument("--only", nargs="*", choices=["02_pair", "03_firm", "04_group"])
     ap.add_argument("--join", choices=["equi", "asof"], default="equi",
                     help="재무 결합 방식. asof 는 명세 §3.3(분기 시작일 직전 완료 기간)")
+    ap.add_argument("--force", action="store_true",
+                    help="이미 있는 패널도 다시 만든다 (기본은 건너뜀 — 명세 §10, v1 과 같은 규약)")
     a = ap.parse_args()
-    V1, FIN = Path(a.v1_dir), Path(a.fin_dir)
+    V1, FIN, CIQ = Path(a.v1_dir), Path(a.fin_dir), Path(a.ciq_dir)
     out = Path(a.out_dir); out.mkdir(parents=True, exist_ok=True)
-    months = month_list(a.start, a.end)
+    months = resolve_months(V1, a.start, a.end)
     t0 = datetime.now()
+
+    targets = a.only or ["02_pair", "03_firm", "04_group"]
+    todo = [n for n in targets if a.force or not (out / f"{n}.parquet").exists()]
+    for n in targets:
+        if n not in todo:
+            print(f"  {n}.parquet  건너뜀(존재) — 다시 만들려면 --force")
+    if not todo:
+        print("만들 패널이 없다 (전부 존재). 종료.")
+        return
+    targets = todo
 
     print(f"[1] 입력 — v1 {len(months)}개월 ({months[0]}~{months[-1]}) "
           f"· 재무 결합 **{a.join}**")
     ship = load_ship(V1, months)
     print(f"  선적 {len(ship):,}건 · 금액 ${ship.valueofgoodsusd.sum()/1e9:,.1f}B")
     layer = load_fin_layer(FIN)
-    co = pd.read_parquet(Path(r"C:\panjiva\data\staging\source\ciq_ref\company.parquet"),
+    co = pd.read_parquet(CIQ / "company.parquet",
                          columns=CO_COLS).drop_duplicates("companyid")
 
-    targets = a.only or ["02_pair", "03_firm", "04_group"]
     specs = {
         "02_pair":  (build_pair,  BLOCKS_PAIR,
                      [("shp_ciqid", "shp_"), ("con_ciqid", "con_"),
