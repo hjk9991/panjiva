@@ -29,10 +29,21 @@ parquet 은 Stata 가 기본으로 못 읽는다. 같은 내용을 `.dta` 로 �
   S-4 정수→실수     nullable 정수(`Int64`)는 Stata 에서 실수형이 된다. **값과 결측은
                     그대로 보존**된다(왕복 검증 완료). Stata 쪽 정상 동작이다.
   S-5 포맷 버전     118 (Stata 14 이상, UTF-8 변수명·레이블 지원).
+  S-6 대형 패널     `to_stata` 는 전 행·전 열을 **한 덩어리 레코드 배열**로 만들어
+                    (`panel_firm_quarter` 2024 실측 12.1GiB) 순간 메모리가 데이터의
+                    3배쯤 필요하다 → 예상 크기가 `--max-shot-gb`(기본 4GiB)를 넘으면
+                    행을 청크로 나눠 `.dta` 조각을 쓰고 **Stata 배치(`append`)로 잇는다.**
+                    값·타입 보존은 단발 변환과 동일하다(청크 dtype 은 parquet 스키마에서
+                    오므로 균일하고, 문자열 폭은 append 가 최대 폭으로 승격 = 단발과 같음).
+                    변환 후 행·열 수를 Stata 로그로 검증한다.
 """
 
 import argparse
+import gc
+import math
 import re
+import shutil
+import subprocess
 import sys
 from datetime import date, datetime
 from pathlib import Path
@@ -51,6 +62,7 @@ PANELS = ["panel_pair_month", "dim_relationship",
           "panel_firm_export_quarter", "panel_firm_origin_quarter"]
 VARNAMES = "99_stata_varnames.csv"
 STATA_IC_MAX_VARS = 2048
+STATA_EXE = r"C:\Program Files\StataNow19\StataMP-64.exe"
 BLOCKS = ("fin_a_", "fin_q_", "up_a_", "up_q_",
           "shp_a_", "shp_q_", "shp_up_a_", "shp_up_q_",
           "con_a_", "con_q_", "con_up_a_", "con_up_q_")
@@ -83,7 +95,28 @@ def short_names(cols, cat: pd.DataFrame) -> tuple:
     return ren, lab, pd.DataFrame(rows)
 
 
-def export(path: Path, out: Path, cat: pd.DataFrame) -> dict:
+def stata_append(tmp: Path, out: Path, exe: Path, k: int, n: int, nvar: int) -> None:
+    """청크 `.dta` k개를 Stata 배치 `append` 로 이어 `out` 으로 저장하고 행·열을 검증한다."""
+    do = ["clear all", "set more off", 'use "chunk_0000.dta", clear']
+    do += [f'append using "chunk_{i:04d}.dta"' for i in range(1, k)]
+    do += [f'save "{out}", replace', "quietly count",
+           'display "NOBS=" r(N)', 'display "NVARS=" c(k)']
+    (tmp / "append.do").write_text("\n".join(do) + "\n", encoding="utf-8")
+    subprocess.run([str(exe), "/e", "do", "append.do"], cwd=tmp, check=False)
+    logf = tmp / "append.log"
+    log = logf.read_text(encoding="utf-8", errors="replace") if logf.exists() else ""
+    mo = re.search(r"NOBS=(\d+)", log)
+    mv = re.search(r"NVARS=(\d+)", log)
+    got = (int(mo.group(1)) if mo else -1, int(mv.group(1)) if mv else -1)
+    if got != (n, nvar):
+        raise SystemExit(f"Stata append 검증 실패 — 기대 {n:,}×{nvar:,}, "
+                         f"결과 {got[0]:,}×{got[1]:,}. 로그: {logf}")
+    shutil.rmtree(tmp)
+
+
+def export(path: Path, out: Path, cat: pd.DataFrame,
+           stata_exe: str = STATA_EXE, max_shot_gb: float = 4.0,
+           chunk_gb: float = 2.0) -> dict:
     d = pd.read_parquet(path)
     n0, c0 = len(d), d.shape[1]
     ren, lab, table = short_names(d.columns, cat)
@@ -98,8 +131,29 @@ def export(path: Path, out: Path, cat: pd.DataFrame) -> dict:
     for c in strcols:
         d[c] = d[c].astype("object").where(d[c].notna(), "")
 
-    d.to_stata(out, write_index=False, version=118, variable_labels=lab or None,
-               data_label=f"v3 {path.stem} ({date.today()})")
+    kw = dict(write_index=False, version=118, variable_labels=lab or None,
+              data_label=f"v3 {path.stem} ({date.today()})")
+    est = n0 * d.shape[1] * 8  # 레코드 배열 크기 근사(f8 기준; S-6)
+    if est <= max_shot_gb * 2**30:
+        d.to_stata(out, **kw)
+    else:
+        exe = Path(stata_exe)
+        if not exe.exists():
+            raise SystemExit(f"S-6 청크 변환에 Stata 가 필요한데 없음: {exe} (--stata-exe)")
+        rows = max(1, int(n0 * (chunk_gb * 2**30) / est))
+        k = math.ceil(n0 / rows)
+        print(f"  단발 변환엔 레코드 배열 약 {est / 2**30:.1f}GiB 필요 — "
+              f"{k}개 청크({rows:,}행씩)로 나눠 Stata append (S-6)")
+        tmp = out.parent / f"_dta_chunks_{out.stem}"
+        if tmp.exists():
+            shutil.rmtree(tmp)
+        tmp.mkdir()
+        for i, a0 in enumerate(range(0, n0, rows)):
+            d.iloc[a0:a0 + rows].to_stata(tmp / f"chunk_{i:04d}.dta", **kw)
+        nvar = d.shape[1]
+        del d
+        gc.collect()  # Stata 가 최종본(≈est)을 올릴 자리를 먼저 비운다
+        stata_append(tmp, out, exe, k, n0, nvar)
     return {"table": table, "str_missing": smiss, "n": n0, "ncol": c0,
             "n_ren": len(ren), "size_mb": out.stat().st_size / 1e6}
 
@@ -129,6 +183,11 @@ def main() -> None:
     ap.add_argument("--fin-dir", default=str(FIN))
     ap.add_argument("--only", nargs="*", choices=PANELS,
                     help="일부만 변환. 나머지 패널 행은 parquet 메타·기존 .dta·대조표로 채운다")
+    ap.add_argument("--stata-exe", default=STATA_EXE,
+                    help="S-6 청크 변환에 쓸 Stata 실행파일")
+    ap.add_argument("--max-shot-gb", type=float, default=4.0,
+                    help="레코드 배열 예상 크기(GiB)가 이보다 크면 청크 변환 (S-6)")
+    ap.add_argument("--chunk-gb", type=float, default=2.0, help="청크 하나의 목표 크기(GiB)")
     a = ap.parse_args()
     V3, FIN = Path(a.v3_dir), Path(a.fin_dir)
     t0 = datetime.now()
@@ -167,7 +226,9 @@ def main() -> None:
         dta = V3 / f"{name}.dta"
         if name in todo:
             print(f"[{name}] 변환 중...")
-            r = export(V3 / f"{name}.parquet", dta, cat)
+            r = export(V3 / f"{name}.parquet", dta, cat,
+                       stata_exe=a.stata_exe, max_shot_gb=a.max_shot_gb,
+                       chunk_gb=a.chunk_gb)
             if len(r["table"]):
                 tables.append(r["table"])
             if r["str_missing"]:

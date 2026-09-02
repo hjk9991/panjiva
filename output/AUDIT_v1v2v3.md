@@ -1,6 +1,6 @@
 # v1 · v2 · v3 교차 감사
 
-**감사일** 2026-09-01 · **스크립트** `audit_v1v2v3.py` · **대상** v1 `C:\panjiva\data\staging\tom_v1_2024_asof` · v2 `C:\panjiva\data\staging\tom_v2_2024_asof` · v3 `C:\panjiva\data\staging\within_firm_pilot_2024_asof` · 표 `C:\panjiva\projects\20251201\output\tables\wf2024_asof` · **월** 202401~202412 (12개월)
+**감사일** 2026-09-02 · **스크립트** `audit_v1v2v3.py` · **대상** v1 `C:\panjiva\data\staging\tom_v1_2024_asof` · v2 `C:\panjiva\data\staging\tom_v2_2024_asof` · v3 `C:\panjiva\data\staging\within_firm_pilot_2024_asof` · 표 `C:\panjiva\projects\20251201\output\tables\wf2024_asof` · **월** 202401~202412 (12개월)
 
 각 버전의 `90_checks.md` 가 못 보는 것 — 팀 함정 준수 · 명세 조항 대조 · 버전 간 총계 연결 · 문서 수치 일치 — 를 본다.
 
@@ -112,7 +112,7 @@ v1·v2 는 HS 자식을 조인하지 않고 **대표 HS 1:1** 만 쓴다. v3 `pa
 
 - [PASS] **§8 v1 산출물 전부 존재** — 없는 것 []
 - [PASS] **§8 v2 산출물 전부 존재** — 없는 것 []
-- [**FAIL**] **§8 v3 산출물 전부 존재** — 없는 것 ['panel_firm_quarter.dta']
+- [PASS] **§8 v3 산출물 전부 존재** — 없는 것 []
 
 ---
 
@@ -170,15 +170,8 @@ v1·v2 는 HS 자식을 조인하지 않고 **대표 HS 1:1** 만 쓴다. v3 `pa
 | 구분 | 결과 | 건수 |
 |---|---|---|
 | 대사 | PASS | 5 |
-| 명세 | FAIL | 1 |
-| 명세 | PASS | 18 |
+| 명세 | PASS | 19 |
 | 문서 | PASS | 17 |
 | 함정 | PASS | 15 |
 
-**56개 항목 중 55개 PASS**
-
-### 실패 항목
-
-| 구분 | 항목 | 결과 |
-|---|---|---|
-| 명세 | §8 v3 산출물 전부 존재 | FAIL |
+**56개 항목 중 56개 PASS**
