@@ -234,7 +234,7 @@ python ... --only dim_relationship                 # 일부만 — 문서의 다
 | 스크립트 | 산출 | 소요 |
 |---|---|---|
 | `wf_v3_panels.py` | 패널 6종 (`--start/--end/--v1-dir/--v2-dir/--src-dir/--out-dir`) | 약 3분 |
-| `wf_v3_d8d9.py` | `d8_firm_ownership_change` · `d9_relationship_transition_pairs` + `95_d8d9_report.md` + `output\tables\wf…\d8_*·d9_*` (`--tables-dir` 기본 = `output\tables\wf{시작연도}[_asof]`) | 약 2분 |
+| `wf_v3_d8d9.py` | `d8_firm_ownership_change` · `d9_relationship_transition_pairs` + `output\tables\wf…\d8_*·d9_*` + 같은 표 폴더의 `d8d9_section.md`(95_report 삽입용 중간 파일) (`--tables-dir` 기본 = `output\tables\wf{시작연도}[_asof]`) | 약 2분 |
 | `wf_v3_stats.py` | `t1~t10` · `d1~d7` CSV + `95_report.md`(d8·d9 절 포함) | 약 1분 |
 | `wf_v3_90_checks.py` | `90_checks.md` (게이트 22개; `--tables-dir` 로 d8 표를 읽는다) | 약 1분 |
 | `wf_v3_stata.py` | `.dta` 6종 + `99_stata_varnames.csv` + `99_stata_handoff.md` | 약 5분 |

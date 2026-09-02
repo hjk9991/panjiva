@@ -30,7 +30,7 @@ wf_v3_stats.py — v3 기초통계 t1~t10 + 진단 d1~d7 (+ d8·d9 삽입) (명�
   d5  PIT 대체(fallback) 규모
   d6  재무 커버리지 (행 기준 vs 금액 기준)
   d7  수출 목적지 (보조자료) — `coalesce(shpmtdestination, portofunladingcountry)`, 결측 비중 병기
-  d8·d9  `95_d8d9_report.md`(wf_v3_d8d9.py 산출) 본문을 리포트 끝에 삽입 (명세 §6.5)
+  d8·d9  표 폴더의 `d8d9_section.md`(wf_v3_d8d9.py 산출) 본문을 리포트 끝에 삽입 (명세 §6.5)
 
 ## 이번에 고친 것
 
@@ -578,15 +578,15 @@ def t10_new_origin_vs_export(fq: pd.DataFrame, fx: pd.DataFrame, fo: pd.DataFram
     return t22, td, {"n_event_quarters": n - 2, "n_events": n_events, "n_dropped": n_dropped}
 
 
-def include_d8d9(v3: Path) -> list:
-    """`95_d8d9_report.md`(wf_v3_d8d9.py) 본문을 H1 만 빼고 그대로 가져온다 — 명세 §6.5.
+def include_d8d9(tables: Path) -> list:
+    """`d8d9_section.md`(wf_v3_d8d9.py 가 표 폴더에 산출) 본문을 H1 만 빼고 가져온다 — 명세 §6.5.
 
     제목 수준만 한 단계 내려(`##`→`###`) 이 리포트의 절 아래에 들어가게 한다.
     """
-    head = "\n---\n\n## d8·d9 — 소유구조 변화와 관계전환 (명세 §6, 상세: 95_d8d9_report.md)\n"
-    p = v3 / "95_d8d9_report.md"
+    head = "\n---\n\n## d8·d9 — 소유구조 변화와 관계전환 (명세 §6)\n"
+    p = tables / "d8d9_section.md"
     if not p.exists():
-        return [head, "> ⚠️ **d8d9 미실행** — `95_d8d9_report.md` 가 없다. `wf_v3_d8d9.py` 를 "
+        return [head, "> ⚠️ **d8d9 미실행** — 표 폴더에 `d8d9_section.md` 가 없다. `wf_v3_d8d9.py` 를 "
                       "먼저 돌린 뒤 이 스크립트를 다시 돌리면 여기에 자동 삽입된다."]
     body = [("#" + l if l.startswith("##") else l)
             for l in p.read_text(encoding="utf-8").splitlines() if not l.startswith("# ")]
@@ -807,7 +807,7 @@ def main() -> None:
 
     # ------------------------------------------------------------------ d8·d9 (명세 §6.5)
     print("[5] d8·d9 삽입")
-    for line in include_d8d9(V3):
+    for line in include_d8d9(TABLES):
         say(line)
 
     (V3 / "95_report.md").write_text("\n".join(L), encoding="utf-8")

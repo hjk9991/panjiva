@@ -1,6 +1,6 @@
 # as-of 판 vs equi-join 판 — 대조
 
-**대조일** 2026-09-01 · **스크립트** `compare_join_modes.py` · **월** 202401~202412 (12개월)
+**대조일** 2026-09-02 · **스크립트** `compare_join_modes.py` · **월** 202401~202412 (12개월)
 
 두 산출물은 **재무 결합 방식만** 다르다. 선적·관계는 같고 재무만 달라야 정상이다.
 
@@ -84,8 +84,8 @@
 - [PASS] **문서 v2 `README.md` equi = asof** — 정규화 후 32/32줄
 - [PASS] **문서 v2 `COLUMNS.md` equi = asof** — 정규화 후 409/409줄
 - [PASS] **문서 v2 `DECISIONS.md` equi = asof** — 정규화 후 110/110줄
-- [PASS] **문서 v3 `README.md` equi = asof** — 정규화 후 49/49줄
-- [PASS] **문서 v3 `COLUMNS.md` equi = asof** — 정규화 후 472/472줄
+- [PASS] **문서 v3 `README.md` equi = asof** — 정규화 후 48/48줄
+- [PASS] **문서 v3 `COLUMNS.md` equi = asof** — 정규화 후 473/473줄
 - [PASS] **문서 v3 `DECISIONS.md` equi = asof** — 정규화 후 138/138줄
 
 ---

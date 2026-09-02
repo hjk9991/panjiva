@@ -346,7 +346,7 @@ def main() -> None:
         "가족이거나 계속 다른 가족이면 분류가 안 바뀐다(명세 §6.4). 반대로 UP 이 안 변해도 "
         "**상대방**이 바뀌면 전환이 생긴다 — d8 과 d9 는 다른 것을 재는 지표다.")
 
-    (V3 / "95_d8d9_report.md").write_text("\n".join(L), encoding="utf-8")
+    (TABLES / "d8d9_section.md").write_text("\n".join(L), encoding="utf-8")
     print(f"\n완료 ({(datetime.now()-t0).seconds}초) → {TABLES}")
 
 
