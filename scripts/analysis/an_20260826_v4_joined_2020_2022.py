@@ -14,6 +14,7 @@ an_20260826_v4_joined_2020_2022.py — v4 결합 테스트 산출물.
 """
 
 import sys
+from datetime import date, datetime
 from pathlib import Path
 
 import pandas as pd
@@ -69,10 +70,13 @@ def main():
     pq_, nq, cq = build("quarter", trade)
     pa_, na, ca = build("annual", trade)
 
+    src_mtime = max(datetime.fromtimestamp((OUT_FULL / f"trade_pair_hs_quarter_{y}.parquet")
+                                           .stat().st_mtime) for y in YEARS)
     (OUT / "README_읽어보세요.md").write_text(f"""# v4 결합 테스트 산출물 (2020~2022)
 
-**생성**: 2026-08-26 · `projects\\20251201\\scripts\\analysis\\an_20260826_v4_joined_2020_2022.py`
-**원료**: `v4_pairhs_full` (무역 {YEARS.start}~{YEARS.stop - 1} + 재무 wide) — 원료는 변경 없음
+**생성**: {date.today()} · `projects\\20251201\\scripts\\analysis\\an_20260826_v4_joined_2020_2022.py`
+**원료**: `v4_pairhs_full` (무역 {YEARS.start}~{YEARS.stop - 1} + 재무 wide) — 무역층 {src_mtime.date()} 빌드 기준
+(원료 파일 목록은 `_manifest.json`)
 
 | 파일 | 내용 | 규모 |
 |---|---|---|
@@ -80,8 +84,11 @@ def main():
 | `joined_annual.parquet` | 무역 + **연간** 재무 양쪽 (`up` x `cal_year`) | {na:,}행 x {ca}열 |
 
 - 재무는 **모회사(`shp_up`/`con_up`) 기준**으로 `shp_fin_*` / `con_fin_*` 접두어로 붙어 있다.
-- 계정은 핵심 17개(매출·원가·이익 계열 7 + 재무상태 8 + CapEx·영업현금흐름) + 기간 메타.
+- 계정은 핵심 17개(매출·원가·이익 계열 7 + 재무상태 8 + CapEx·영업현금흐름(2006 = Cash from
+  Operations; 감가상각은 아님)) + 기간 메타.
   전 410계정 양쪽 부착은 ~840열이라 뺐다 — 다른 계정이 필요하면 스크립트의 `ITEM_IDS` 수정 후 재실행.
+- `shp_up_backcast`·`con_up_backcast` 는 이 기간(PIT 추적 시작 2018-04-16 이후)에서 **전 행 0** 이다
+  — 열 정의는 `v4_pairhs_full\\COLUMNS.md`.
 - 값은 **백만 단위·원표시통화**. USD 는 `v4_join.to_usd(값, *_fin_fx_per_usd)` (나눗셈).
 - 안 붙은 행(NaN)은 모회사 재무가 CIQ 에 없는 것 — 커버리지·편향은 `v4_pairhs_full\\README` §2.
 """, encoding="utf-8")
